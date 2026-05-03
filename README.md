@@ -1,8 +1,8 @@
 # PCB-RAG：面向 PCB 知识库的智能问答系统
 
 PCB-RAG 是一个面向 PCB 设计规范、工艺资料与工程经验文档的检索增强生成（RAG）系统。项目支持文档入库、向量检索、BM25 词法召回、多路融合、Rerank 精排、元数据过滤和 Dify 外部知识库 API 集成，可用于构建 PCB 领域的智能问答助手。
+博客文章：https://blog.eecs.top/index.php/archives/3/
 
-> 公开版本已移除原始语料、历史实验产物、日志和本地配置，仅保留核心代码、环境脚本与部署说明。
 
 ## 项目亮点
 
@@ -64,7 +64,7 @@ bash scripts/setup.sh
 
 ### 2. 准备数据
 
-公开仓库不包含原始语料。请将你有权使用的 PCB 文档放入：
+公开仓库不包含任何原始语料。请将你有权使用的 PCB 文档放入：
 
 ```text
 data/clear_docs/
@@ -140,7 +140,7 @@ uvicorn pcb_rag.dify_external_api:app --host 0.0.0.0 --port 8000
 
 完整配置见 `.env.example` 和 `docs/CONFIGURATION_GUIDE.md`。
 
-## 简历描述参考
+## 开发意义
 
 - 设计并实现面向 PCB 领域文档的 RAG 问答系统，支持规范文档入库、向量检索、BM25 召回、多路融合、Rerank 精排与答案生成。
 - 基于 LlamaIndex、Milvus、Ollama 和 FastAPI 搭建私有化知识库服务，并通过 Dify External Knowledge API 对外提供问答能力。
@@ -149,15 +149,8 @@ uvicorn pcb_rag.dify_external_api:app --host 0.0.0.0 --port 8000
 
 ## 公开仓库说明
 
-为适合公开发布，本仓库已移除：
-
-- 原始业务语料、标准文档全文和数据缓存
-- 历史实验目录、评测数据集和中间产物
-- 日志、备份文件、本地 IDE / Claude 配置
-- 服务器 IP、固定 Token、默认数据库密码等敏感配置
-
 请在本地通过 `.env` 配置真实服务地址和密钥，不要将 `.env`、原始数据或模型缓存提交到 GitHub。
 
 ## License
 
-如需开源发布，建议在上传前补充合适的许可证文件，例如 MIT、Apache-2.0 或仅作为作品集展示的自定义说明。
+遵循 MIT 协议，任何人都有权使用，但是修改请务必再开源
