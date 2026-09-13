@@ -60,19 +60,54 @@ source .env
 
 ## 🔧 服务配置
 
-### Ollama 服务
+### 模型后端（本地 / API 双模式）
+
+通过 `LLM_BACKEND`、`EMBED_BACKEND`、`RERANK_BACKEND` 分别选择后端，三者可自由混搭。
+
+**LLM**
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `OLLAMA_BASE` | `http://127.0.0.1:11434` | Ollama API 地址 |
-| `OLLAMA_LLM_MODEL` | 自动选择 | 生成回答的 LLM 模型 |
-| `OLLAMA_NUM_CTX` | `2048` | LLM 上下文窗口大小 |
-| `OLLAMA_TIMEOUT` | `120` | API 请求超时（秒）|
+| `LLM_BACKEND` | `local` | `local`（Ollama）或 `api`（OpenAI 兼容） |
+| `OLLAMA_BASE` | `http://127.0.0.1:11434` | 本地 Ollama 地址（local） |
+| `OLLAMA_LLM_MODEL` | `qwen3.5:35b-a3b-q4_K_M` | 本地 LLM 模型（local） |
+| `OLLAMA_NUM_CTX` | `8192` | 本地 LLM 上下文窗口（local） |
+| `OLLAMA_TIMEOUT` | `300` | 本地请求超时（秒，local） |
+| `LLM_BASE_URL` | 空 | API 地址（api，如 `https://api.deepseek.com/v1`） |
+| `LLM_API_KEY` | 空 | API 密钥（api） |
+| `LLM_MODEL` | 空 | API 模型名（api） |
+| `LLM_TIMEOUT` | `180` | API 请求超时（秒，api） |
+| `LLM_MAX_TOKENS` | `2048` | 单次生成上限（api） |
+| `LLM_TEMPERATURE` | `0.7` | 采样温度（api） |
+| `LLM_CONTEXT_WINDOW` | `8192` | 上下文窗口（api） |
+
+**Embedding**
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `EMBED_BACKEND` | `local` | `local`（Ollama）或 `api`（OpenAI 兼容） |
+| `OLLAMA_EMBED_MODEL` | `qwen3-embedding:8b-q8_0` | 本地 Embedding 模型（local） |
+| `EMBED_BASE_URL` | 空 | API 地址，留空复用 `LLM_BASE_URL` |
+| `EMBED_API_KEY` | 空 | API 密钥，留空复用 `LLM_API_KEY` |
+| `EMBED_MODEL` | 空 | API Embedding 模型名（api，必填） |
+| `EMBED_DIM` | 空 | 向量维度，留空自动探测 |
+| `EMBED_BATCH_SIZE` | `16` | 批量大小（api） |
 
 **示例：**
 ```bash
-export OLLAMA_LLM_MODEL="glm-4.7-flash:q8_0"
-export OLLAMA_NUM_CTX=4096  # 处理长文档时增大
+# 全本地
+export LLM_BACKEND=local
+export EMBED_BACKEND=local
+export OLLAMA_LLM_MODEL="qwen3.5:35b-a3b-q4_K_M"
+
+# 全 API
+export LLM_BACKEND=api
+export EMBED_BACKEND=api
+export LLM_BASE_URL="https://api.siliconflow.cn/v1"
+export LLM_API_KEY="sk-xxxx"
+export LLM_MODEL="Qwen/Qwen3-8B"
+export EMBED_MODEL="BAAI/bge-m3"
+export EMBED_DIM=1024
 ```
 
 ### Milvus 向量数据库
@@ -447,14 +482,21 @@ docker ps | grep milvus
 cd milvus && docker-compose restart
 ```
 
-#### 2. Ollama 模型加载失败
-```bash
-# 检查可用模型
-ollama list
+#### 2. 模型后端不可用
 
-# 拉取模型
-ollama pull glm-4.7-flash:q8_0
+```bash
+# 查看当前后端配置与连通性
+python scripts/check_env.py
 ```
+
+本地后端：确认 `ollama list` 能列出模型，必要时执行 `ollama pull <模型名>`。
+API 后端：确认 `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` 正确，且网络可达。
+
+#### 2.1 Rerank 不可用
+
+- `RERANK_BACKEND=api`：必须配置 `RERANK_API_URL`，否则启动时会记录 `[RERANK] API 精排初始化失败`。
+- `RERANK_BACKEND=hf/qwen3reranker`：需要本地显存，显存不足会自动回退为仅召回。
+- 不需要精排时可设 `RERANK_BACKEND=none`。
 
 #### 3. 显存不足
 ```bash
@@ -508,11 +550,27 @@ export RERANK_ENABLED=0
 
 ### 核心配置
 ```bash
-# Ollama
+# 后端选择
+LLM_BACKEND=local            # local | api
+EMBED_BACKEND=local          # local | api
+RERANK_BACKEND=api           # api | hf | qwen3reranker | sbert | none
+
+# 本地后端（Ollama）
 OLLAMA_BASE=http://127.0.0.1:11434
-OLLAMA_LLM_MODEL=glm-4.7-flash:q8_0
-OLLAMA_NUM_CTX=4096
-OLLAMA_TIMEOUT=120
+OLLAMA_LLM_MODEL=qwen3.5:35b-a3b-q4_K_M
+OLLAMA_EMBED_MODEL=qwen3-embedding:8b-q8_0
+OLLAMA_NUM_CTX=8192
+OLLAMA_TIMEOUT=300
+
+# API 后端（OpenAI 兼容）
+LLM_BASE_URL=
+LLM_API_KEY=
+LLM_MODEL=
+EMBED_MODEL=
+EMBED_DIM=
+RERANK_API_URL=
+RERANK_API_KEY=
+RERANK_API_MODEL=
 
 # 检索
 FUSION_MODE=DIST_BASED_SCORE

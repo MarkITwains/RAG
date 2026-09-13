@@ -17,20 +17,40 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 def _bootstrap_local_venv() -> None:
-    """允许模块运行时也能找到本项目 `.venv` 里的依赖。"""
+    """允许模块运行时也能找到本项目 `.venv` 里的依赖（兼容 Windows / POSIX）。"""
 
-    repo_dir = str(Path(__file__).resolve().parents[2])
-    venv_site_packages = os.path.join(
-        repo_dir,
-        ".venv",
-        "lib",
-        f"python{sys.version_info.major}.{sys.version_info.minor}",
-        "site-packages",
-    )
+    repo_dir = Path(__file__).resolve().parents[2]
+    venv_dir = repo_dir / ".venv"
 
-    if os.path.isdir(venv_site_packages) and venv_site_packages not in sys.path:
-        sys.path.insert(0, venv_site_packages)
-        site.addsitedir(venv_site_packages)
+    # 无论能否找到 .venv，都把 src 目录加入 sys.path，保证可直接运行脚本
+    src_dir = repo_dir / "src"
+    if src_dir.is_dir() and str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
+    if not venv_dir.is_dir():
+        return
+
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates = [
+        venv_dir / "Lib" / "site-packages",            # Windows
+        venv_dir / "lib" / version / "site-packages",  # POSIX
+    ]
+
+    lib_dir = venv_dir / "lib"
+    if lib_dir.is_dir():
+        try:
+            for name in sorted(os.listdir(lib_dir), reverse=True):
+                if name.startswith("python"):
+                    candidates.append(lib_dir / name / "site-packages")
+        except OSError:
+            pass
+
+    for sp in candidates:
+        sp_str = str(sp)
+        if sp.is_dir() and sp_str not in sys.path:
+            sys.path.insert(0, sp_str)
+            site.addsitedir(sp_str)
+            return
 
 
 _bootstrap_local_venv()
@@ -89,8 +109,6 @@ warnings.filterwarnings(
 )
 
 from llama_index.core import Settings, StorageContext, VectorStoreIndex
-from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.milvus import MilvusVectorStore
 from llama_index.core.base.base_retriever import BaseRetriever
 from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
@@ -106,6 +124,22 @@ from llama_index.core.vector_stores.types import (
     MetadataFilters,
 )
 
+# 统一模型客户端工厂：LLM / Embedding / Rerank 均支持 local（Ollama/HF）与 api 双后端
+from pcb_rag.api_clients import (
+    EMBED_BACKEND,
+    LLM_BACKEND,
+    OLLAMA_BASE,
+    OLLAMA_EMBED_MODEL,
+    OLLAMA_LLM_MODEL,
+    RERANK_API_MODEL,
+    RERANK_API_URL,
+    build_api_reranker,
+    build_embed_model,
+    build_llm,
+    describe_backends,
+    get_embedding_dim,
+)
+
 try:
     import nest_asyncio
 
@@ -115,7 +149,6 @@ except Exception:
 
 MILVUS_URI = os.getenv("MILVUS_URI", "http://127.0.0.1:19530")
 COLLECTION = os.getenv("COLLECTION", "pcb_kb")
-OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://127.0.0.1:11434")
 
 HF_ENDPOINT = os.getenv("HF_ENDPOINT", "https://hf-mirror.com") 
 # Huggingface国内代理
@@ -153,9 +186,11 @@ RERANK_ENABLED = os.getenv("RERANK_ENABLED", "1") not in {"0", "false", "False"}
 RERANK_MODEL = os.getenv("RERANK_MODEL", "Qwen/Qwen3-Reranker-4B")
 RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "200"))  # Top200 精排
 # rerank 后端：
+# - api: HTTP rerank 接口（Jina / 硅基流动 / DashScope 等，推荐，无需本地显存）
 # - sbert: SentenceTransformerRerank (cross-encoder)
-# - hf: 直接用 HuggingFace Transformers 加载 rerank 模型（适合 Ollama 不支持的 rerank 模型）
+# - hf: 直接用 HuggingFace Transformers 加载 rerank 模型
 # - qwen3reranker: Qwen3-Reranker 专用（生成式 reranker，使用 yes/no 分类 logits）
+# - none: 关闭精排
 RERANK_BACKEND = os.getenv("RERANK_BACKEND", "qwen3reranker").strip().lower()
 
 # HF rerank 相关（RERANK_BACKEND=hf 时生效）
@@ -328,8 +363,21 @@ def _gpu_free_mib() -> dict[int, int]:
 
 
 def _try_build_reranker():
-    if not RERANK_ENABLED:
+    if not RERANK_ENABLED or RERANK_BACKEND in {"none", "off", "disabled"}:
         return None
+
+    # ── API 精排（Jina / 硅基流动 / DashScope 等，无需本地显存）─────────────
+    if RERANK_BACKEND == "api":
+        try:
+            reranker = build_api_reranker(top_n=RERANK_TOP_N)
+            print(
+                f"[RERANK] API 精排就绪: url={RERANK_API_URL}, "
+                f"model={RERANK_API_MODEL or '(service default)'}, top_n={RERANK_TOP_N}"
+            )
+            return reranker
+        except Exception as e:
+            print(f"[RERANK] API 精排初始化失败: {e}")
+            return None
 
     if RERANK_BACKEND in {"hf", "qwen3reranker"} or "qwen3-reranker" in HF_RERANK_MODEL.lower():
         model_id = HF_RERANK_MODEL
@@ -759,6 +807,11 @@ def _ollama_list_models(base_url: str) -> list[dict]:
 
 
 def _pick_llm_candidates(base_url: str) -> list[str]:
+    # API 后端：只使用配置中指定的模型，无需探测本地模型列表
+    if LLM_BACKEND == "api":
+        env_model = (os.getenv("LLM_MODEL", "") or "").strip()
+        return [env_model] if env_model else []
+
     env_model = os.getenv("OLLAMA_LLM_MODEL", "").strip()
     tags = _ollama_list_models(base_url)
 
@@ -786,21 +839,8 @@ def _pick_llm_candidates(base_url: str) -> list[str]:
 
 
 def _configure_llm(model_name: str) -> None:
-    Settings.llm = Ollama(
-        model=model_name,
-        base_url=OLLAMA_BASE,
-        request_timeout=DEFAULT_TIMEOUT,
-        context_window=DEFAULT_NUM_CTX,
-        additional_kwargs={
-            "num_ctx": DEFAULT_NUM_CTX,
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "top_k": 20,
-            "repeat_penalty": 1.0,
-            "presence_penalty": 1.5,
-        },
-        thinking=False,
-    )
+    """按 LLM_BACKEND 配置全局 LLM（local=Ollama，api=OpenAI 兼容）。"""
+    Settings.llm = build_llm(model_name)
 
 
 def _preprocess_query(query: str) -> str:
@@ -984,7 +1024,11 @@ def _build_rule_based_variants(query: str, num_variants: int) -> list[str]:
             for exp in expansions[:2]:
                 if len(variants) >= num_variants:
                     break
-                variant = query.replace(term, exp) if term in query else query_lower.replace(term_lower, exp.lower())
+                if term in query:
+                    variant = query.replace(term, exp)
+                else:
+                    # 使用 IGNORECASE 替换，避免把整条查询降级为小写
+                    variant = re.sub(re.escape(term_lower), exp, query, flags=re.IGNORECASE)
                 if variant not in variants and variant.lower() not in [v.lower() for v in variants]:
                     variants.append(variant)
     
@@ -1062,8 +1106,11 @@ def _build_multi_expand_queries(query: str, num_queries: int = 7) -> list[str]:
             for exp in expansions[:2]:  # 每个术语最多2个扩展变体
                 if len(variants) >= num_queries:
                     break
-                # 替换术语生成新变体
-                variant = query.replace(term, exp) if term in query else query_lower.replace(term_lower, exp.lower())
+                # 替换术语生成新变体（IGNORECASE 替换，保留原查询大小写）
+                if term in query:
+                    variant = query.replace(term, exp)
+                else:
+                    variant = re.sub(re.escape(term_lower), exp, query, flags=re.IGNORECASE)
                 if variant not in variants and variant.lower() not in [v.lower() for v in variants]:
                     variants.append(variant)
     
@@ -1085,7 +1132,7 @@ def _build_multi_expand_queries(query: str, num_queries: int = 7) -> list[str]:
     # 5. 核心实体聚焦查询：提取疑似专业名词和实体
     if len(variants) < num_queries:
         # 提取带引号、书名号或大写的实体
-        entities = re.findall(r'[【】《》""'']+([^【】《》""'']+)[【】《》""'']+|([A-Z][A-Za-z0-9_\-]+)', query)
+        entities = re.findall(r'[【】《》""'']+([^【】《》""'']+)[【】《》""'']+|([A-Z][A-Za-z0-9_-]+)', query)
         entity_list = [e[0] or e[1] for e in entities if e[0] or e[1]]
         if entity_list:
             entity_query = ' '.join(entity_list)
@@ -2151,7 +2198,7 @@ def _classify_query(query: str) -> str:
             return best_type[0]
 
     # 补充规则：数值规格查询
-    if re.search(r"\b\d+(?:\.\d+)?\s*(mm|mil|oz|ohm|μm|um|Ω|层)\b", q, re.I):
+    if re.search(r"(?<![a-zA-Z0-9])\d+(?:\.\d+)?\s*(?:mm|mil|oz|ohm|μm|um|Ω|层)", q, re.I):
         return "specification"
 
     # 补充规则：长句倾向语义理解
@@ -2589,18 +2636,21 @@ def expand_chunks_with_context(
     from pymilvus import connections, Collection
     from llama_index.core.schema import TextNode, NodeWithScore as NWS
     import json as _json
-    
-    # 确保 Milvus 连接
-    conn_alias = "default"
-    milvus_host = "127.0.0.1"
-    milvus_port = "19530"
-    
+    from urllib.parse import urlparse
+
+    # 复用 MILVUS_URI 的 host/port，避免硬编码导致远程 / 自定义端口 Milvus 上扩展静默失败
+    parsed = urlparse(MILVUS_URI if "://" in MILVUS_URI else f"http://{MILVUS_URI}")
+    conn_alias = "pcb_chunk_expand"
+    milvus_host = parsed.hostname or "127.0.0.1"
+    milvus_port = str(parsed.port or 19530)
+
     try:
         if not connections.has_connection(conn_alias):
             connections.connect(alias=conn_alias, host=milvus_host, port=milvus_port)
         collection = Collection(COLLECTION, using=conn_alias)
         collection.load()
     except Exception as e:
+        print(f"[ChunkExpand] Milvus 连接失败({milvus_host}:{milvus_port})，跳过扩展: {e}")
         return nodes
     
     # 收集原始 IDs
@@ -2723,10 +2773,17 @@ def expand_chunks_with_context(
     if not expanded_nodes:
         return nodes
     
-    # 合并结果：简单追加到原始结果后面
+    # 扩展节点分数取「原始最低分 × 0.95」，使其紧跟命中节点且不会被阈值误杀；
+    # 调用方（_retrieve_nodes）为扩展节点保留独立配额，避免被 top_k 截断整体丢弃
+    base_scores = [n.score for n in nodes if n.score is not None]
+    floor_score = (min(base_scores) if base_scores else 1.0) * 0.95
+    for nws in expanded_nodes:
+        nws.score = floor_score
+
     result = list(nodes)
     result.extend(expanded_nodes)
-    
+    result.sort(key=lambda x: -(x.score if x.score is not None else 0.0))
+
     return result
 
 
@@ -2874,7 +2931,7 @@ _PCB_TERMS: set[str] = {
     "lsi", "package", "ball", "grid", "array", "bonding", "wire", "finger",
     "anti", "pad", "lpb", "spdr", "vna", "dsc", "tga", "tma", "dma",
     "gb/t", "iec", "sj/t", "qualification", "approval", "inspection", "lot", 
-    "acceptance", "sampling", "aql", "reliability", "environmental", "stress", "temperature", "cycle"
+    "acceptance", "sampling", "aql", "reliability", "environmental", "stress", "temperature", "cycle",
     "schematic", "schdoc", "pcbdoc", "schlib", "pcblib", "prjpcb", "intlib", "netlabel", 
     "powerport", "offsheet", "connector", "sheet", "symbol", "sheetentry", "room", "polygon", "pour", "teardrop", "fanout", "interactive", "routing",
     "signal", "integrity", "si", "crosstalk", "reflection", "transmission", "line", "differential", 
@@ -2966,7 +3023,7 @@ _PCB_TERMS: set[str] = {
     "powerintegrity", "pdnsim", "decouplingcapacitor", "bypasscapacitor", "esr", "esl", "ssn", "groundbounce",
     "thermalanalysis", "heatdissipation", "thermalconductivity", "thermalresistance", "heatsink", "thermalvia",
     "manufacturingoutput", "gerber", "drilldrawing", "ncdrill", "odb++", "step", "pdf",
-    "designformanufacturability", "dfm", "designforserviceability", "dfs", "designfortestability", "dft"
+    "designformanufacturability", "dfm", "designforserviceability", "dfs", "designfortestability", "dft",
     "signalpropagation", "transmissionline", "characteristicimpedance", "propagationdelay", "skew", 
     "jitter", "eyeopening", "noisemargin", "crosstalkcoupling", "nearendcrosstalk", 
     "farendcrosstalk", "emccompliance", "shielding", "groundplane", "powerplane", 
@@ -2987,7 +3044,7 @@ _PCB_TERMS: set[str] = {
     "ecomanagement", "parametereditor", "ruleeditor", "constrainteditor", "layerstackeditor", 
     "boardoutlineeditor", "shapeeditor", "polygoneditor",
     "continuitytest", "insulationtest", "hipottest", "thermalcyclingtest", "humiditytest", 
-    "vibrationtest", "drcverification", "siverification", "piverification", "emcverification"
+    "vibrationtest", "drcverification", "siverification", "piverification", "emcverification",
         "glassstransitiontemperature", "tma", "dsc", "tga", "thermaldecompositiontemperature", "td", "zaxiscte", 
         "thermalstratificationtime", "halogencontent", "ionchromatography", "oxygenbombcombustion", "oxygenbombcombustion",
     "verticalburning", "horizontalburning", "glowwiretest", "needleflametest", "flameretardantgrade", "fv-0", "fv-1", "fv-2", "fhb",
@@ -3226,9 +3283,10 @@ def _extract_query_filters(user_query: str) -> tuple[str, Optional[MetadataFilte
         extracted.setdefault("eda", "allegro")
 
     # layers: 4层 / 4-layer / 4 layers / 4L
-    m = re.search(r"(?<!\d)(\d{1,2})\s*(?:层|layer|layers)\b", low)
+    # 注意：不能依赖 \b —— Python 中 \w 含中文，"4层PCB" 里 "层" 与 "P" 之间不存在词边界
+    m = re.search(r"(?<!\d)(\d{1,2})(?!\d)\s*(?:层|layer|layers)", low)
     if not m:
-        m = re.search(r"(?<!\d)(\d{1,2})\s*l\b", low)
+        m = re.search(r"(?<!\d)(\d{1,2})(?!\d)\s*l(?![a-z0-9])", low)
     if m:
         try:
             extracted.setdefault("layer_count", int(m.group(1)))
@@ -3465,8 +3523,24 @@ def _load_or_build_bm25(vector_store: MilvusVectorStore) -> Optional[_Bm25Index]
     cache_path = Path(LEXICAL_CACHE_PATH)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 缓存 TTL：超过该时长视为过期并重建，避免重新入库后 BM25 仍检索旧语料
+    ttl_hours = float(os.getenv("LEXICAL_CACHE_TTL_HOURS", "24"))
+    cache_usable = cache_path.exists()
+    if cache_usable and ttl_hours > 0:
+        try:
+            import time as _time
+
+            age_hours = (_time.time() - cache_path.stat().st_mtime) / 3600.0
+            if age_hours >= ttl_hours:
+                print(
+                    f"[BM25] 词法缓存已过期（{age_hours:.1f}h >= {ttl_hours}h），将重建: {cache_path}"
+                )
+                cache_usable = False
+        except OSError:
+            cache_usable = False
+
     docs: list[TextNode] = []
-    if cache_path.exists():
+    if cache_usable:
         try:
             with cache_path.open("r", encoding="utf-8") as f:
                 for line in f:
@@ -3548,19 +3622,14 @@ def _load_or_build_bm25(vector_store: MilvusVectorStore) -> Optional[_Bm25Index]
 
 def build_index(llm_model: str):
     _configure_llm(llm_model)
-    Settings.embed_model = OllamaEmbedding(
-        model_name="qwen3-embedding:8b-q8_0", 
-        base_url=OLLAMA_BASE,
-        ollama_additional_kwargs={"num_ctx": EMBED_NUM_CTX}
-    )
+    # Embedding 后端由 EMBED_BACKEND 决定（local=Ollama，api=OpenAI 兼容）
+    Settings.embed_model = build_embed_model()
 
-    # Milvus 向量字段需要显式维度；优先从 embedding 模型自动推断，失败则允许用环境变量指定。
+    # Milvus 向量字段需要显式维度；优先 EMBED_DIM，未配置时实际请求一次探测
     embedding_field = os.getenv("MILVUS_EMBEDDING_FIELD", "embedding")
-    embed_dim = None
-    try:
-        embed_dim = len(Settings.embed_model.get_query_embedding("test dimension"))
-    except Exception:
-        dim_env = os.getenv("EMBED_DIM") or os.getenv("MILVUS_DIM")
+    embed_dim = get_embedding_dim(Settings.embed_model)
+    if embed_dim is None:
+        dim_env = os.getenv("MILVUS_DIM")
         if dim_env:
             try:
                 embed_dim = int(dim_env)
@@ -3568,10 +3637,11 @@ def build_index(llm_model: str):
                 embed_dim = None
 
     if not isinstance(embed_dim, int) or embed_dim <= 0:
+        current_model = os.getenv("EMBED_MODEL") or OLLAMA_EMBED_MODEL
         raise RuntimeError(
             "无法推断 embedding 维度（Milvus 需要 dim 才能创建/校验向量字段）。"
-            "\n- 请确认 Ollama embedding 模型可用（当前：qwen3-embedding:8b-q8_0）"
-            "\n- 或手动设置环境变量 EMBED_DIM（例如：EMBED_DIM=1024）"
+            f"\n- 当前 EMBED_BACKEND={EMBED_BACKEND}, 模型={current_model}"
+            "\n- 请确认 embedding 服务可访问，或手动设置环境变量 EMBED_DIM（例如：EMBED_DIM=1024）"
         )
 
     async def _init_vector_store() -> MilvusVectorStore:

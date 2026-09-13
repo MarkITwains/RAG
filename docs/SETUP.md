@@ -8,8 +8,10 @@
 
 - Python 3.10+
 - Docker 与 Docker Compose
-- Ollama
 - Git Bash（Windows 用户推荐）
+- 模型服务（二选一）：
+  - `LLM_BACKEND=local` / `EMBED_BACKEND=local`：安装并启动 Ollama
+  - `LLM_BACKEND=api` / `EMBED_BACKEND=api`：准备任意 OpenAI 兼容服务的 `BASE_URL` 与 `API_KEY`
 
 ## 一键补全环境
 
@@ -27,24 +29,48 @@ bash scripts/setup.sh
 4. 如果 `.env` 不存在，则从 `.env.example` 复制。
 5. 创建运行目录：`data/clear_docs/`、`data/raw_docs/`、`logs/`。
 6. 启动 Milvus：`docker/milvus/docker-compose.yml`。
-7. 检查 Ollama，并尝试拉取 `.env` 中配置的 LLM 与 Embedding 模型。
-8. 运行 `scripts/check_env.py` 检查 Python 包、Milvus、Ollama 和数据目录。
+7. 按 `LLM_BACKEND` / `EMBED_BACKEND` 检查后端：local 时尝试拉取 Ollama 模型，api 时跳过。
+8. 运行 `scripts/check_env.py` 检查 Python 包、Milvus、模型后端和数据目录。
 
-## 默认模型配置
+## 模型后端配置
 
-`.env.example` 默认偏效果优先：
+LLM / Embedding / Rerank 各自独立选择后端，可自由混搭。
+
+### 全本地（Ollama + 本地 Rerank）
 
 ```bash
+LLM_BACKEND=local
+EMBED_BACKEND=local
 OLLAMA_LLM_MODEL=qwen3.5:35b-a3b-q4_K_M
+OLLAMA_EMBED_MODEL=qwen3-embedding:8b-q8_0
 RERANK_ENABLED=1
 RERANK_BACKEND=qwen3reranker
 RERANK_MODEL=Qwen/Qwen3-Reranker-4B
 RECALL_TOP_K=200
 ```
 
-这类模型对显存、内存和下载时间要求较高。如果你的机器资源有限，可以在 `.env` 中改为较轻配置，例如：
+### 全 API（OpenAI 兼容，示例：硅基流动）
 
 ```bash
+LLM_BACKEND=api
+EMBED_BACKEND=api
+LLM_BASE_URL=https://api.siliconflow.cn/v1
+LLM_API_KEY=sk-xxxx
+LLM_MODEL=Qwen/Qwen3-8B
+EMBED_MODEL=BAAI/bge-m3
+EMBED_DIM=1024
+RERANK_BACKEND=api
+RERANK_API_URL=https://api.siliconflow.cn/v1/rerank
+RERANK_API_KEY=sk-xxxx
+RERANK_API_MODEL=BAAI/bge-reranker-v2-m3
+RECALL_TOP_K=100
+```
+
+### 资源受限（本地轻量配置）
+
+```bash
+LLM_BACKEND=local
+EMBED_BACKEND=local
 OLLAMA_LLM_MODEL=qwen3:8b
 RERANK_ENABLED=0
 RECALL_TOP_K=40
@@ -104,19 +130,27 @@ docker compose -f docker/milvus/docker-compose.yml restart
 docker compose -f docker/milvus/docker-compose.yml down
 ```
 
-## Ollama 排查
+## 模型后端排查
 
-查看模型：
-
-```bash
-ollama list
-```
-
-手动拉取模型：
+先确认当前使用的后端：
 
 ```bash
-ollama pull qwen3.5:35b-a3b-q4_K_M
-ollama pull nomic-embed-text
+python scripts/check_env.py
 ```
 
-如果 `scripts/check_env.py` 提示 Ollama 无法连接，请确认 Ollama 服务已经启动，并检查 `.env` 中的 `OLLAMA_BASE`。
+**本地后端（local）**
+
+```bash
+ollama list                                   # 查看已安装模型
+ollama pull qwen3.5:35b-a3b-q4_K_M            # 拉取 LLM
+ollama pull qwen3-embedding:8b-q8_0           # 拉取 Embedding
+```
+
+如果提示 Ollama 无法连接，请确认服务已启动，并检查 `.env` 中的 `OLLAMA_BASE`。
+
+**API 后端（api）**
+
+- 确认 `LLM_BASE_URL` 指向 OpenAI 兼容地址（通常以 `/v1` 结尾）。
+- 确认 `LLM_API_KEY` 有效，且 `LLM_MODEL` / `EMBED_MODEL` 是服务方支持的模型名。
+- Embedding 维度不确定时，先留空 `EMBED_DIM` 让程序自动探测；若探测失败，请显式填写。
+- API 精排需同时配置 `RERANK_API_URL`；未配置时请在 `.env` 中设 `RERANK_BACKEND=none`。

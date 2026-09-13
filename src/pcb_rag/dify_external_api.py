@@ -26,7 +26,6 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 # 0b. API 模式性能参数覆盖（在 import query 之前执行，setdefault 不覆盖已有值）
 #     大幅减少召回候选数、精排数量、查询变体，缩短单次请求耗时
 # ---------------------------------------------------------------------------
-os.environ.setdefault("OLLAMA_LLM_MODEL", "qwen3.5:35b-a3b-q4_K_M")  # 强制使用指定 LLM
 os.environ.setdefault("RECALL_TOP_K", "200")
 os.environ.setdefault("RERANK_TOP_N", "10")
 os.environ.setdefault("FUSION_NUM_QUERIES", "3")
@@ -124,7 +123,8 @@ from pcb_rag.query import (
     format_self_rag_result,
 )
 from llama_index.vector_stores.milvus import MilvusVectorStore
-from llama_index.llms.ollama import Ollama
+
+from pcb_rag.api_clients import build_llm, describe_backends
 
 # ---------------------------------------------------------------------------
 # 1c. 持久 HyDE 线程池 + 第二路变体函数
@@ -414,6 +414,11 @@ class SessionManager:
                 return list(session["history"])
         return []
 
+    def exists(self, session_id: str) -> bool:
+        """判断会话是否存在（线程安全，避免调用方直接访问内部状态）。"""
+        with self._lock:
+            return session_id in self._sessions
+
     def add_message(self, session_id: str, role: str, content: str) -> None:
         """向会话添加一条消息。"""
         with self._lock:
@@ -509,30 +514,22 @@ def _initialize_retrieval_engine() -> None:
     """
     logger.info("=== PCB-RAG 初始化中 ===")
 
-    # 选择 LLM（Ollama 本地）
+    # 选择 LLM：local 后端探测 Ollama 模型列表，api 后端使用配置的 LLM_MODEL
     llm_candidates = _pick_llm_candidates(OLLAMA_BASE)
     if not llm_candidates:
-        llm_candidates = ["qwen3.5:35b-a3b-q4_K_M"]
-    # ── 关闭思考模式（thinking=False），大幅加速所有 LLM 调用 ───────────
+        llm_candidates = [
+            os.getenv("LLM_MODEL")
+            or os.getenv("OLLAMA_LLM_MODEL")
+            or "qwen3.5:35b-a3b-q4_K_M"
+        ]
     model_name = llm_candidates[0]
-    Settings.llm = Ollama(
-        model=model_name,
-        base_url=OLLAMA_BASE,
-        request_timeout=180.0,
-        context_window=DEFAULT_NUM_CTX,
-        additional_kwargs={
-            "num_ctx": DEFAULT_NUM_CTX,
-            # Qwen3.5 官方 Instruct (non-thinking) 模式推荐参数
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "top_k": 20,
-            "repeat_penalty": 1.0,
-            "presence_penalty": 1.5,
-        },
-        thinking=False,   # ★ Ollama API: "think": false → 关闭思考模式
-    )
+    Settings.llm = build_llm(model_name)
     _app_state["llm_candidates"] = llm_candidates
-    logger.info(f"[LLM] 已配置: {model_name} (thinking=False)")
+    backend_info = describe_backends()
+    logger.info(
+        f"[LLM] backend={backend_info['llm_backend']}, model={model_name}, "
+        f"base_url={backend_info['llm_base_url']}"
+    )
 
     # 初始化向量索引（连接 Milvus + 加载 Embedding 模型）
     logger.info("[Index] 正在连接 Milvus 并加载 Embedding 模型...")
@@ -542,7 +539,7 @@ def _initialize_retrieval_engine() -> None:
 
     # 初始化本地 BM25 索引
     bm25_index = None
-    if RERANK_ENABLED or True:  # BM25 在 Fusion 模式下始终需要
+    if os.getenv("LEXICAL_ENABLED", "1") not in {"0", "false", "False"} or RERANK_ENABLED:
         try:
             vector_store = index.storage_context.vector_store
             if isinstance(vector_store, MilvusVectorStore):
@@ -721,6 +718,9 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
     recall_k    = _app_state["recall_k"]
     colbert_reranker = _app_state["colbert_reranker"]
 
+    # 最终分数的量纲来源：rerank(0~1 概率) / rrf(倒数排名分) / vector(相似度)
+    _score_kind = "vector"
+
     t_start = time.time()
 
     # ── Step 1: 提取元数据过滤条件 ────────────────────────────────────────
@@ -815,6 +815,11 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
                 retrieved_nodes,
                 query_bundle=QueryBundle(query_str=expanded_q),
             )
+            _score_kind = "rerank"
+        elif colbert_reranker is not None and COLBERT_RERANK_ENABLED:
+            _score_kind = "rerank"
+        else:
+            _score_kind = "rrf"
 
     elif bm25_index is not None:
         # ── 5b. 并行 Fusion 召回（HyDE LLM + 向量 + BM25 同时执行）──────
@@ -895,7 +900,8 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
         n_hit, n_skip = 0, 0
 
         if hyde_futs and hyde_remain > 0:
-            from concurrent.futures import wait as _futures_wait, FIRST_COMPLETED
+            from concurrent.futures import wait as _futures_wait
+
             done_set, not_done = _futures_wait(hyde_futs, timeout=hyde_remain)
             for hf in done_set:
                 try:
@@ -910,13 +916,14 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
                 except Exception as e:
                     logger.warning(f"[HyDE] 结果取失败: {e}")
             n_skip = len(not_done)
-            for hf in not_done:
-                hf.cancel()
-                logger.info("[HyDE] 生成超时，取消")
+            if not_done:
+                # 已提交到线程池的任务无法真正取消，这里只停止等待，避免误导性日志
+                logger.info(
+                    f"[HyDE] {len(not_done)} 路生成超时（剩余预算 {hyde_remain:.1f}s），"
+                    f"本次放弃等待，任务将在后台自行结束"
+                )
         elif hyde_futs:
             n_skip = len(hyde_futs)
-            for hf in hyde_futs:
-                hf.cancel()
             logger.info(f"[HyDE] 主检索已耗时 {hyde_elapsed:.1f}s，无剩余预算，跳过 HyDE")
 
         t_hyde = time.time()
@@ -949,6 +956,9 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
             )
             logger.info(f"[Timing] 精排: {time.time() - t_pre_rerank:.2f}s "
                        f"→ {len(retrieved_nodes)} nodes")
+            _score_kind = "rerank"
+        else:
+            _score_kind = "rrf"
 
     else:
         # ── 5c. 纯向量检索（BM25 不可用）──────────────────────────────
@@ -961,6 +971,9 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
                 retrieved_nodes,
                 query_bundle=QueryBundle(query_str=expanded_q),
             )
+            _score_kind = "rerank"
+        else:
+            _score_kind = "vector"
 
     # ── Step 6: Chunk 上下文扩展（合并邻近 Chunk）──────────────────────
     if CHUNK_EXPAND_ENABLED and retrieved_nodes:
@@ -979,18 +992,39 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
             logger.warning(f"[ChunkExpand] 扩展失败，跳过: {e}")
 
     # ── Step 7: 按得分阈值过滤 + top_k 截断 ──────────────────────────────
+    # RRF 分数（约 0.01~0.05）与 rerank 概率（0~1）量纲不同，直接套用阈值会误过滤
+    effective_threshold = score_threshold
+    if _score_kind == "rrf" and score_threshold > 0.0:
+        logger.info("[Score] 当前为 RRF 融合分数（非 0~1 概率），已忽略 score_threshold")
+        effective_threshold = 0.0
+
+    # 扩展上下文节点享有独立配额，避免被 top_k 直接截断导致扩展功能失效
+    max_expand_extra = max(0, int(os.getenv("CHUNK_EXPAND_MAX_EXTRA", "5")))
+    ordered = sorted(
+        retrieved_nodes,
+        key=lambda x: -(float(x.score) if x.score is not None else 0.0),
+    )
+
     filtered: List[NodeWithScore] = []
-    for nws in retrieved_nodes:
+    primary_count = 0
+    extra_count = 0
+    for nws in ordered:
         score = float(nws.score) if nws.score is not None else 0.0
-        if score_threshold > 0.0 and score < score_threshold:
+        if effective_threshold > 0.0 and score < effective_threshold:
             continue
         node = nws.node
         content = node.get_content(metadata_mode=MetadataMode.NONE).strip()
         if not content:
             continue
+        if (node.metadata or {}).get("is_context_expansion"):
+            if extra_count >= max_expand_extra:
+                continue
+            extra_count += 1
+        else:
+            if primary_count >= top_k:
+                continue
+            primary_count += 1
         filtered.append(nws)
-        if len(filtered) >= top_k:
-            break
 
     t_total = time.time()
     logger.info(f"[Timing] 检索总耗时: {t_total - t_start:.2f}s → {len(filtered)} 条 "
@@ -1556,9 +1590,9 @@ def get_session_history(session_id: str, _: str = Depends(verify_token)):
     获取指定会话的完整对话历史。
     """
     sm = get_session_manager()
-    history = sm.get_history(session_id)
-    if not history and session_id not in sm._sessions:
+    if not sm.exists(session_id):
         raise HTTPException(status_code=404, detail=f"会话 {session_id} 不存在")
+    history = sm.get_history(session_id)
     return SessionHistoryRes(
         session_id=session_id,
         history=history,
@@ -1640,6 +1674,7 @@ def health_check():
             "HYDE_ENABLED": HYDE_ENABLED,
             "CHUNK_EXPAND_ENABLED": CHUNK_EXPAND_ENABLED,
         },
+        "backends": describe_backends(),
     }
 
 

@@ -73,21 +73,34 @@ if [ ${#compose_cmd[@]} -gt 0 ]; then
   "${compose_cmd[@]}" -f docker/milvus/docker-compose.yml up -d
 fi
 
-if command_exists ollama; then
-  if ollama list >/dev/null 2>&1; then
-    if [ -n "${OLLAMA_LLM_MODEL:-}" ]; then
-      info "检查/拉取 LLM 模型: ${OLLAMA_LLM_MODEL}"
-      ollama pull "${OLLAMA_LLM_MODEL}" || warn "LLM 模型拉取失败，可稍后手动执行: ollama pull ${OLLAMA_LLM_MODEL}"
-    fi
-    if [ -n "${OLLAMA_EMBED_MODEL:-}" ]; then
-      info "检查/拉取 Embedding 模型: ${OLLAMA_EMBED_MODEL}"
-      ollama pull "${OLLAMA_EMBED_MODEL}" || warn "Embedding 模型拉取失败，可稍后手动执行: ollama pull ${OLLAMA_EMBED_MODEL}"
+llm_backend="${LLM_BACKEND:-local}"
+embed_backend="${EMBED_BACKEND:-local}"
+
+if [ "$llm_backend" = "local" ] || [ "$embed_backend" = "local" ]; then
+  if command_exists ollama; then
+    if ollama list >/dev/null 2>&1; then
+      if [ "$llm_backend" = "local" ] && [ -n "${OLLAMA_LLM_MODEL:-}" ]; then
+        info "检查/拉取本地 LLM 模型: ${OLLAMA_LLM_MODEL}"
+        ollama pull "${OLLAMA_LLM_MODEL}" || warn "LLM 模型拉取失败，可稍后手动执行: ollama pull ${OLLAMA_LLM_MODEL}"
+      fi
+      if [ "$embed_backend" = "local" ] && [ -n "${OLLAMA_EMBED_MODEL:-}" ]; then
+        info "检查/拉取本地 Embedding 模型: ${OLLAMA_EMBED_MODEL}"
+        ollama pull "${OLLAMA_EMBED_MODEL}" || warn "Embedding 模型拉取失败，可稍后手动执行: ollama pull ${OLLAMA_EMBED_MODEL}"
+      fi
+    else
+      warn "Ollama 未响应，请先启动 Ollama 服务后再拉取模型。"
     fi
   else
-    warn "Ollama 未响应，请先启动 Ollama 服务后再拉取模型。"
+    warn "未找到 Ollama（LLM_BACKEND=${llm_backend}, EMBED_BACKEND=${embed_backend}）。"
+    warn "如需纯 API 模式，请在 .env 中设置 LLM_BACKEND=api / EMBED_BACKEND=api 并填写 API 配置。"
   fi
 else
-  warn "未找到 Ollama。请安装并启动 Ollama 后执行: ollama pull ${OLLAMA_LLM_MODEL:-qwen3.5:35b-a3b-q4_K_M}"
+  info "LLM_BACKEND=${llm_backend}, EMBED_BACKEND=${embed_backend}：跳过 Ollama 检查（使用 API 后端）。"
+fi
+
+rerank_backend="${RERANK_BACKEND:-api}"
+if [ "$rerank_backend" = "api" ] && [ -z "${RERANK_API_URL:-}" ]; then
+  warn "RERANK_BACKEND=api 但未配置 RERANK_API_URL，精排将不可用（可在 .env 中设置 RERANK_BACKEND=none 关闭）。"
 fi
 
 info "运行环境检查"

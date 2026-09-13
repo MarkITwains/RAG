@@ -15,43 +15,40 @@ except ImportError:
     HAS_CHARDET = False
 
 def _bootstrap_local_venv() -> None:
-    """允许模块运行时也能找到本项目 `.venv` 里的依赖。"""
+    """允许模块运行时也能找到本项目 `.venv` 里的依赖（兼容 Windows / POSIX）。"""
 
-    repo_dir = str(Path(__file__).resolve().parents[2])
-    venv_site_packages = os.path.join(
-        repo_dir,
-        ".venv",
-        "lib",
-        f"python{sys.version_info.major}.{sys.version_info.minor}",
-        "site-packages",
-    )
+    repo_dir = Path(__file__).resolve().parents[2]
+    venv_dir = repo_dir / ".venv"
 
-    # 首先尝试按当前解释器的版本添加
-    if os.path.isdir(venv_site_packages) and venv_site_packages not in sys.path:
-        sys.path.insert(0, venv_site_packages)
-        site.addsitedir(venv_site_packages)
+    # 无论能否找到 .venv，都把 src 目录加入 sys.path，保证可直接运行脚本
+    src_dir = repo_dir / "src"
+    if src_dir.is_dir() and str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
+    if not venv_dir.is_dir():
         return
 
-    # 如果没有与当前 Python 完全匹配的 site-packages，尝试扫描 `.venv/lib` 下的 pythonX.Y 目录，
-    # 将第一个可用的 site-packages 加入 sys.path（兼容在其他 Python 版本下运行脚本但依赖安装在特定 venv 的场景）。
-    lib_dir = os.path.join(repo_dir, ".venv", "lib")
-    try:
-        candidates = []
-        if os.path.isdir(lib_dir):
-            for name in os.listdir(lib_dir):
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates = [
+        venv_dir / "Lib" / "site-packages",            # Windows
+        venv_dir / "lib" / version / "site-packages",  # POSIX
+    ]
+
+    lib_dir = venv_dir / "lib"
+    if lib_dir.is_dir():
+        try:
+            for name in sorted(os.listdir(lib_dir), reverse=True):
                 if name.startswith("python"):
-                    sp = os.path.join(lib_dir, name, "site-packages")
-                    if os.path.isdir(sp):
-                        candidates.append(sp)
-        # 按名称倒序（通常 python3.10 < python3.11），选择最高版本优先
-        candidates.sort(reverse=True)
-        for sp in candidates:
-            if sp not in sys.path:
-                sys.path.insert(0, sp)
-                site.addsitedir(sp)
-                return
-    except Exception:
-        pass
+                    candidates.append(lib_dir / name / "site-packages")
+        except OSError:
+            pass
+
+    for sp in candidates:
+        sp_str = str(sp)
+        if sp.is_dir() and sp_str not in sys.path:
+            sys.path.insert(0, sp_str)
+            site.addsitedir(sp_str)
+            return
 
 
 _bootstrap_local_venv()
@@ -95,10 +92,19 @@ _sanitize_proxy_env_for_httpx()
 from llama_index.core import Settings, SimpleDirectoryReader, StorageContext, VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter, SemanticSplitterNodeParser, HierarchicalNodeParser
 from llama_index.core.schema import MetadataMode, TextNode
-from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.llms.ollama import Ollama
 from llama_index.readers.file import PyMuPDFReader, DocxReader, RTFReader
 from llama_index.vector_stores.milvus import MilvusVectorStore
+
+# 统一模型客户端工厂：LLM / Embedding 支持 local（Ollama）与 api 双后端
+from pcb_rag.api_clients import (
+    EMBED_BACKEND,
+    LLM_BACKEND,
+    OLLAMA_BASE,
+    OLLAMA_EMBED_MODEL,
+    build_embed_model,
+    build_llm,
+    get_embedding_dim,
+)
 
 try:
     import nest_asyncio
@@ -110,7 +116,6 @@ except Exception:
 DATA_DIR = os.getenv("DATA_DIR", "./data/clear_docs")
 MILVUS_URI = os.getenv("MILVUS_URI", "http://127.0.0.1:19530")
 COLLECTION = os.getenv("COLLECTION", "pcb_kb")
-OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://127.0.0.1:11434")
 
 # 切块策略配置：parent_child（两层结构）| structure（结构感知）| semantic（语义感知）| hierarchical（层次化）| sentence（固定大小）| attention（注意力语义感知）
 NODE_PARSER_MODE = os.getenv("NODE_PARSER_MODE", "parent_child").strip().lower()
@@ -237,7 +242,7 @@ def _detect_encoding(data: bytes) -> Tuple[str, float]:
                 # 如果UTF-8质量更好，使用UTF-8
                 if utf8_garbage < 0.05:
                     return 'utf-8', 0.99
-            except:
+            except Exception:
                 pass
         
         # chardet有时会误判中文为ISO-8859-1
@@ -247,7 +252,7 @@ def _detect_encoding(data: bytes) -> Tuple[str, float]:
                 chinese_count = len(re.findall(r'[\u4e00-\u9fff]', decoded))
                 if chinese_count > 10:
                     return 'gbk', 0.95
-            except:
+            except Exception:
                 pass
         
         return encoding, confidence
@@ -263,7 +268,7 @@ def _decode_with_fallback(data: bytes) -> Tuple[str, str]:
     if encoding.lower() in ('utf-8', 'utf-8-sig'):
         try:
             return data.decode('utf-8'), 'utf-8'
-        except:
+        except Exception:
             pass
     
     encodings_to_try = [encoding]
@@ -1341,8 +1346,14 @@ class AttentionSemanticSplitter:
         self.window_size = window_size or ATTENTION_WINDOW_SIZE
         self.breakpoint_percentile = breakpoint_percentile or ATTENTION_BREAKPOINT_PERCENTILE
         
-        # 判断是否使用 Ollama（模型名包含 : 且不包含 /）
-        self.use_ollama = ATTENTION_USE_OLLAMA and ':' in self.model_name and '/' not in self.model_name
+        # Embedding 后端：EMBED_BACKEND=api 直接走 API；local 时按模型名判断 Ollama / HF
+        self.use_api_embed = EMBED_BACKEND == "api"
+        self.use_ollama = (
+            not self.use_api_embed
+            and ATTENTION_USE_OLLAMA
+            and ':' in self.model_name
+            and '/' not in self.model_name
+        )
         
         self._model = None
         self._tokenizer = None
@@ -1363,7 +1374,16 @@ class AttentionSemanticSplitter:
         if self._model is not None or self._ollama_embed is not None:
             return
         
-        if self.use_ollama:
+        if self.use_api_embed:
+            # 使用 OpenAI 兼容 API 端点
+            try:
+                print(f"[SemanticSplitter] 使用 API embedding 模型: {self.model_name}")
+                self._ollama_embed = build_embed_model(self.model_name)
+                print(f"[SemanticSplitter] API embedding 初始化完成")
+            except Exception as e:
+                print(f"[SemanticSplitter] API embedding 初始化失败: {e}")
+                self._ollama_embed = None
+        elif self.use_ollama:
             # 使用 Ollama
             try:
                 from llama_index.embeddings.ollama import OllamaEmbedding
@@ -1410,8 +1430,8 @@ class AttentionSemanticSplitter:
         
         self._load_model()
         
-        if self.use_ollama and self._ollama_embed is not None:
-            # 使用 Ollama 获取嵌入
+        if (self.use_ollama or self.use_api_embed) and self._ollama_embed is not None:
+            # 使用 Ollama / API 获取嵌入
             try:
                 embeddings = []
                 # 显示进度（每 10 个打印一次）
@@ -2011,9 +2031,10 @@ def _infer_metadata(file_path: str) -> dict:
             break
 
     # layers (e.g. 4层 / 4-layer / 4 layers / 4L)
-    m = re.search(r"(?<!\d)(\d{1,2})\s*(?:层|layer|layers)\b", text)
+    # 注意：不能依赖 \b —— \w 含中文，"4层板"/"4层PCB" 中 "层" 之后不存在词边界
+    m = re.search(r"(?<!\d)(\d{1,2})(?!\d)\s*(?:层|layer|layers)", text)
     if not m:
-        m = re.search(r"(?<!\d)(\d{1,2})\s*l\b", text)
+        m = re.search(r"(?<!\d)(\d{1,2})(?!\d)\s*l(?![a-z0-9])", text)
     if m:
         try:
             md["layer_count"] = int(m.group(1))
@@ -2881,21 +2902,14 @@ def _attention_semantic_parse(documents) -> list:
 
 
 def main():
-    # 1) 配置 LLM（用于回答）- 通过环境变量配置，便于与生成模型分离
-    llm_model = os.getenv("OLLAMA_LLM_MODEL", "glm-4.7-flash:q8_0")
-    Settings.llm = Ollama(model=llm_model, base_url=OLLAMA_BASE, request_timeout=120.0)
+    # 1) 配置 LLM（用于回答）- 后端由 LLM_BACKEND 决定（local=Ollama，api=OpenAI 兼容）
+    Settings.llm = build_llm()
 
-    # 2) 配置 Embedding（用于向量化）
-    Settings.embed_model = OllamaEmbedding(
-        model_name="qwen3-embedding:8b-q8_0", 
-        base_url=OLLAMA_BASE,
-        ollama_additional_kwargs={"num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "2048"))}
-    )
+    # 2) 配置 Embedding（用于向量化）- 后端由 EMBED_BACKEND 决定
+    Settings.embed_model = build_embed_model()
+
     # 2.1) 计算嵌入维度（用于配置 Milvus）
-    try:
-        embed_dim = len(Settings.embed_model.get_query_embedding("test dimension"))
-    except Exception:
-        embed_dim = None
+    embed_dim = get_embedding_dim(Settings.embed_model)
 
     # 2.2) 配置切块策略：parent_child > 结构感知 > 注意力语义 > 语义感知 > 层次化 > 固定切块
     node_parser = _build_node_parser(Settings.embed_model)
@@ -2957,12 +2971,15 @@ def main():
     print(f"📚 共加载 {len(documents)} 个文档，开始向量化并写入 Milvus...")
 
     # 4) 连接 Milvus 向量库（Standalone 端口 19530）
+    # 是否重建集合：默认关闭，避免每次入库清空历史数据（首次建库可设 INGEST_OVERWRITE=1）
+    overwrite_collection = os.getenv("INGEST_OVERWRITE", "0") not in {"0", "false", "False"}
+
     async def _init_store() -> MilvusVectorStore:
         return MilvusVectorStore(
             uri=MILVUS_URI,
             collection_name=COLLECTION,
-            overwrite=True,   # 首次建库可改 True；后续建议做增量
-            upsert_mode=True,  # 允许按 doc_id 覆盖，避免重复
+            overwrite=overwrite_collection,  # 默认 False = 增量 upsert；需重建时设 INGEST_OVERWRITE=1
+            upsert_mode=True,                 # 按 doc_id 覆盖，避免重复
             dim=embed_dim,
             embedding_field="embedding",
         )
@@ -3026,6 +3043,15 @@ def main():
 
     print(f"✅ Ingest done. docs={len(documents)} chunks={len(nodes)} collection={COLLECTION}")
 
+    # 清理词法检索缓存，确保下次查询基于最新语料重建 BM25 索引
+    try:
+        cache_path = Path(os.getenv("LEXICAL_CACHE_PATH", "./data/lexical_corpus.jsonl"))
+        if cache_path.exists():
+            cache_path.unlink()
+            print(f"🧹 已清理词法检索缓存: {cache_path}")
+    except Exception as e:
+        print(f"⚠️  清理词法缓存失败: {e}")
+
 
 def _fix_file_encodings(data_dir: str) -> int:
     """修复目录下文本文件的编码问题"""
@@ -3055,7 +3081,7 @@ def _fix_file_encodings(data_dir: str) -> int:
                         if quality_score < 0.05 and not _should_try_mojibake_repair(utf8_decoded):
                             skipped_count += 1
                             continue
-                    except:
+                    except Exception:
                         pass
                 
                 # 如果不是UTF-8，尝试修复

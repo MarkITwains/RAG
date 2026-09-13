@@ -1,0 +1,58 @@
+image: python:3.10-slim
+
+stages:
+  - lint
+  - test
+
+variables:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .cache/pip
+
+.default_python_setup:
+  before_script:
+    - python -m pip install --upgrade pip
+    - pip install -r requirements.txt
+    - pip install -e .
+
+lint:
+  stage: lint
+  extends: .default_python_setup
+  script:
+    - |
+      if [ -f pyproject.toml ] && python - <<'PY'
+      import sys
+      try:
+        import tomllib
+      except Exception:
+        import tomli as tomllib
+      from pathlib import Path
+      content = Path("pyproject.toml").read_bytes()
+      data = tomllib.loads(content.decode("utf-8"))
+      if "tool" in data and "ruff" in data["tool"]:
+        sys.exit(0)
+      sys.exit(1)
+      PY
+      then
+        python -m pip install ruff
+        ruff check .
+      else
+        echo "No ruff config found, skipping lint."
+      fi
+
+pytest:
+  stage: test
+  extends: .default_python_setup
+  script:
+    - |
+      if [ -d tests ] || [ -f pytest.ini ] || [ -f tox.ini ] || [ -f setup.cfg ]; then
+        python -m pip install pytest
+        pytest -q
+      else
+        echo "No tests config found, skipping tests."
+      fi

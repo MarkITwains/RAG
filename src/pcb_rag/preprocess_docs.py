@@ -106,7 +106,7 @@ def detect_encoding(data: bytes) -> Tuple[str, float]:
                 # 如果UTF-8质量更好，使用UTF-8
                 if utf8_garbage < 0.05:
                     return 'utf-8', 0.99
-            except:
+            except Exception:
                 pass
         
         # chardet有时会误判中文为ISO-8859-1
@@ -117,7 +117,7 @@ def detect_encoding(data: bytes) -> Tuple[str, float]:
                 chinese_count = len(re.findall(r'[\u4e00-\u9fff]', decoded))
                 if chinese_count > 10:  # 有较多中文
                     return 'gbk', 0.95
-            except:
+            except Exception:
                 pass
         
         return encoding, confidence
@@ -137,7 +137,7 @@ def decode_file_content(file_path: str) -> Tuple[str, str]:
     if encoding.lower() in ('utf-8', 'utf-8-sig'):
         try:
             return raw_data.decode('utf-8'), 'utf-8'
-        except:
+        except Exception:
             pass
     
     # 尝试解码
