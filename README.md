@@ -1,48 +1,139 @@
-# PCB-RAG：面向 PCB 知识库的智能问答系统
+<h1 align="center">PCB-RAG</h1>
 
-PCB-RAG 是一个面向 PCB 设计规范、工艺资料与工程经验文档的检索增强生成（RAG）系统。项目支持文档入库、向量检索、BM25 词法召回、多路融合、Rerank 精排、元数据过滤和 Dify 外部知识库 API 集成，可用于构建 PCB 领域的智能问答助手。
+<p align="center"><b>面向 PCB 知识库的检索增强生成（RAG）问答系统</b></p>
 
-博客文章：https://blog.eecs.top/index.php/archives/3/
+<p align="center">
+  文档入库 · 向量检索 · BM25 词法召回 · 多路融合 · Rerank 精排 · Dify 集成
+</p>
+
+<p align="center">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="LlamaIndex" src="https://img.shields.io/badge/Built%20with-LlamaIndex-6E56CF">
+  <img alt="Milvus" src="https://img.shields.io/badge/Vector%20Store-Milvus-00A1EA">
+  <img alt="FastAPI" src="https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-green">
+</p>
+
+<p align="center">博客文章：<a href="https://blog.eecs.top/index.php/archives/3/">https://blog.eecs.top/index.php/archives/3/</a></p>
+
+---
+
+PCB-RAG 面向 PCB 设计规范、工艺资料与工程经验文档，覆盖从文档预处理、结构切块入库，到混合检索、重排序、答案合成与对外服务的完整链路，可用于构建 PCB 领域的智能问答助手。
+
+## 目录
+
+- [项目亮点](#项目亮点)
+- [系统架构](#系统架构)
+- [技术栈](#技术栈)
+- [目录结构](#目录结构)
+- [快速开始](#快速开始)
+- [检索链路](#检索链路)
+- [Dify 外部知识库 API](#dify-外部知识库-api)
+- [配置说明](#配置说明)
+- [常见问题](#常见问题)
+- [开发意义](#开发意义)
+- [公开仓库说明](#公开仓库说明)
+- [License](#license)
 
 ## 项目亮点
 
-- **本地 / API 双后端**：LLM、Embedding、Rerank 均支持「本地服务（Ollama / HuggingFace）」与「OpenAI 兼容 API」两种后端，通过 `*_BACKEND` 环境变量切换，不锁定厂商。
-- **一键环境补全**：`scripts/setup.sh` 自动创建虚拟环境、安装依赖、生成 `.env`、启动 Milvus，并按后端检查模型可用性。
-- **领域化文档处理**：针对 PCB 规范、EDA 工具文档、工艺参数等资料进行清洗、切块和元数据抽取。
-- **混合检索架构**：结合 Milvus 向量检索、BM25 词法检索、HyDE 查询扩展和多路召回融合，提高专业问题召回率。
-- **Rerank 精排**：支持 API 精排（Jina / 硅基流动等）与本地模型精排（Qwen3-Reranker / cross-encoder）。
-- **Dify 集成**：提供 FastAPI 外部知识库接口，可接入 Dify 工作流或对话应用。
-- **标准项目结构**：采用 `src/pcb_rag` 包结构，便于安装、导入和维护。
+| 亮点 | 说明 |
+| --- | --- |
+| **本地 / API 双后端** | LLM、Embedding、Rerank 均支持「本地服务」与「OpenAI 兼容 API」两种后端，通过 `*_BACKEND` 环境变量切换，不锁定厂商 |
+| **一键环境补全** | `scripts/setup.sh` 自动创建虚拟环境、安装依赖、生成 `.env`、启动 Milvus，并按后端检查模型可用性 |
+| **领域化文档处理** | 面向 PCB 规范、EDA 工具文档与工艺参数，内置编码修复、OCR 乱码清理、结构感知切块与元数据抽取 |
+| **混合检索架构** | Milvus 向量检索 + BM25 词法检索 + HyDE 查询扩展 + 加权 RRF 多路融合，提升专业问题召回率 |
+| **可切换精排** | 支持 API 精排（Jina / 硅基流动等）与本地精排（Qwen3-Reranker / cross-encoder / SBERT） |
+| **上下文扩展** | 命中的 chunk 自动并入相邻与父级 chunk 内容，缓解长文档上下文割裂 |
+| **Dify 集成** | 提供符合规范的 FastAPI 外部知识库接口，可直接接入 Dify 工作流或对话应用 |
+| **标准工程结构** | `src/pcb_rag` 包结构 + `pyproject.toml`，便于安装、导入与维护 |
+
+## 系统架构
+
+### 模型层：本地 / API 双后端
+
+```mermaid
+flowchart TB
+    subgraph F["api_clients.py — 统一模型工厂"]
+        direction LR
+        LLM["LLM"]
+        EMB["Embedding"]
+        RRK["Rerank"]
+    end
+
+    LLM --> LLM_L["local：Ollama"]
+    LLM --> LLM_A["api：OpenAI 兼容"]
+
+    EMB --> EMB_L["local：Ollama"]
+    EMB --> EMB_A["api：OpenAI 兼容"]
+
+    RRK --> RRK_A["api：HTTP /rerank"]
+    RRK --> RRK_H["local：HF / Qwen3-Reranker / SBERT"]
+    RRK --> RRK_N["none：关闭精排"]
+```
+
+### 检索链路
+
+```mermaid
+flowchart LR
+    Q["用户问题"] --> FLT["元数据过滤解析"]
+    FLT --> EXP["查询扩展 + HyDE"]
+    EXP --> DENSE["向量召回"]
+    EXP --> SPARSE["BM25 词法召回"]
+    DENSE --> FUSE["加权 RRF 融合"]
+    SPARSE --> FUSE
+    FUSE --> RERANK["Rerank 精排"]
+    RERANK --> CTX["相邻 / 父级 Chunk 扩展"]
+    CTX --> ANS["LLM 合成答案 + 引用"]
+```
 
 ## 技术栈
 
-- Python 3.10+
-- LlamaIndex
-- Milvus
-- OpenAI 兼容 API / Ollama / HuggingFace Transformers
-- FastAPI
-- Dify External Knowledge API
+| 层次 | 组件 |
+| --- | --- |
+| 语言 | Python 3.10+ |
+| RAG 框架 | LlamaIndex |
+| 向量数据库 | Milvus 2.6（Docker Compose 一键启动） |
+| 模型服务 | OpenAI 兼容 API / Ollama / HuggingFace Transformers |
+| 服务框架 | FastAPI + Uvicorn |
+| 外部集成 | Dify External Knowledge API |
+| 分词与检索 | jieba 领域词典 + 本地 BM25+ 词法索引 |
 
 ## 目录结构
 
 ```text
 .
-├── .env.example                  # 公开安全的环境变量模板
+├── .env.example                  # 环境变量模板（本地 / API 双后端）
+├── .gitlab-ci.yml                # CI：lint + pytest
 ├── requirements.txt              # Python 依赖
 ├── pyproject.toml                # Python 包配置
 ├── src/pcb_rag/                  # 核心源码包
 │   ├── api_clients.py            # LLM / Embedding / Rerank 双后端工厂
-│   ├── ingest.py                 # 文档入库
-│   ├── query.py                  # 交互式问答
-│   ├── preprocess_docs.py        # 文档预处理
-│   └── dify_external_api.py      # Dify 外部知识库 API
+│   ├── ingest.py                 # 文档预处理、切块与入库
+│   ├── query.py                  # 检索链路与交互式问答
+│   ├── preprocess_docs.py        # 编码修复与乱码清理
+│   └── dify_external_api.py      # Dify 外部知识库 API 服务
 ├── scripts/                      # 一键安装与运行脚本
+│   ├── setup.sh                  # 环境一键补全
+│   ├── check_env.py              # 环境自检
+│   ├── run_ingest.sh             # 文档入库
+│   ├── run_query.sh              # 交互式问答
+│   ├── serve_api.sh              # 启动 API 服务
+│   └── run_optimized.sh          # 交互式参数配置脚本
 ├── docker/milvus/docker-compose.yml
 ├── data/README.md                # 数据目录说明
-└── docs/                         # 配置、集成和优化说明文档
+└── docs/                         # 配置、集成与优化文档
 ```
 
 ## 快速开始
+
+### 前置要求
+
+- Python 3.10+
+- Docker 与 Docker Compose（用于启动 Milvus）
+- 模型服务（二选一）：
+  - 本地：安装并启动 [Ollama](https://ollama.com/)
+  - API：准备任意 OpenAI 兼容服务的 `BASE_URL` 与 `API_KEY`
 
 ### 1. 一键补全环境
 
@@ -50,31 +141,34 @@ PCB-RAG 是一个面向 PCB 设计规范、工艺资料与工程经验文档的�
 bash scripts/setup.sh
 ```
 
-该脚本会执行：
+脚本执行内容：
 
-- 创建 `.venv`
-- 安装 `requirements.txt`
-- 执行 `pip install -e .`
-- 从 `.env.example` 生成 `.env`
-- 创建 `data/clear_docs/`、`data/raw_docs/`、`logs/`
-- 启动 `docker/milvus/docker-compose.yml`
-- 按 `LLM_BACKEND` / `EMBED_BACKEND` 检查后端（local 时拉取 Ollama 模型，api 时跳过）
-- 运行 `scripts/check_env.py`
-
-前置要求：Python 3.10+、Docker、Docker Compose；本地后端需要 Ollama，API 后端只需可访问的 OpenAI 兼容服务。详细说明见 `docs/SETUP.md`。
+| 步骤 | 内容 |
+| --- | --- |
+| 1 | 创建 `.venv` 虚拟环境 |
+| 2 | 安装 `requirements.txt`，并执行 `pip install -e .` |
+| 3 | 从 `.env.example` 生成 `.env` |
+| 4 | 创建 `data/clear_docs/`、`data/raw_docs/`、`logs/` |
+| 5 | 启动 `docker/milvus/docker-compose.yml` |
+| 6 | 按 `LLM_BACKEND` / `EMBED_BACKEND` 检查模型后端 |
+| 7 | 运行 `scripts/check_env.py` 完成环境自检 |
 
 ### 2. 配置模型后端
 
-编辑 `.env`，按需选择后端：
+编辑 `.env` 选择后端，三者可自由混搭。
+
+**全本地（Ollama）**
 
 ```bash
-# 方式一：全本地（Ollama）
 LLM_BACKEND=local
 EMBED_BACKEND=local
 OLLAMA_LLM_MODEL=qwen3.5:35b-a3b-q4_K_M
 OLLAMA_EMBED_MODEL=qwen3-embedding:8b-q8_0
+```
 
-# 方式二：全 API（OpenAI 兼容，以硅基流动为例）
+**全 API（OpenAI 兼容，以硅基流动为例）**
+
+```bash
 LLM_BACKEND=api
 EMBED_BACKEND=api
 LLM_BASE_URL=https://api.siliconflow.cn/v1
@@ -82,11 +176,9 @@ LLM_API_KEY=sk-xxxx
 LLM_MODEL=Qwen/Qwen3-8B
 EMBED_MODEL=BAAI/bge-m3
 EMBED_DIM=1024
-
-# 方式三：混搭（例如 LLM 走 API，Embedding 走本地）
 ```
 
-Rerank 后端：
+**Rerank 后端**
 
 ```bash
 # API 精排（推荐，无需本地显存）
@@ -99,6 +191,8 @@ RERANK_API_MODEL=jina-reranker-v2-base-multilingual
 RERANK_BACKEND=qwen3reranker
 ```
 
+> 混搭示例：LLM 走 API、Embedding 走本地，只需分别设置 `LLM_BACKEND` 与 `EMBED_BACKEND`。
+
 ### 3. 准备数据
 
 公开仓库不包含任何原始语料。请将你有权使用的 PCB 文档放入：
@@ -110,27 +204,15 @@ data/clear_docs/
 ### 4. 文档入库
 
 ```bash
-bash scripts/run_ingest.sh
+bash scripts/run_ingest.sh      # 等价：python -m pcb_rag.ingest
 ```
 
-等价命令：
-
-```bash
-python -m pcb_rag.ingest
-```
-
-> 默认增量写入（`INGEST_OVERWRITE=0`）。如需清空重建集合，设置 `INGEST_OVERWRITE=1`。
+> 默认增量写入（`INGEST_OVERWRITE=0`）；如需清空重建集合，设置 `INGEST_OVERWRITE=1`。
 
 ### 5. 运行问答
 
 ```bash
-bash scripts/run_query.sh
-```
-
-等价命令：
-
-```bash
-python -m pcb_rag.query
+bash scripts/run_query.sh       # 等价：python -m pcb_rag.query
 ```
 
 示例问题：
@@ -140,56 +222,147 @@ python -m pcb_rag.query
 Altium Designer 中如何处理高速差分线等长？
 ```
 
-## Dify 外部知识库 API
+## 检索链路
 
-启动服务：
+| 阶段 | 说明 |
+| --- | --- |
+| 元数据过滤解析 | 从问题中提取 `vendor` / `eda` / `layer_count` / `copper_oz` 等条件，缩小检索范围 |
+| 查询扩展 | PCB 同义词与缩写扩展，提升专业术语召回 |
+| HyDE 增强 | 生成假设文档参与向量检索，缓解短查询语义稀疏问题 |
+| 多路召回 | 向量检索与 BM25 词法检索并行执行 |
+| 加权 RRF 融合 | 按查询类型动态调整向量 / 词法权重并融合排序 |
+| Rerank 精排 | 使用 API 或本地 cross-encoder 对候选重排序 |
+| 上下文扩展 | 命中 chunk 并入相邻 / 父级 chunk，保持上下文完整 |
+| 答案合成 | 基于 RAG Prompt 生成答案并标注引用来源 |
+
+## Dify 外部知识库 API
 
 ```bash
 bash scripts/serve_api.sh
-```
-
-等价命令：
-
-```bash
-uvicorn pcb_rag.dify_external_api:app --host 0.0.0.0 --port 8000
+# 等价：uvicorn pcb_rag.dify_external_api:app --host 0.0.0.0 --port 8000
 ```
 
 在 Dify 外部知识库中配置：
 
-- URL：`http://<your-server-host>:8000/retrieval`
-- API Key：`Bearer <your DIFY_API_TOKEN>`
+| 配置项 | 值 |
+| --- | --- |
+| URL | `http://<your-server-host>:8000/retrieval` |
+| API Key | `Bearer <your DIFY_API_TOKEN>` |
 
-更多步骤见 `docs/DIFY_INTEGRATION_GUIDE.md`。`/health` 端点会返回当前后端配置与检索参数，便于排查问题。
+主要端点：
 
-## 常用配置
+| 端点 | 说明 |
+| --- | --- |
+| `POST /retrieval` | Dify 外部知识库规范接口，返回命中的 records |
+| `POST /api/ask` | 检索 + LLM 合成答案，支持传入对话历史 |
+| `POST /api/chat` | 服务端会话记忆问答，返回 `session_id` |
+| `GET /health` | 健康检查，展示索引 / 后端 / 检索参数状态 |
 
-| 环境变量 | 默认值 | 说明 |
+更多步骤见 `docs/DIFY_INTEGRATION_GUIDE.md`。
+
+## 配置说明
+
+### 模型后端
+
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DATA_DIR` | `./data/clear_docs` | 待入库文档目录 |
-| `MILVUS_URI` | `http://127.0.0.1:19530` | Milvus 服务地址 |
-| `COLLECTION` | `pcb_kb` | 向量集合名称 |
-| `INGEST_OVERWRITE` | `0` | 入库时是否清空重建集合 |
-| `LLM_BACKEND` | `local` | LLM 后端：`local`(Ollama) / `api`(OpenAI 兼容) |
+| `LLM_BACKEND` | `local` | `local`（Ollama）/ `api`（OpenAI 兼容） |
+| `EMBED_BACKEND` | `local` | `local`（Ollama）/ `api`（OpenAI 兼容） |
+| `RERANK_BACKEND` | `qwen3reranker` | `api` / `hf` / `qwen3reranker` / `sbert` / `none` |
+| `RERANK_ENABLED` | `1` | 是否启用精排 |
 | `OLLAMA_BASE` | `http://127.0.0.1:11434` | 本地 Ollama 服务地址 |
 | `OLLAMA_LLM_MODEL` | `qwen3.5:35b-a3b-q4_K_M` | 本地 LLM 模型 |
 | `OLLAMA_EMBED_MODEL` | `qwen3-embedding:8b-q8_0` | 本地 Embedding 模型 |
 | `LLM_BASE_URL` | 空 | API 后端地址（如 `https://api.deepseek.com/v1`） |
 | `LLM_API_KEY` | 空 | API 密钥 |
 | `LLM_MODEL` | 空 | API 模型名 |
-| `EMBED_BACKEND` | `local` | Embedding 后端：`local` / `api` |
 | `EMBED_BASE_URL` | 空 | Embedding API 地址（留空复用 `LLM_BASE_URL`） |
 | `EMBED_MODEL` | 空 | Embedding 模型名（api 后端必填） |
 | `EMBED_DIM` | 空 | 向量维度（留空自动探测） |
-| `RECALL_TOP_K` | `200` | 初始召回数量 |
-| `LEXICAL_CACHE_TTL_HOURS` | `24` | 词法索引缓存有效期（小时） |
-| `CHUNK_EXPAND_MAX_EXTRA` | `5` | 上下文扩展可额外返回的条数 |
-| `RERANK_ENABLED` | `1` | 是否启用 Rerank |
-| `RERANK_BACKEND` | `qwen3reranker` | Rerank 后端：`api` / `hf` / `qwen3reranker` / `sbert` / `none` |
 | `RERANK_API_URL` | 空 | API 精排地址 |
 | `RERANK_API_MODEL` | 空 | API 精排模型名 |
-| `DIFY_API_TOKEN` | `change-me` | Dify 外部知识库鉴权 Token |
 
-完整配置见 `.env.example` 和 `docs/CONFIGURATION_GUIDE.md`。
+### 存储与入库
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DATA_DIR` | `./data/clear_docs` | 待入库文档目录 |
+| `MILVUS_URI` | `http://127.0.0.1:19530` | Milvus 服务地址 |
+| `COLLECTION` | `pcb_kb` | 向量集合名称 |
+| `INGEST_OVERWRITE` | `0` | 入库时是否清空重建集合 |
+| `LEXICAL_CACHE_TTL_HOURS` | `24` | 词法索引缓存有效期（小时） |
+
+### 检索与生成
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RECALL_TOP_K` | `200` | 初始召回数量 |
+| `RERANK_TOP_N` | `200` | 精排后保留数量 |
+| `CHUNK_EXPAND_MAX_EXTRA` | `5` | 上下文扩展可额外返回的条数 |
+| `HYDE_ENABLED` | `1` | 是否启用 HyDE 查询增强 |
+| `CITATION_ENABLED` | `1` | 是否在答案中标注引用来源 |
+
+### 服务
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DIFY_API_TOKEN` | `change-me` | Dify 外部知识库鉴权 Token |
+| `API_PORT` | `8000` | API 服务端口 |
+| `SESSION_EXPIRE_MINUTES` | `60` | 会话过期时间（分钟） |
+| `SESSION_MAX_COUNT` | `1000` | 最大会话数 |
+
+完整配置见 `.env.example` 与 `docs/CONFIGURATION_GUIDE.md`。
+
+## 常见问题
+
+<details>
+<summary>Milvus 连接失败怎么办？</summary>
+
+```bash
+# 查看容器状态
+docker compose -f docker/milvus/docker-compose.yml ps
+
+# 重启 Milvus
+docker compose -f docker/milvus/docker-compose.yml restart
+```
+
+Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确认连通性。
+
+</details>
+
+<details>
+<summary>API 后端启动时报缺少配置？</summary>
+
+- `LLM_BACKEND=api`：需要 `LLM_BASE_URL` 与 `LLM_MODEL`
+- `EMBED_BACKEND=api`：需要 `EMBED_MODEL`（`EMBED_BASE_URL` 留空时自动复用 `LLM_BASE_URL`）
+- `RERANK_BACKEND=api`：需要 `RERANK_API_URL`
+
+运行 `python scripts/check_env.py` 可直接看到缺失项。
+
+</details>
+
+<details>
+<summary>Rerank 不可用或显存不足？</summary>
+
+- `RERANK_BACKEND=api` 必须配置 `RERANK_API_URL`，否则精排初始化失败并回退；
+- 本地精排（`hf` / `qwen3reranker`）需要足够显存，不足时会自动回退为「仅召回」；
+- 不需要精排时设置 `RERANK_BACKEND=none`，或直接改用 API 精排。
+
+</details>
+
+<details>
+<summary>重新入库后 BM25 仍在检索旧内容？</summary>
+
+词法索引缓存在 `LEXICAL_CACHE_PATH`，入库完成后会自动清理；同时 `LEXICAL_CACHE_TTL_HOURS`（默认 24 小时）超期后会自动重建。如需强制刷新，删除该缓存文件即可。
+
+</details>
+
+<details>
+<summary>如何清空并重建向量库？</summary>
+
+设置 `INGEST_OVERWRITE=1` 后重新执行入库脚本即可清空重建集合；保持默认 `0` 时为增量 upsert。
+
+</details>
 
 ## 开发意义
 
