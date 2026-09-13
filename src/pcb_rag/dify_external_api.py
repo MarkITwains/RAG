@@ -47,6 +47,7 @@ from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -83,6 +84,11 @@ from pcb_rag.query import (
     QUERY_ROUTING_ENABLED,
     _classify_query,
     _get_query_strategy,
+    # ── 查询理解升级：意图识别 / 查询分解 / Step-back ──────────────────────
+    understand_query,
+    decompose_query,
+    step_back_query,
+    STEPBACK_ROUTE_WEIGHT,
     # ── 工具函数 ──────────────────────────────────────────────────────────
     build_index,
     _try_build_reranker,
@@ -118,6 +124,8 @@ from pcb_rag.query import (
     # ── 答案生成函数 ──────────────────────────────────────────────────────
     generate_answer_with_citation,
     format_answer_with_citations,
+    CITATION_ENABLED,
+    extract_citations,
     SELF_RAG_ENABLED,
     self_rag_query,
     format_self_rag_result,
@@ -125,6 +133,7 @@ from pcb_rag.query import (
 from llama_index.vector_stores.milvus import MilvusVectorStore
 
 from pcb_rag.api_clients import build_llm, describe_backends
+from pcb_rag.cache import all_cache_stats, embed_query_for_cache, get_cache
 
 # ---------------------------------------------------------------------------
 # 1c. 持久 HyDE 线程池 + 第二路变体函数
@@ -188,7 +197,7 @@ _RAG_PROMPT_WITH_HISTORY = """你是 PCB 电路板领域的技术专家。请根
 1. 只基于参考文档中的信息回答，不要编造
 2. 如果文档中没有相关信息，明确说明"根据提供的文档无法回答"
 3. 回答要准确、专业、简洁
-4. 在回答末尾标注信息来源（如：[来源：GBT4588.4-2017]）
+4. 参考文档带有编号 [1] [2]，引用某条信息时请在对应句子末尾标注同样的角标，例如：[1][2]
 5. 如果用户的问题是对前一轮的追问，请结合对话历史进行回答
 
 对话历史（最近 {n} 轮）：
@@ -729,16 +738,37 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
         filter_strs = [f"{f.key}={f.value}" for f in getattr(filters, "filters", [])]
         logger.info(f"[Filter] {'; '.join(filter_strs)}")
 
-    # ── Step 2: 智能查询路由（动态权重）──────────────────────────────────
+    # ── Step 2: 查询理解（意图识别 + 动态权重 + 分解 / Step-back 决策）────
     query_type = "general"
     strategy = None
     dynamic_weights = FUSION_WEIGHTS
+    sub_queries: List[str] = []
+    step_back_q = ""
     if QUERY_ROUTING_ENABLED:
-        query_type = _classify_query(clean_q)
-        strategy = _get_query_strategy(query_type)
-        dynamic_weights = (strategy["vector_weight"], strategy["bm25_weight"])
-        logger.info(f"[QueryRoute] {query_type} ({strategy['description']}), "
-                    f"weights(vec={dynamic_weights[0]:.2f}, bm25={dynamic_weights[1]:.2f})")
+        understanding = understand_query(clean_q)
+        query_type = understanding["type"]
+        strategy = {
+            "num_queries": understanding["num_queries"],
+            "description": understanding["description"],
+        }
+        dynamic_weights = (understanding["vector_weight"], understanding["bm25_weight"])
+        logger.info(
+            f"[QueryRoute] {query_type} ({understanding['description']}), "
+            f"weights(vec={dynamic_weights[0]:.2f}, bm25={dynamic_weights[1]:.2f}), "
+            f"decompose={understanding['need_decompose']}, step_back={understanding['need_step_back']}"
+        )
+
+        # 查询分解：复合问题拆成子问题，作为额外召回查询
+        if understanding["need_decompose"]:
+            sub_queries = decompose_query(clean_q)
+            if sub_queries:
+                logger.info(f"[Decompose] 拆出 {len(sub_queries)} 个子问题: {sub_queries}")
+
+        # Step-back：生成上位问题，作为额外向量召回路径
+        if understanding["need_step_back"]:
+            step_back_q = step_back_query(clean_q)
+            if step_back_q:
+                logger.info(f"[StepBack] 上位问题: {step_back_q}")
 
     # ── Step 3: 查询扩展（同义词替换）────────────────────────────────────
     expanded_q = _expand_query(clean_q)
@@ -792,6 +822,10 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
         else:
             expand_queries = [q2doc_q]
 
+        # 查询分解出的子问题并入召回查询集
+        if sub_queries:
+            expand_queries = list(dict.fromkeys([*expand_queries, *sub_queries]))
+
         multipath_retriever = MultiPathRetriever(
             dense_retriever=vector_retriever,
             sparse_retriever=lexical_retriever,
@@ -840,6 +874,25 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
         else:
             raw_queries = [expanded_q]
             bm25_queries = [expanded_q]
+
+        # 查询分解出的子问题并入多路召回
+        if sub_queries:
+            raw_queries = list(dict.fromkeys([*raw_queries, *sub_queries]))
+            bm25_queries = list(dict.fromkeys([*bm25_queries, *sub_queries]))
+
+        # Step-back 上位问题：单独一路向量召回，补足背景知识
+        stepback_vec_nodes: List[NodeWithScore] = []
+        if step_back_q:
+            try:
+                seen_stepback: set = set()
+                for n in vector_retriever.retrieve(step_back_q)[:recall_k]:
+                    nid = _node_id_key(n)
+                    if nid not in seen_stepback:
+                        seen_stepback.add(nid)
+                        stepback_vec_nodes.append(n)
+                logger.info(f"[StepBack] 上位问题召回 {len(stepback_vec_nodes)} 条")
+            except Exception as e:
+                logger.warning(f"[StepBack] 检索失败: {e}")
 
         # ★ 核心优化：
         #   HyDE 2路提前提交到专用 _HYDE_EXECUTOR（不阻塞主检索）
@@ -934,13 +987,15 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
             logger.warning("[HyDE] 本次全部未命中，可能原因: LLM 响应慢/模型加载中。"
                           f" 预算={HYDE_WAIT_BUDGET}s, 主检索耗时={hyde_elapsed:.1f}s")
 
-        # RRF 三路融合
+        # RRF 多路融合（原始向量 + HyDE 向量 + Step-back 向量 + BM25）
         routes: list = [
             (raw_vec_nodes, vec_weight),
             (bm25_nodes, bm25_weight),
         ]
         if hyde_vec_nodes:
             routes.insert(1, (hyde_vec_nodes, hyde_weight))
+        if stepback_vec_nodes:
+            routes.append((stepback_vec_nodes, vec_weight * float(STEPBACK_ROUTE_WEIGHT)))
 
         retrieved_nodes = _weighted_rrf_fuse_three_routes(
             routes, top_n=recall_k, rrf_k=FUSION_RRF_K,
@@ -1036,7 +1091,17 @@ def retrieve_chunks(user_query: str, top_k: int = 5, score_threshold: float = 0.
     """
     完整执行 PCB-RAG 检索管道，返回适配 Dify 的 Record 列表。
     内部调用 _retrieve_nodes 获取 NodeWithScore，再转换为 Record。
+    带语义缓存：相同或语义相近的查询直接复用结果。
     """
+    cache = get_cache("retrieval")
+    cache_key = f"{user_query}|top_k={top_k}|thr={score_threshold}"
+    query_vec = embed_query_for_cache(user_query)
+
+    cached = cache.get(cache_key, query_vec)
+    if isinstance(cached, dict) and cached.get("params") == [top_k, score_threshold]:
+        logger.info(f"[Cache] 检索命中缓存（query={user_query[:40]}...）")
+        return [Record(**item) for item in cached.get("records", [])]
+
     nodes = _retrieve_nodes(user_query, top_k=top_k, score_threshold=score_threshold)
     records: List[Record] = []
     for nws in nodes:
@@ -1057,6 +1122,11 @@ def retrieve_chunks(user_query: str, top_k: int = 5, score_threshold: float = 0.
                 "eda": meta.get("eda", ""),
             },
         ))
+    cache.set(
+        cache_key,
+        {"params": [top_k, score_threshold], "records": [r.model_dump() for r in records]},
+        query_vec,
+    )
     logger.info(f"[Result] 返回 {len(records)} 条记录（query={user_query[:40]}...）")
     return records
 
@@ -1548,6 +1618,123 @@ def ask_rag_plain(
 
 
 # ---------------------------------------------------------------------------
+# 10d. /api/ask/stream：SSE 流式问答端点
+#      先推送检索来源，再逐 token 推送答案，适合需要流式体验的前端
+# ---------------------------------------------------------------------------
+@app.post("/api/ask/stream", summary="流式问答接口（SSE）")
+def ask_rag_stream(
+    req: AskReq,
+    _: str = Depends(verify_token),
+):
+    """SSE 流式问答。
+
+    事件类型：
+
+    - ``sources``  ：检索完成后立即推送，包含来源列表与改写后的查询
+    - ``token``    ：逐段推送答案文本
+    - ``citations``：答案生成完毕后的引用溯源
+    - ``error``    ：生成过程中出错
+    - ``done``     ：流结束
+    """
+    import json as _json
+
+    if not req.query.strip():
+        raise HTTPException(status_code=400, detail="query 不能为空")
+
+    threshold = req.score_threshold if req.score_threshold_enabled else 0.0
+    raw_query = req.query.strip()
+    history_dicts = [m.model_dump() for m in req.chat_history] if req.chat_history else []
+
+    def _sse(event: str, payload: dict) -> str:
+        return f"event: {event}\ndata: {_json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def _generate():
+        try:
+            # 1) 历史感知查询改写
+            search_query = raw_query
+            if history_dicts:
+                search_query = _rewrite_query_with_history(raw_query, history_dicts)
+
+            # 2) 检索
+            nodes = _retrieve_nodes(
+                user_query=search_query,
+                top_k=req.top_k,
+                score_threshold=threshold,
+            )
+
+            context, sources_info = build_context_with_sources(nodes)
+            yield _sse(
+                "sources",
+                {
+                    "sources": [info.get("source_path", "") for info in sources_info],
+                    "citations": [
+                        {
+                            "index": info.get("index"),
+                            "source_name": info.get("source_name", ""),
+                            "section": info.get("section", ""),
+                            "chunk_id": info.get("chunk_id", ""),
+                        }
+                        for info in sources_info
+                    ],
+                    "rewritten_query": search_query if search_query != raw_query else None,
+                },
+            )
+
+            # 3) 构造 Prompt（与 /api/ask 保持一致）
+            if history_dicts:
+                recent = history_dicts[-_MAX_HISTORY_TURNS:]
+                history_lines = []
+                for msg in recent:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    if role == "user":
+                        history_lines.append(f"用户：{content}")
+                    elif role == "assistant":
+                        truncated = content[:300] + "..." if len(content) > 300 else content
+                        history_lines.append(f"助手：{truncated}")
+                prompt = _RAG_PROMPT_WITH_HISTORY.format(
+                    n=len(recent),
+                    history="\n".join(history_lines),
+                    context=context,
+                    query=raw_query,
+                )
+            else:
+                prompt = RAG_PROMPT_TEMPLATE.format(context=context, query=raw_query)
+
+            # 4) 流式生成
+            answer_parts: List[str] = []
+            try:
+                for chunk in Settings.llm.stream_complete(prompt):
+                    delta = getattr(chunk, "delta", None)
+                    if delta is None:
+                        delta = getattr(chunk, "text", "") or ""
+                    if delta:
+                        answer_parts.append(delta)
+                        yield _sse("token", {"text": delta})
+            except Exception as e:
+                logger.error(f"[Error] 流式生成失败: {e}", exc_info=True)
+                yield _sse("error", {"message": f"生成失败: {e}"})
+
+            answer = "".join(answer_parts)
+            if CITATION_ENABLED and answer:
+                try:
+                    yield _sse("citations", {"citations": extract_citations(answer, nodes)})
+                except Exception:
+                    pass
+
+            yield _sse("done", {"answer_length": len(answer)})
+        except Exception as e:
+            logger.error(f"[Error] /api/ask/stream 异常: {e}", exc_info=True)
+            yield _sse("error", {"message": str(e)})
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
 # 11. 会话管理 API 端点
 # ---------------------------------------------------------------------------
 class SessionCreateRes(BaseModel):
@@ -1675,6 +1862,7 @@ def health_check():
             "CHUNK_EXPAND_ENABLED": CHUNK_EXPAND_ENABLED,
         },
         "backends": describe_backends(),
+        "cache": all_cache_stats(),
     }
 
 

@@ -26,7 +26,10 @@ milvus/volumes/
 data/*
 !data/README.md
 !data/.gitkeep
-eval/
+# 评测数据集与报告（评测脚本本身保留在版本库）
+eval/datasets/
+eval/reports/
+eval/*.json
 history/
 existing_repo/
 rag.code-workspace

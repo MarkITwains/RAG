@@ -1,0 +1,303 @@
+"""PCB-RAG 评测指标（LLM-as-Judge 实现，不引入额外依赖）。
+
+四个核心指标：
+
+- **Faithfulness（忠实度）**：答案中的每条陈述是否能被检索上下文支持
+- **Answer Relevancy（答案相关性）**：答案是否真正回应了问题
+- **Context Precision（上下文精确率）**：相关上下文是否排在前面（用平均精度 AP）
+- **Context Recall（上下文召回率）**：参考答案所需信息是否都被召回
+
+生产参考阈值（可按业务与风险容忍度调整）：
+
+===============  =========
+指标              参考阈值
+===============  =========
+Faithfulness      >= 0.75
+Answer Relevancy  >= 0.80
+Context Precision >= 0.70
+Context Recall    >= 0.80
+===============  =========
+
+诊断建议：指标要组合起来读，而不是单独看。
+
+- 高忠实度 + 低上下文相关性 → 生成正常，是**检索问题**
+- 低忠实度 + 上下文正确     → **生成漂移**（收紧提示 / 降温 / 换模型）
+- 低忠实度 + 答案却正确     → 最危险：模型绕开检索、直接用训练数据作答
+- 高召回 + 低精确率         → 信息都在但被噪声淹没，应加强重排
+- 低召回 + 高精确率         → 召回太窄，应增大 top-k 或改进查询改写
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Optional, Sequence
+
+THRESHOLDS = {
+    "faithfulness": 0.75,
+    "answer_relevancy": 0.80,
+    "context_precision": 0.70,
+    "context_recall": 0.80,
+}
+
+ALL_METRICS = list(THRESHOLDS.keys())
+
+
+# ---------------------------------------------------------------------------
+# 工具
+# ---------------------------------------------------------------------------
+def _strip_think(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
+
+
+def _extract_json(text: str) -> Optional[Any]:
+    """从模型输出中提取第一个 JSON 对象或数组。"""
+    text = _strip_think(text)
+    for pattern in (r"\{.*\}", r"\[.*\]"):
+        match = re.search(pattern, text, re.DOTALL)
+        if not match:
+            continue
+        try:
+            return json.loads(match.group())
+        except Exception:
+            continue
+    return None
+
+
+def _ask_json(llm, prompt: str, default: Any) -> Any:
+    """调用 LLM 并解析 JSON，失败返回 default。"""
+    try:
+        response = llm.complete(prompt)
+        text = response.text if hasattr(response, "text") else str(response)
+        data = _extract_json(text)
+        return data if data is not None else default
+    except Exception:
+        return default
+
+
+def _clip01(value: Any) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        return 0.0
+    return max(0.0, min(1.0, v))
+
+
+def _short(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit]
+
+
+# ---------------------------------------------------------------------------
+# 1. Faithfulness
+# ---------------------------------------------------------------------------
+_FAITHFULNESS_PROMPT = """你是严格的答案审核员。请判断"回答"中的每条事实性陈述能否从"参考资料"中得到支持。
+
+参考资料：
+{context}
+
+回答：
+{answer}
+
+请输出 JSON（每条陈述一项）：
+{{"statements": [{{"text": "陈述原文", "supported": true}}]}}
+
+只输出 JSON，不要解释。"""
+
+
+def faithfulness(answer: str, contexts: Sequence[str], llm) -> float:
+    """答案中能被上下文支持的陈述占比。"""
+    if not answer or not contexts:
+        return 0.0
+    context = "\n\n".join(contexts)
+    data = _ask_json(
+        llm,
+        _FAITHFULNESS_PROMPT.format(context=_short(context, 8000), answer=_short(answer, 3000)),
+        {"statements": []},
+    )
+    statements = data.get("statements") if isinstance(data, dict) else None
+    if not isinstance(statements, list) or not statements:
+        return 0.0
+    supported = sum(1 for s in statements if isinstance(s, dict) and s.get("supported"))
+    return _clip01(supported / len(statements))
+
+
+# ---------------------------------------------------------------------------
+# 2. Answer Relevancy
+# ---------------------------------------------------------------------------
+_RELEVANCY_PROMPT = """你是严格的答案审核员。请判断"回答"是否真正回应了"问题"（只判断是否切题，不判断事实是否正确）。
+
+问题：{question}
+
+回答：{answer}
+
+请输出 JSON：{{"score": 0.0}}
+
+其中 score 为 0~1 的数字：1 表示完全切题且有实质内容，0 表示答非所问。
+只输出 JSON。"""
+
+
+def answer_relevancy(question: str, answer: str, llm) -> float:
+    """答案与问题的相关程度（0~1）。"""
+    if not question or not answer:
+        return 0.0
+    data = _ask_json(
+        llm,
+        _RELEVANCY_PROMPT.format(question=_short(question, 1000), answer=_short(answer, 3000)),
+        {"score": 0.0},
+    )
+    if isinstance(data, dict):
+        return _clip01(data.get("score", 0.0))
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# 3. Context Precision（平均精度 AP）
+# ---------------------------------------------------------------------------
+_CONTEXT_RELEVANT_PROMPT = """请判断下面这段参考资料是否有助于回答该问题。
+
+问题：{question}
+
+参考资料：
+{context}
+
+只输出 JSON：{{"relevant": true}}"""
+
+
+def context_precision(question: str, contexts: Sequence[str], llm) -> float:
+    """相关上下文是否排在前面；用平均精度（AP）度量位置惩罚。"""
+    if not contexts:
+        return 0.0
+
+    flags: list[bool] = []
+    for ctx in contexts:
+        data = _ask_json(
+            llm,
+            _CONTEXT_RELEVANT_PROMPT.format(question=_short(question, 1000), context=_short(ctx, 2000)),
+            {"relevant": False},
+        )
+        flags.append(bool(data.get("relevant")) if isinstance(data, dict) else False)
+
+    total_relevant = sum(flags)
+    if total_relevant == 0:
+        return 0.0
+
+    hits = 0
+    acc = 0.0
+    for i, flag in enumerate(flags, 1):
+        if flag:
+            hits += 1
+            acc += hits / i  # precision@i
+    return _clip01(acc / total_relevant)
+
+
+# ---------------------------------------------------------------------------
+# 4. Context Recall
+# ---------------------------------------------------------------------------
+_RECALL_PROMPT = """你是严格的审核员。请判断"参考答案"中的每条关键信息能否在"参考资料"中找到。
+
+参考资料：
+{context}
+
+参考答案：
+{ground_truth}
+
+请输出 JSON（每条关键信息一项）：
+{{"statements": [{{"text": "信息点", "found": true}}]}}
+
+只输出 JSON，不要解释。"""
+
+
+def context_recall(ground_truth: str, contexts: Sequence[str], llm) -> float:
+    """参考答案中的信息点被上下文覆盖的比例。"""
+    if not ground_truth or not contexts:
+        return 0.0
+    context = "\n\n".join(contexts)
+    data = _ask_json(
+        llm,
+        _RECALL_PROMPT.format(context=_short(context, 8000), ground_truth=_short(ground_truth, 3000)),
+        {"statements": []},
+    )
+    statements = data.get("statements") if isinstance(data, dict) else None
+    if not isinstance(statements, list) or not statements:
+        return 0.0
+    found = sum(1 for s in statements if isinstance(s, dict) and s.get("found"))
+    return _clip01(found / len(statements))
+
+
+# ---------------------------------------------------------------------------
+# 批量入口
+# ---------------------------------------------------------------------------
+def evaluate_case(
+    question: str,
+    answer: str,
+    contexts: Sequence[str],
+    ground_truth: str,
+    llm,
+    metrics: Optional[Sequence[str]] = None,
+) -> dict:
+    """评估单条样本，返回各指标得分与 overall 均值。"""
+    names = list(metrics or ALL_METRICS)
+    result: dict[str, float] = {}
+
+    if "faithfulness" in names:
+        result["faithfulness"] = faithfulness(answer, contexts, llm)
+    if "answer_relevancy" in names:
+        result["answer_relevancy"] = answer_relevancy(question, answer, llm)
+    if "context_precision" in names:
+        result["context_precision"] = context_precision(question, contexts, llm)
+    if "context_recall" in names:
+        result["context_recall"] = context_recall(ground_truth, contexts, llm)
+
+    if result:
+        result["overall"] = round(sum(result.values()) / len(result), 4)
+    return result
+
+
+def summarize(rows: Sequence[dict]) -> dict:
+    """按指标聚合均值，并对照阈值给出通过情况。"""
+    rows = [r for r in rows if r]
+    if not rows:
+        return {}
+
+    summary: dict[str, dict] = {}
+    for name in ALL_METRICS:
+        values = [r[name] for r in rows if isinstance(r.get(name), (int, float))]
+        if not values:
+            continue
+        avg = sum(values) / len(values)
+        threshold = THRESHOLDS.get(name)
+        summary[name] = {
+            "avg": round(avg, 4),
+            "threshold": threshold,
+            "passed": (avg >= threshold) if threshold is not None else None,
+        }
+
+    overall_values = [r["overall"] for r in rows if isinstance(r.get("overall"), (int, float))]
+    if overall_values:
+        summary["overall"] = {"avg": round(sum(overall_values) / len(overall_values), 4)}
+
+    return summary
+
+
+def format_summary(summary: dict) -> str:
+    """把汇总结果格式化为可读文本。"""
+    if not summary:
+        return "（无评测结果）"
+
+    lines = ["指标                    平均分   阈值    是否达标", "-" * 56]
+    for name, info in summary.items():
+        if name == "overall":
+            continue
+        threshold = info.get("threshold")
+        passed = info.get("passed")
+        flag = "达标" if passed else "未达标"
+        if threshold is None:
+            flag = "-"
+        lines.append(f"{name:<22} {info['avg']:<8.4f} {str(threshold or '-'):<7} {flag}")
+
+    if "overall" in summary:
+        lines.append("-" * 56)
+        lines.append(f"{'overall':<22} {summary['overall']['avg']:<8.4f}")
+
+    return "\n".join(lines)

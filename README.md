@@ -30,6 +30,7 @@ PCB-RAG 面向 PCB 设计规范、工艺资料与工程经验文档，覆盖从�
 - [检索链路](#检索链路)
 - [Dify 外部知识库 API](#dify-外部知识库-api)
 - [配置说明](#配置说明)
+- [评测](#评测)
 - [常见问题](#常见问题)
 - [开发意义](#开发意义)
 - [公开仓库说明](#公开仓库说明)
@@ -43,6 +44,8 @@ PCB-RAG 面向 PCB 设计规范、工艺资料与工程经验文档，覆盖从�
 | **一键环境补全** | `scripts/setup.sh` 自动创建虚拟环境、安装依赖、生成 `.env`、启动 Milvus，并按后端检查模型可用性 |
 | **领域化文档处理** | 面向 PCB 规范、EDA 工具文档与工艺参数，内置编码修复、OCR 乱码清理、结构感知切块与元数据抽取 |
 | **混合检索架构** | Milvus 向量检索 + BM25 词法检索 + HyDE 查询扩展 + 加权 RRF 多路融合，提升专业问题召回率 |
+| **查询理解** | 意图识别与动态权重、复合问题自动分解、过于具体的问题自动 Step-back 补充背景知识 |
+| **Contextual Retrieval** | 入库时为每个 chunk 注入「文档 · 章节 · 标准号」语境前缀，缓解切块导致的上下文丢失 |
 | **可切换精排** | 支持 API 精排（Jina / 硅基流动等）与本地精排（Qwen3-Reranker / cross-encoder / SBERT） |
 | **上下文扩展** | 命中的 chunk 自动并入相邻与父级 chunk 内容，缓解长文档上下文割裂 |
 | **Dify 集成** | 提供符合规范的 FastAPI 外部知识库接口，可直接接入 Dify 工作流或对话应用 |
@@ -109,10 +112,15 @@ flowchart LR
 ├── pyproject.toml                # Python 包配置
 ├── src/pcb_rag/                  # 核心源码包
 │   ├── api_clients.py            # LLM / Embedding / Rerank 双后端工厂
+│   ├── cache.py                  # 语义缓存（精确匹配 + 向量相似）
 │   ├── ingest.py                 # 文档预处理、切块与入库
 │   ├── query.py                  # 检索链路与交互式问答
 │   ├── preprocess_docs.py        # 编码修复与乱码清理
 │   └── dify_external_api.py      # Dify 外部知识库 API 服务
+├── eval/                         # 评测体系（黄金集 + 四指标）
+│   ├── build_golden_dataset.py   # 数据集构建
+│   ├── metrics.py                # 忠实度 / 相关性 / 精确率 / 召回率
+│   └── evaluate.py               # 评测主脚本
 ├── scripts/                      # 一键安装与运行脚本
 │   ├── setup.sh                  # 环境一键补全
 │   ├── check_env.py              # 环境自检
@@ -227,10 +235,13 @@ Altium Designer 中如何处理高速差分线等长？
 | 阶段 | 说明 |
 | --- | --- |
 | 元数据过滤解析 | 从问题中提取 `vendor` / `eda` / `layer_count` / `copper_oz` 等条件，缩小检索范围 |
+| 查询理解 | 规则 + LLM 混合的意图识别，输出查询类型与动态检索权重 |
+| 查询分解 | 复合问题拆成多个子问题分别召回，缓解多跳问题漏召 |
 | 查询扩展 | PCB 同义词与缩写扩展，提升专业术语召回 |
 | HyDE 增强 | 生成假设文档参与向量检索，缓解短查询语义稀疏问题 |
+| Step-back | 过于具体的问题抽象为上位问题，单独一路召回补充背景知识 |
 | 多路召回 | 向量检索与 BM25 词法检索并行执行 |
-| 加权 RRF 融合 | 按查询类型动态调整向量 / 词法权重并融合排序 |
+| 加权 RRF 融合 | 按查询类型动态调整各路线权重并融合排序 |
 | Rerank 精排 | 使用 API 或本地 cross-encoder 对候选重排序 |
 | 上下文扩展 | 命中 chunk 并入相邻 / 父级 chunk，保持上下文完整 |
 | 答案合成 | 基于 RAG Prompt 生成答案并标注引用来源 |
@@ -255,8 +266,9 @@ bash scripts/serve_api.sh
 | --- | --- |
 | `POST /retrieval` | Dify 外部知识库规范接口，返回命中的 records |
 | `POST /api/ask` | 检索 + LLM 合成答案，支持传入对话历史 |
+| `POST /api/ask/stream` | SSE 流式问答：先推检索来源，再逐 token 推答案 |
 | `POST /api/chat` | 服务端会话记忆问答，返回 `session_id` |
-| `GET /health` | 健康检查，展示索引 / 后端 / 检索参数状态 |
+| `GET /health` | 健康检查，展示索引 / 后端 / 检索参数 / 缓存状态 |
 
 更多步骤见 `docs/DIFY_INTEGRATION_GUIDE.md`。
 
@@ -300,7 +312,21 @@ bash scripts/serve_api.sh
 | `RERANK_TOP_N` | `200` | 精排后保留数量 |
 | `CHUNK_EXPAND_MAX_EXTRA` | `5` | 上下文扩展可额外返回的条数 |
 | `HYDE_ENABLED` | `1` | 是否启用 HyDE 查询增强 |
+| `QUERY_UNDERSTANDING_MODE` | `hybrid` | 查询理解模式：`rule` / `llm` / `hybrid` |
+| `QUERY_DECOMPOSE_ENABLED` | `1` | 是否对复合问题自动分解 |
+| `QUERY_STEP_BACK_ENABLED` | `1` | 是否对具体问题自动 Step-back |
+| `STEPBACK_ROUTE_WEIGHT` | `0.7` | Step-back 召回路线在 RRF 中的权重系数 |
+| `CONTEXTUAL_RETRIEVAL_MODE` | `rule` | chunk 语境前缀：`off` / `rule` / `llm` |
 | `CITATION_ENABLED` | `1` | 是否在答案中标注引用来源 |
+
+### 缓存
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SEMANTIC_CACHE_ENABLED` | `1` | 是否启用语义缓存 |
+| `SEMANTIC_CACHE_MAX_SIZE` | `512` | 缓存条目上限 |
+| `SEMANTIC_CACHE_TTL_SECONDS` | `3600` | 缓存有效期（秒） |
+| `SEMANTIC_CACHE_THRESHOLD` | `0.95` | 语义命中的相似度阈值 |
 
 ### 服务
 
@@ -312,6 +338,27 @@ bash scripts/serve_api.sh
 | `SESSION_MAX_COUNT` | `1000` | 最大会话数 |
 
 完整配置见 `.env.example` 与 `docs/CONFIGURATION_GUIDE.md`。
+
+## 评测
+
+项目自带评测体系，用四个指标量化检索与生成质量：
+
+```bash
+# 1. 构建黄金数据集（需已入库）
+python eval/build_golden_dataset.py --limit 100
+
+# 2. 人工抽检 20~30 条后执行评测
+python eval/evaluate.py --dataset eval/datasets/golden.jsonl
+```
+
+| 指标 | 度量对象 | 参考阈值 |
+| --- | --- | --- |
+| Faithfulness | 答案与检索上下文的事实一致性 | ≥ 0.75 |
+| Answer Relevancy | 是否真正回应了问题 | ≥ 0.80 |
+| Context Precision | 相关上下文是否排在前面 | ≥ 0.70 |
+| Context Recall | 所需信息是否都被召回 | ≥ 0.80 |
+
+支持 `--no-rerank` 对比重排收益、`--retrieval-only` 只评检索（更快更省）。详见 `eval/README.md`。
 
 ## 常见问题
 

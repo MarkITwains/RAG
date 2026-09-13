@@ -1403,6 +1403,8 @@ class ThreeWayHyDEFusionRetriever(BaseRetriever):
         use_hyde: bool = True,
         use_query2doc: bool = False,
         primed_queries: Optional[dict[str, tuple[str, str]]] = None,
+        extra_queries: Optional[list[str]] = None,
+        step_back_query: Optional[str] = None,
     ):
         super().__init__()
         self._vector = vector_retriever
@@ -1416,6 +1418,9 @@ class ThreeWayHyDEFusionRetriever(BaseRetriever):
         self._use_hyde = bool(use_hyde)
         self._use_query2doc = bool(use_query2doc)
         self._primed_queries = primed_queries or {}
+        # 查询分解出的子问题 / step-back 上位问题（Phase 4）
+        self._extra_queries = list(extra_queries or [])
+        self._step_back_query = (step_back_query or "").strip()
 
     def _enhance_queries(self, query_str: str) -> tuple[str, str]:
         if query_str in self._primed_queries:
@@ -1443,6 +1448,10 @@ class ThreeWayHyDEFusionRetriever(BaseRetriever):
             # 生成查询变体
             raw_queries = _build_multi_expand_queries(query_str, num_queries=FUSION_NUM_QUERIES)
             bm25_queries = _build_multi_expand_queries(bm25_query, num_queries=FUSION_NUM_QUERIES)
+            # 并入查询分解出的子问题
+            if self._extra_queries:
+                raw_queries = list(dict.fromkeys([*raw_queries, *self._extra_queries]))
+                bm25_queries = list(dict.fromkeys([*bm25_queries, *self._extra_queries]))
             
             # 多查询向量检索（raw vec）
             all_raw_vec: list[NodeWithScore] = []
@@ -1469,10 +1478,36 @@ class ThreeWayHyDEFusionRetriever(BaseRetriever):
             raw_vec_nodes = self._vector.retrieve(query_str)[: self._k]
             bm25_nodes = self._bm25.retrieve(bm25_query)[: self._k]
 
+            def _merge_nodes(base: list[NodeWithScore], extra: list[NodeWithScore]) -> list[NodeWithScore]:
+                """按 node_id 去重合并（NodeWithScore 不可哈希，不能用 dict.fromkeys）。"""
+                seen = {_node_id_key(n) for n in base}
+                merged = list(base)
+                for n in extra:
+                    key = _node_id_key(n)
+                    if key not in seen:
+                        seen.add(key)
+                        merged.append(n)
+                return merged
+
+            for extra_q in self._extra_queries:
+                try:
+                    raw_vec_nodes = _merge_nodes(raw_vec_nodes, self._vector.retrieve(extra_q)[: self._k])
+                    bm25_nodes = _merge_nodes(bm25_nodes, self._bm25.retrieve(extra_q)[: self._k])
+                except Exception:
+                    continue
+
         # HyDE 向量检索
         hyde_vec_nodes: list[NodeWithScore] = []
         if self._use_hyde and hyde_query and hyde_query != query_str:
             hyde_vec_nodes = self._vector.retrieve(hyde_query)[: self._k]
+
+        # Step-back 上位问题向量召回（补足背景知识）
+        stepback_vec_nodes: list[NodeWithScore] = []
+        if self._step_back_query:
+            try:
+                stepback_vec_nodes = self._vector.retrieve(self._step_back_query)[: self._k]
+            except Exception:
+                stepback_vec_nodes = []
 
         routes: list[tuple[list[NodeWithScore], float]] = [
             (raw_vec_nodes, self._vector_weight),
@@ -1480,6 +1515,8 @@ class ThreeWayHyDEFusionRetriever(BaseRetriever):
         ]
         if hyde_vec_nodes:
             routes.insert(1, (hyde_vec_nodes, self._hyde_weight))
+        if stepback_vec_nodes:
+            routes.append((stepback_vec_nodes, self._vector_weight * float(STEPBACK_ROUTE_WEIGHT)))
 
         return _weighted_rrf_fuse_three_routes(
             routes,
@@ -1499,7 +1536,7 @@ RAG_PROMPT_TEMPLATE = """你是 PCB 电路板领域的技术专家。请根据�
 1. 只基于参考文档中的信息回答，不要编造
 2. 如果文档中没有相关信息，明确说明"根据提供的文档无法回答"
 3. 回答要准确、专业、简洁
-4. 在回答末尾标注信息来源（如：[来源：GBT4588.4-2017]）
+4. 参考文档带有编号 [1] [2]，引用某条信息时请在对应句子末尾标注同样的角标，例如：[1][2]
 
 参考文档：
 {context}
@@ -1601,44 +1638,70 @@ def extract_citations(answer: str, retrieved_docs: list) -> list[dict]:
         matches = re.findall(pattern, answer, re.IGNORECASE)
         mentioned_standards.update(m.upper().replace(' ', '') for m in matches)
     
-    # 2. 与检索文档匹配
-    for doc in retrieved_docs:
+    # 2. 解析答案中的角标引用 [1] [2]（与上下文编号一致）
+    bracket_ids: set = set()
+    for raw_id in re.findall(r'\[(\d{1,2})\]', answer):
+        try:
+            bracket_ids.add(int(raw_id))
+        except ValueError:
+            continue
+
+    # 3. 与检索文档匹配
+    for pos, doc in enumerate(retrieved_docs):
+        index = pos + 1
         node = doc.node if hasattr(doc, 'node') else doc
-        source_path = node.metadata.get('source_path', '') if hasattr(node, 'metadata') else ''
+        metadata = node.metadata if hasattr(node, 'metadata') else {}
+        source_path = metadata.get('source_path', '')
         doc_text = node.get_content() if hasattr(node, 'get_content') else str(node)
-        
+
         # 标准化来源路径
         source_name = Path(source_path).stem if source_path else '未知来源'
-        
+
+        section = (
+            metadata.get('parent_title')
+            or metadata.get('chunk_section')
+            or metadata.get('section')
+            or ''
+        )
+        chunk_id = getattr(node, 'id_', None) or metadata.get('chunk_id', '')
+
         # 检查是否在答案中被提及
         confidence = 'low'
         matched_text = ''
-        
-        # 检查标准编号匹配
-        for std in mentioned_standards:
-            std_normalized = std.replace('/', '').replace('-', '').replace(' ', '')
-            source_normalized = source_name.upper().replace('/', '').replace('-', '').replace(' ', '')
-            if std_normalized in source_normalized or source_normalized in std_normalized:
-                confidence = 'high'
-                matched_text = std
-                break
-        
-        # 如果没有标准编号匹配，检查关键词匹配
-        if confidence == 'low':
-            # 提取来源文档的关键词
-            source_keywords = re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+', source_name)
-            for kw in source_keywords:
-                if len(kw) >= 2 and kw.lower() in answer.lower():
-                    confidence = 'medium'
-                    matched_text = kw
+
+        # 角标优先：LLM 显式引用了该编号，可信度最高
+        if index in bracket_ids:
+            confidence = 'high'
+            matched_text = f'[{index}]'
+        else:
+            # 检查标准编号匹配
+            for std in mentioned_standards:
+                std_normalized = std.replace('/', '').replace('-', '').replace(' ', '')
+                source_normalized = source_name.upper().replace('/', '').replace('-', '').replace(' ', '')
+                if std_normalized in source_normalized or source_normalized in std_normalized:
+                    confidence = 'high'
+                    matched_text = std
                     break
-        
+
+            # 如果没有标准编号匹配，检查关键词匹配
+            if confidence == 'low':
+                source_keywords = re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+', source_name)
+                for kw in source_keywords:
+                    if len(kw) >= 2 and kw.lower() in answer.lower():
+                        confidence = 'medium'
+                        matched_text = kw
+                        break
+
         citations.append({
+            'index': index,
             'source': source_path or source_name,
             'source_name': source_name,
+            'section': section,
+            'chunk_id': str(chunk_id) if chunk_id else '',
             'matched_text': matched_text,
             'confidence': confidence,
             'score': doc.score if hasattr(doc, 'score') else 0.0,
+            'snippet': (doc_text or '')[:200],
         })
     
     # 按置信度和分数排序
@@ -1667,7 +1730,7 @@ def build_context_with_sources(retrieved_docs: list, max_docs: int = None, max_c
     
     for i, doc in enumerate(retrieved_docs[:max_docs]):
         node = doc.node if hasattr(doc, 'node') else doc
-        
+
         # 获取文档内容
         if hasattr(node, 'get_content'):
             text = node.get_content(metadata_mode=MetadataMode.EMBED)
@@ -1683,15 +1746,32 @@ def build_context_with_sources(retrieved_docs: list, max_docs: int = None, max_c
         if len(text) > max_chars:
             text = text[:max_chars] + '...'
         
-        # 构建带标注的上下文
-        context_texts.append(f"[文档{i+1}: {source_name}]\n{text}")
-        
+        # 章节 / chunk 定位信息（用于把引用溯源到具体 chunk）
+        section = (
+            metadata.get('parent_title')
+            or metadata.get('chunk_section')
+            or metadata.get('section')
+            or ''
+        )
+        chunk_id = getattr(node, 'id_', None) or metadata.get('chunk_id', '')
+        page = metadata.get('page_label') or metadata.get('page') or ''
+
+        # 构建带编号与章节的上下文（编号供 LLM 用 [n] 角标引用）
+        label = f"[{i+1}] {source_name}"
+        if section:
+            label += f" · {section}"
+        context_texts.append(f"{label}\n{text}")
+
         sources_info.append({
             'index': i + 1,
             'source_path': source_path,
             'source_name': source_name,
+            'section': section,
+            'chunk_id': str(chunk_id) if chunk_id else '',
+            'page': str(page) if page else '',
             'score': doc.score if hasattr(doc, 'score') else 0.0,
             'char_count': len(text),
+            'snippet': text[:200],
         })
     
     context = "\n\n---\n\n".join(context_texts)
@@ -1777,9 +1857,15 @@ def format_answer_with_citations(result: dict, verbose: bool = False) -> str:
         
         if valid_citations:
             output_parts.append('\n\n📚 参考来源：')
-            for i, cite in enumerate(valid_citations[:5], 1):  # 最多显示5个
+            for cite in valid_citations[:5]:  # 最多显示5个
                 confidence_marker = '✓' if cite['confidence'] == 'high' else '○'
-                output_parts.append(f"  {confidence_marker} [{i}] {cite['source_name']}")
+                label = cite.get('source_name') or '未知来源'
+                section = cite.get('section') or ''
+                if section and section not in label:
+                    label += f" · {section}"
+                cite_index = cite.get('index') or 0
+                prefix = f"[{cite_index}] " if cite_index else ""
+                output_parts.append(f"  {confidence_marker} {prefix}{label}")
                 if verbose and cite.get('matched_text'):
                     output_parts.append(f"      匹配: {cite['matched_text']}")
     
@@ -2242,6 +2328,212 @@ def _get_retrieval_weights(query_type: str) -> tuple[float, float]:
     """根据查询类型返回检索权重 (向量权重, BM25权重)。"""
     strategy = _get_query_strategy(query_type)
     return (strategy["vector_weight"], strategy["bm25_weight"])
+
+
+# =============================================================================
+# 查询理解升级（Phase 4）
+#   - understand_query : 统一入口，输出类型 / 权重 / 是否分解 / 是否 step-back
+#   - decompose_query  : 复合问题拆成子问题，缓解多跳问题召回不足
+#   - step_back_query  : 过于具体的问题抽象为上位问题，补充背景知识
+#
+# 设计原则：规则优先，仅在必要时调用 LLM，避免每次请求都增加一次 LLM 延迟。
+# =============================================================================
+
+# rule = 纯规则（与原行为一致）；llm = 始终调 LLM；hybrid = 规则落到 general 时才调 LLM
+QUERY_UNDERSTANDING_MODE = os.getenv("QUERY_UNDERSTANDING_MODE", "hybrid").strip().lower()
+QUERY_DECOMPOSE_ENABLED = os.getenv("QUERY_DECOMPOSE_ENABLED", "1") not in {"0", "false", "False"}
+QUERY_STEP_BACK_ENABLED = os.getenv("QUERY_STEP_BACK_ENABLED", "1") not in {"0", "false", "False"}
+DECOMPOSE_MAX_SUB_QUERIES = int(os.getenv("DECOMPOSE_MAX_SUB_QUERIES", "3"))
+# Step-back 路由在 RRF 融合中的权重系数（相对原始向量权重）
+STEPBACK_ROUTE_WEIGHT = float(os.getenv("STEPBACK_ROUTE_WEIGHT", "0.7"))
+
+# 复合问题的启发式标记（出现 2 个及以上视为复合问题）
+_CLAUSE_MARKERS = (
+    "以及", "同时", "分别", "各自", "对比", "区别", "差异",
+    "还有", "另外", "并且", "以及", "和", "与", "或",
+)
+
+# 「过于具体」的启发式标记（标准号 / 条款号 / 数值，适合 step-back）
+_SPECIFIC_PATTERNS = (
+    r"(?:GB|IPC|SJ|ISO|JEDEC|MIL)[/\-T]*\s*\d",
+    r"\d+(?:\.\d+){1,3}\s*(?:条|节|款|章)",
+    r"第\s*[\d\.]+\s*(?:条|节|款|章)",
+)
+
+
+def _looks_composite(query: str) -> bool:
+    """启发式判断问题是否为复合问题（含多个并列 / 对比意图）。"""
+    if not query or len(query) < 12:
+        return False
+    hits = sum(1 for m in _CLAUSE_MARKERS if m in query)
+    if hits >= 2:
+        return True
+    if query.count("？") + query.count("?") >= 2:
+        return True
+    if query.count("；") + query.count(";") >= 1:
+        return True
+    return False
+
+
+def _looks_specific(query: str) -> bool:
+    """启发式判断问题是否过于具体（含标准号 / 条款号），适合 step-back。"""
+    if not query:
+        return False
+    return any(re.search(p, query, re.I) for p in _SPECIFIC_PATTERNS)
+
+
+_DECOMPOSE_PROMPT = """你是 PCB 领域的检索助手。请判断下面的问题是否包含多个需要分别检索的子问题。
+
+规则：
+1. 如果只有一个问题，只输出一行：NONE
+2. 如果包含多个子问题，每行输出一个子问题（最多 {max_sub} 个），不要编号、不要解释
+3. 每个子问题都要能独立检索，省略的主语要补全
+
+问题：{query}
+
+输出："""
+
+
+def decompose_query(
+    query: str,
+    llm=None,
+    max_sub: int = DECOMPOSE_MAX_SUB_QUERIES,
+) -> list[str]:
+    """把复合问题拆成子问题；单一问题或调用失败时返回空列表。"""
+    if not QUERY_DECOMPOSE_ENABLED or not query:
+        return []
+    if not _looks_composite(query):
+        return []
+
+    try:
+        if llm is None:
+            llm = Settings.llm
+        response = llm.complete(_DECOMPOSE_PROMPT.format(query=query, max_sub=max_sub))
+        text = response.text if hasattr(response, "text") else str(response)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+        subs: list[str] = []
+        for raw_line in text.splitlines():
+            line = re.sub(r"^[\d\.\-\*\s、）)]+", "", raw_line.strip()).strip()
+            if not line or line.upper() == "NONE":
+                continue
+            if len(line) < 4 or line == query:
+                continue
+            if line not in subs:
+                subs.append(line)
+        return subs[: max(1, int(max_sub))]
+    except Exception as e:
+        print(f"[Decompose] 查询分解失败，跳过: {e}")
+        return []
+
+
+_STEPBACK_PROMPT = """你是 PCB 领域的技术专家。用户提出了一个很具体的问题，请把它抽象成一个更上位、更通用的问题，用于检索背景知识。
+
+要求：
+1. 只输出一个上位问题，不要解释
+2. 保留核心主题，去掉具体标准号 / 条款号 / 数值
+3. 上位问题应指向该类知识的通用要求或原理
+
+原始问题：{query}
+
+上位问题："""
+
+
+def step_back_query(query: str, llm=None) -> str:
+    """生成上位问题用于补充背景知识；不适用或失败时返回空字符串。"""
+    if not QUERY_STEP_BACK_ENABLED or not query:
+        return ""
+    if not _looks_specific(query):
+        return ""
+
+    try:
+        if llm is None:
+            llm = Settings.llm
+        response = llm.complete(_STEPBACK_PROMPT.format(query=query))
+        text = response.text if hasattr(response, "text") else str(response)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        text = text.splitlines()[0].strip() if text else ""
+        if not text or text == query or len(text) < 6:
+            return ""
+        return text
+    except Exception as e:
+        print(f"[StepBack] 生成上位问题失败，跳过: {e}")
+        return ""
+
+
+_UNDERSTAND_PROMPT = """你是 PCB 领域检索系统的查询理解模块。请分析用户问题并输出 JSON。
+
+可选查询类型：definition, procedure, specification, comparison, troubleshoot, standard, material, test, eda_operation, general
+
+JSON 字段：
+- type: 上述类型之一
+- need_decompose: 是否包含多个需要分别检索的子问题（true/false）
+- need_step_back: 问题是否过于具体、需要补充背景知识（true/false）
+
+只输出 JSON，不要解释。
+
+问题：{query}
+
+JSON："""
+
+
+def _understand_with_llm(query: str, llm=None) -> Optional[dict]:
+    """用 LLM 做意图识别，失败返回 None（调用方回退到规则结果）。"""
+    try:
+        if llm is None:
+            llm = Settings.llm
+        response = llm.complete(_UNDERSTAND_PROMPT.format(query=query))
+        text = response.text if hasattr(response, "text") else str(response)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+
+        match = re.search(r"\{.*?\}", text, re.DOTALL)
+        if not match:
+            return None
+        data = json.loads(match.group())
+
+        qtype = str(data.get("type", "")).strip().lower()
+        if qtype != "general" and qtype not in QUERY_TYPES:
+            return None
+        return {
+            "type": qtype,
+            "need_decompose": bool(data.get("need_decompose")),
+            "need_step_back": bool(data.get("need_step_back")),
+        }
+    except Exception:
+        return None
+
+
+def understand_query(query: str, llm=None) -> dict:
+    """统一的查询理解入口，返回检索策略所需的全部信息。
+
+    ``QUERY_UNDERSTANDING_MODE``：
+      - ``rule``   : 仅规则（与旧行为一致，零额外延迟）
+      - ``llm``    : 始终调用 LLM 做意图识别
+      - ``hybrid`` : 规则优先，规则落到 ``general`` 时才调用 LLM（默认）
+    """
+    query_type = _classify_query(query)
+    need_decompose = _looks_composite(query)
+    need_step_back = _looks_specific(query)
+
+    mode = QUERY_UNDERSTANDING_MODE
+    if mode == "llm" or (mode == "hybrid" and query_type == "general"):
+        llm_result = _understand_with_llm(query, llm)
+        if llm_result:
+            if llm_result["type"]:
+                query_type = llm_result["type"]
+            need_decompose = need_decompose or llm_result["need_decompose"]
+            need_step_back = need_step_back or llm_result["need_step_back"]
+
+    strategy = _get_query_strategy(query_type)
+    return {
+        "type": query_type,
+        "description": strategy.get("description", ""),
+        "vector_weight": strategy["vector_weight"],
+        "bm25_weight": strategy["bm25_weight"],
+        "num_queries": strategy["num_queries"],
+        "need_decompose": bool(need_decompose and QUERY_DECOMPOSE_ENABLED),
+        "need_step_back": bool(need_step_back and QUERY_STEP_BACK_ENABLED),
+    }
 
 
 # =============================================================================
@@ -3794,16 +4086,32 @@ def main():
             fs = "; ".join([f"{f.key}{f.operator.value}{f.value}" for f in filters.filters if isinstance(f, MetadataFilter)])
             print(f"[FILTER] {fs}")
 
-        # 智能查询意图理解
+        # 查询理解：意图识别 + 动态权重 + 分解 / Step-back
         query_type = "general"
         dynamic_weights = FUSION_WEIGHTS
         strategy = None
+        sub_queries: list = []
+        step_back_q = ""
         if QUERY_ROUTING_ENABLED and bm25_index is not None:
-            query_type = _classify_query(clean_q)
-            strategy = _get_query_strategy(query_type)
-            dynamic_weights = (strategy["vector_weight"], strategy["bm25_weight"])
-            print(f"[查询意图] {query_type} ({strategy['description']})")
+            understanding = understand_query(clean_q)
+            query_type = understanding["type"]
+            strategy = {
+                "num_queries": understanding["num_queries"],
+                "description": understanding["description"],
+            }
+            dynamic_weights = (understanding["vector_weight"], understanding["bm25_weight"])
+            print(f"[查询意图] {query_type} ({understanding['description']})")
             print(f"  -> 权重(vec={dynamic_weights[0]:.2f}, bm25={dynamic_weights[1]:.2f}), 查询数={strategy['num_queries']}")
+            if understanding["need_decompose"]:
+                sub_queries = decompose_query(clean_q)
+                if sub_queries:
+                    print(f"[查询分解] 拆出 {len(sub_queries)} 个子问题:")
+                    for sq in sub_queries:
+                        print(f"   - {sq}")
+            if understanding["need_step_back"]:
+                step_back_q = step_back_query(clean_q)
+                if step_back_q:
+                    print(f"[Step-back] 上位问题: {step_back_q}")
 
         # 查询扩展：添加同义词提升召回
         expanded_q = _expand_query(clean_q)
@@ -3854,12 +4162,15 @@ def main():
             if MULTI_EXPAND_ENABLED and len(clean_q) <= SHORT_QUERY_THRESHOLD:
                 # 使用 Query2Doc 增强的查询构建变体（用于 BM25）
                 expand_queries = _build_multi_expand_queries(q2doc_q, num_queries=target_num_queries)
+                # 并入查询分解出的子问题
+                if sub_queries:
+                    expand_queries = list(dict.fromkeys([*expand_queries, *sub_queries]))
                 if len(expand_queries) > 1:
                     print(f"[多扩展查询] 生成 {len(expand_queries)} 个查询变体")
                     for i, eq in enumerate(expand_queries[:3]):  # 只显示前3个
                         print(f"   {i+1}. {eq[:60]}{'...' if len(eq) > 60 else ''}")
             else:
-                expand_queries = [q2doc_q]
+                expand_queries = list(dict.fromkeys([q2doc_q, *sub_queries]))
 
             # 创建 MultiPathRetriever
             multipath_retriever = MultiPathRetriever(
@@ -3986,6 +4297,8 @@ def main():
                 use_hyde=HYDE_ENABLED,
                 use_query2doc=QUERY2DOC_ENABLED,
                 primed_queries=primed,
+                extra_queries=sub_queries,
+                step_back_query=step_back_q,
             )
             print(
                 f"[三路融合] weights(raw_vec={vec_weight:.2f}, hyde_vec={hyde_weight:.2f}, bm25={bm25_weight:.2f}), "

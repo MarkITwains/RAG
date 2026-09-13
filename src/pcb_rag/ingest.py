@@ -2274,6 +2274,194 @@ def enhance_chunk_metadata(chunk_text: str, chunk_meta: dict, doc_text: str, fil
     return enhanced_meta
 
 
+# =============================================================================
+# Contextual Retrieval：为 chunk 补充语境前缀（Phase 4）
+#
+#   问题：切块会丢失上下文。"应不小于 1.0 N/mm。" 这类片段脱离文档后，
+#         既看不出是哪篇文档、哪一章节，也看不出在说什么，很难被检索命中。
+#   方案：入库时给每个 chunk 拼一句「属于哪篇文档 · 哪个章节 · 在说什么」的前缀，
+#         该前缀同时参与 embedding 与 BM25 索引。
+#
+#   CONTEXTUAL_RETRIEVAL_MODE:
+#     off  = 关闭
+#     rule = 规则版：文档名 + 标题路径 + 标准号拼装（零 LLM 成本，推荐默认）
+#     llm  = LLM 版：模型生成一句话语境（效果更好，入库时每个 chunk 需一次调用）
+# =============================================================================
+
+CONTEXTUAL_RETRIEVAL_MODE = os.getenv("CONTEXTUAL_RETRIEVAL_MODE", "rule").strip().lower()
+CONTEXTUAL_RETRIEVAL_ENABLED = CONTEXTUAL_RETRIEVAL_MODE in {"rule", "llm"}
+CONTEXTUAL_LLM_WORKERS = int(os.getenv("CONTEXTUAL_LLM_WORKERS", "4"))
+CONTEXTUAL_LLM_MAX_CHARS = int(os.getenv("CONTEXTUAL_LLM_MAX_CHARS", "120"))
+CONTEXTUAL_LLM_BATCH = int(os.getenv("CONTEXTUAL_LLM_BATCH", "1000"))
+
+
+def _set_node_text(node, text: str) -> None:
+    """兼容不同 LlamaIndex 版本，安全设置 TextNode 正文。"""
+    try:
+        node.set_content(text)
+    except Exception:
+        try:
+            node.text = text
+        except Exception:
+            pass
+
+
+def build_contextual_prefix(chunk_text: str, chunk_meta: dict, doc_meta: dict) -> str:
+    """规则版语境前缀：文档名 · 章节路径 · 文档类型 · 标准号。"""
+
+    doc_meta = doc_meta or {}
+    chunk_meta = chunk_meta or {}
+    chunk_text = chunk_text or ""
+
+    parts: list[str] = []
+
+    source = doc_meta.get("source_path") or doc_meta.get("file_name") or ""
+    if source:
+        parts.append(Path(str(source)).stem)
+
+    section = (
+        chunk_meta.get("parent_title")
+        or chunk_meta.get("chunk_section")
+        or chunk_meta.get("section")
+        or ""
+    )
+    if section:
+        parts.append(str(section).strip())
+
+    doc_type = chunk_meta.get("doc_type") or ""
+    if doc_type and doc_type != "general":
+        parts.append(str(doc_type))
+
+    standards = chunk_meta.get("standards") or []
+    if isinstance(standards, (list, tuple)) and standards:
+        parts.append("/".join(str(s) for s in list(standards)[:3]))
+
+    parts = [p for p in parts if p]
+    if not parts:
+        return ""
+
+    prefix = "【上下文：" + " · ".join(parts) + "】"
+    # 前缀过长、或已注入过，则跳过
+    if len(prefix) > 200 or prefix in chunk_text:
+        return ""
+    return prefix
+
+
+_CONTEXTUAL_LLM_PROMPT = """你在为 PCB 领域文档构建检索索引。
+
+【文档全文】
+{document}
+
+【待处理片段】
+{chunk}
+
+请用一句话（{max_chars} 字以内）说明：这个片段出自文档的哪个部分、在讲什么、能回答什么问题。
+只输出这句话，不要任何前缀、编号或解释。"""
+
+
+def _generate_contextual_summary(chunk_text: str, doc_text: str, llm) -> str:
+    """LLM 版：为单个 chunk 生成语境说明，失败返回空串。"""
+    try:
+        doc_excerpt = (doc_text or "")[:6000]
+        prompt = _CONTEXTUAL_LLM_PROMPT.format(
+            document=doc_excerpt,
+            chunk=(chunk_text or "")[:1500],
+            max_chars=CONTEXTUAL_LLM_MAX_CHARS,
+        )
+        response = llm.complete(prompt)
+        text = response.text if hasattr(response, "text") else str(response)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        text = text.splitlines()[0].strip() if text else ""
+        return text[: CONTEXTUAL_LLM_MAX_CHARS * 2]
+    except Exception:
+        return ""
+
+
+def _apply_contextual_with_llm(nodes: list, doc_text_by_id: dict, llm) -> list:
+    """LLM 版：并发为每个 chunk 生成语境说明，失败时回退规则前缀。"""
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    total = len(nodes)
+    targets = nodes
+    if total > CONTEXTUAL_LLM_BATCH > 0:
+        print(
+            f"[Contextual] chunk 数 {total} 超过批量上限 {CONTEXTUAL_LLM_BATCH}，"
+            f"仅处理前 {CONTEXTUAL_LLM_BATCH} 个（可调整 CONTEXTUAL_LLM_BATCH）"
+        )
+        targets = nodes[:CONTEXTUAL_LLM_BATCH]
+
+    def _task(node):
+        meta = getattr(node, "metadata", None) or {}
+        doc_id = str(meta.get("doc_node_id") or "")
+        summary = _generate_contextual_summary(
+            node.text or "", doc_text_by_id.get(doc_id, ""), llm
+        )
+        if summary:
+            return node, f"【上下文：{summary}】"
+        # 回退到规则前缀
+        return node, build_contextual_prefix(node.text or "", meta, {})
+
+    applied = 0
+    with ThreadPoolExecutor(max_workers=max(1, CONTEXTUAL_LLM_WORKERS)) as pool:
+        futures = [pool.submit(_task, n) for n in targets]
+        for i, fut in enumerate(as_completed(futures), 1):
+            try:
+                node, prefix = fut.result()
+                if prefix:
+                    _set_node_text(node, f"{prefix}\n{node.text}")
+                    meta = getattr(node, "metadata", None)
+                    if isinstance(meta, dict):
+                        meta["contextual_prefix"] = True
+                    applied += 1
+            except Exception:
+                continue
+            if i % 50 == 0:
+                print(f"[Contextual] 进度 {i}/{len(targets)}")
+
+    print(f"[Contextual] LLM 版完成：{applied}/{len(targets)} 个 chunk 已注入语境前缀")
+    return nodes
+
+
+def apply_contextual_retrieval(nodes: list, documents: list) -> list:
+    """为所有 chunk 注入语境前缀（就地修改节点正文与 metadata）。"""
+
+    if not CONTEXTUAL_RETRIEVAL_ENABLED or not nodes:
+        return nodes
+
+    # 文档 id -> 原文，供 LLM 版使用
+    doc_text_by_id: dict[str, str] = {}
+    for d in documents or []:
+        did = getattr(d, "id_", None)
+        if did:
+            doc_text_by_id[str(did)] = getattr(d, "text", "") or ""
+
+    if CONTEXTUAL_RETRIEVAL_MODE == "llm":
+        try:
+            llm = build_llm()
+            print(f"[Contextual] LLM 版已启用，模型={getattr(llm, 'model', 'unknown')}")
+            return _apply_contextual_with_llm(nodes, doc_text_by_id, llm)
+        except Exception as e:
+            print(f"[Contextual] LLM 初始化失败，回退规则版: {e}")
+
+    applied = 0
+    for node in nodes:
+        meta = getattr(node, "metadata", None) or {}
+        doc_meta = {
+            "source_path": meta.get("source_path", ""),
+            "file_name": meta.get("file_name", ""),
+        }
+        prefix = build_contextual_prefix(node.text or "", meta, doc_meta)
+        if not prefix:
+            continue
+        _set_node_text(node, f"{prefix}\n{node.text}")
+        meta["contextual_prefix"] = True
+        applied += 1
+
+    print(f"[Contextual] 规则版完成：{applied}/{len(nodes)} 个 chunk 已注入语境前缀")
+    return nodes
+
+
 def _normalize_text_for_embed(text: str) -> str:
     """文本清洗：修复编码、清理乱码、减少噪声
 
@@ -3027,6 +3215,9 @@ def main():
         # 使用配置的node_parser
         nodes = Settings.node_parser.get_nodes_from_documents(documents, show_progress=True)
     
+    # Contextual Retrieval：为每个 chunk 注入语境前缀，提升脱离上下文片段的召回
+    nodes = apply_contextual_retrieval(nodes, documents)
+
     # 截断超长文本（避免超过Milvus的65535字符限制）
     nodes = _truncate_text_nodes(nodes, max_bytes=60000, target_bytes=12000)
     
