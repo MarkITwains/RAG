@@ -140,6 +140,45 @@ from pcb_rag.api_clients import (
     get_embedding_dim,
 )
 
+# P2：上下文压缩与去重（纯标准库，不消耗 LLM）
+from pcb_rag.compression import (
+    COMPRESSION_ENABLED,
+    compress_pipeline,
+    describe_compression,
+)
+
+# P1-2：GraphRAG（实体关系图检索）
+from pcb_rag.graph_rag import (
+    GRAPH_RAG_ENABLED,
+    GRAPH_TOP_K,
+    GRAPH_WEIGHT,
+    GraphRetriever,
+    KnowledgeGraph,
+    describe_graph,
+    expand_nodes_with_graph,
+    fuse_with_graph,
+)
+
+# P2：可观测性（tracing / 指标 / 事件）
+from pcb_rag.observability import (
+    counter,
+    describe_observability,
+    record_event,
+    span,
+    trace_context,
+    traced,
+)
+
+# P2：访问控制（多租户 / 角色 / 组）
+from pcb_rag.security import (
+    ACL_ENABLED,
+    build_acl_filters,
+    describe_acl,
+    filter_nodes,
+    merge_filters,
+    resolve_principal,
+)
+
 try:
     import nest_asyncio
 
@@ -3732,7 +3771,8 @@ def _extract_query_filters(user_query: str) -> tuple[str, Optional[MetadataFilte
             pass
 
     if not extracted:
-        return user_query, None
+        # 没有业务过滤条件时，仍然要带上权限条件（否则跨租户数据会进入召回）
+        return user_query, build_acl_filters(current_principal())
 
     filters: list[MetadataFilter] = []
     for k, v in extracted.items():
@@ -3749,7 +3789,9 @@ def _extract_query_filters(user_query: str) -> tuple[str, Optional[MetadataFilte
         flags=re.I,
     )
     clean = re.sub(r"\s+", " ", clean).strip()
-    return clean or user_query, MetadataFilters(filters=filters, condition=FilterCondition.AND)
+    base_filters = MetadataFilters(filters=filters, condition=FilterCondition.AND)
+    # 权限条件与业务过滤以 AND 合并：在召回阶段就把无权访问的文档挡掉
+    return clean or user_query, merge_filters(base_filters, build_acl_filters(current_principal()))
 
 
 @dataclass
@@ -4130,6 +4172,120 @@ def build_index(llm_model: str):
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     return VectorStoreIndex.from_vector_store(vector_store=vector_store, storage_context=storage_context)
 
+# ---------------------------------------------------------------------------
+# GraphRAG / P2 运行时装配（图检索、权限复核、上下文压缩）
+# ---------------------------------------------------------------------------
+# 图邻域扩展追加的额外事实条数上限
+GRAPH_EXPAND_MAX = int(os.getenv("GRAPH_EXPAND_MAX", "2"))
+
+_GRAPH_STATE: dict = {"graph": None, "retriever": None}
+
+
+class _GraphAugmentedRetriever(BaseRetriever):
+    """在任意基础 retriever 之上叠加图检索融合。
+
+    Fusion / 纯向量分支把 retriever 交给 ``RetrieverQueryEngine`` 自动完成
+    「检索 → 后处理 → 生成」，没有插入点，因此用包装器的 ``_retrieve`` 承接。
+    """
+
+    _base: Any = PrivateAttr()
+
+    def __init__(self, base: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._base = base
+
+    def _retrieve(self, query_bundle: QueryBundle) -> list:
+        nodes = self._base._retrieve(query_bundle)
+        return _graph_augment(query_bundle.query_str, nodes)
+
+
+class _AclPostprocessor(BaseNodePostprocessor):
+    """内存侧权限复核：向量库过滤条件若被服务端忽略，这里兜底拦截。"""
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "AclPostprocessor"
+
+    def _postprocess_nodes(self, nodes=None, query_bundle=None):
+        return filter_nodes(nodes or [], current_principal())
+
+
+class _CompressionPostprocessor(BaseNodePostprocessor):
+    """上下文压缩：去重 → 抽取式压缩 → 字符预算裁剪（不消耗 LLM）。"""
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "CompressionPostprocessor"
+
+    def _postprocess_nodes(self, nodes=None, query_bundle=None):
+        query = query_bundle.query_str if query_bundle is not None else ""
+        return compress_pipeline(nodes or [], query)
+
+
+def _init_graph():
+    """加载知识图谱；未启用或文件缺失时返回 ``(None, None)``，检索自动降级。"""
+
+    if not GRAPH_RAG_ENABLED:
+        return None, None
+
+    try:
+        with span("graph.load"):
+            graph = KnowledgeGraph.load()
+    except Exception as exc:
+        record_event("graph.load_failed", error=str(exc)[:200])
+        return None, None
+
+    if graph is None or not graph.nodes:
+        print("[GraphRAG] 未找到可用图谱（可先运行入库脚本构建），本次按无图模式运行")
+        return None, None
+
+    stats = graph.stats()
+    print(
+        f"[GraphRAG] 已加载图谱: 实体={stats['entities']}, 关系={stats['relations']}, "
+        f"社区={stats['communities']}, hop={GRAPH_HOP}, 融合权重={GRAPH_WEIGHT}"
+    )
+    return graph, GraphRetriever(graph)
+
+
+def _graph_augment(query: str, nodes: list) -> list:
+    """把图检索结果与邻域事实融合进召回结果（未加载图谱时为 no-op）。"""
+
+    graph = _GRAPH_STATE.get("graph")
+    retriever = _GRAPH_STATE.get("retriever")
+    if not GRAPH_RAG_ENABLED or graph is None or retriever is None or not nodes:
+        return nodes
+
+    try:
+        graph_nodes = retriever.retrieve(query, top_k=GRAPH_TOP_K)
+        if graph_nodes:
+            nodes = fuse_with_graph(nodes, graph_nodes, graph_weight=GRAPH_WEIGHT)
+            counter("graph.fused_nodes", len(graph_nodes))
+            print(f"[GraphRAG] 图检索补充 {len(graph_nodes)} 条关系证据")
+        nodes = expand_nodes_with_graph(nodes, graph, max_extra=GRAPH_EXPAND_MAX)
+    except Exception as exc:
+        record_event("graph.augment_failed", error=str(exc)[:200])
+    return nodes
+
+
+def _wrap_with_graph(base):
+    """用图融合包装基础 retriever；未启用图时原样返回，避免额外开销。"""
+
+    if not GRAPH_RAG_ENABLED or _GRAPH_STATE.get("graph") is None:
+        return base
+    return _GraphAugmentedRetriever(base)
+
+
+def _aux_postprocessors() -> list:
+    """P2 辅助后处理器：权限复核 + 上下文压缩（按开关动态组装）。"""
+
+    processors: list = []
+    if ACL_ENABLED:
+        processors.append(_AclPostprocessor())
+    if COMPRESSION_ENABLED:
+        processors.append(_CompressionPostprocessor())
+    return processors
+
+
 def main():
     llm_candidates = _pick_llm_candidates(OLLAMA_BASE)
     if not llm_candidates:
@@ -4137,6 +4293,9 @@ def main():
 
     llm_idx = 0
     index = build_index(llm_candidates[llm_idx])
+
+    # GraphRAG：加载知识图谱（文件缺失 / 未启用时自动降级为无图检索）
+    _GRAPH_STATE["graph"], _GRAPH_STATE["retriever"] = _init_graph()
 
     rerank = _try_build_reranker()
     if rerank is not None:
@@ -4219,6 +4378,26 @@ def main():
     if CHUNK_EXPAND_ENABLED:
         print(f"[层次化Chunk扩展] 已启用")
         print(f"  邻居扩展: {CHUNK_EXPAND_NEIGHBORS}, 父节点扩展: {CHUNK_EXPAND_PARENT}, 按文档分组: {CHUNK_GROUP_BY_DOC}")
+
+    # P1-2 / P2 能力状态
+    if GRAPH_RAG_ENABLED:
+        graph_info = describe_graph(_GRAPH_STATE.get("graph"))
+        print(
+            f"[GraphRAG] 已启用: 实体={graph_info.get('entities', 0)}, 关系={graph_info.get('relations', 0)}, "
+            f"社区={graph_info.get('communities', 0)}, hop={GRAPH_HOP}, top_k={GRAPH_TOP_K}"
+        )
+    else:
+        print("[GraphRAG] 关闭（GRAPH_RAG_ENABLED=0）")
+    if COMPRESSION_ENABLED:
+        compression_info = describe_compression()
+        print(f"[上下文压缩] 已启用: mode={compression_info['mode']}, 去重={compression_info['dedupe']}")
+    acl_info = describe_acl()
+    print(
+        f"[权限] {'启用' if acl_info['enabled'] else '关闭'}: "
+        f"租户字段={acl_info['tenant_field']}, 公开值={acl_info['public_value']}"
+    )
+    obs_info = describe_observability()
+    print(f"[观测] tracing={obs_info['tracing']}, metrics={obs_info['metrics']}, trace_log={obs_info['trace_log']}")
     
     # 显示 HyDE/Query2Doc 状态
     if HYDE_ENABLED or QUERY2DOC_ENABLED:
@@ -4363,7 +4542,17 @@ def main():
                         retrieved_nodes,
                         query_bundle=QueryBundle(query_str=expanded_q),
                     )
-                
+
+                # GraphRAG：图检索融合 + 邻域事实扩展
+                retrieved_nodes = _graph_augment(hyde_q, retrieved_nodes)
+
+                # P2：权限复核 + 上下文压缩
+                for postprocessor in _aux_postprocessors():
+                    retrieved_nodes = postprocessor._postprocess_nodes(
+                        retrieved_nodes,
+                        query_bundle=QueryBundle(query_str=expanded_q),
+                    )
+
                 # 层次化 Chunk 扩展：带上相关上下文
                 if CHUNK_EXPAND_ENABLED and retrieved_nodes:
                     original_count = len(retrieved_nodes)
@@ -4473,6 +4662,7 @@ def main():
             if rerank is not None:
                 postprocessors.append(rerank)
                 print(f"[Rerank] 启用精排，top_n={RERANK_TOP_N}")
+            postprocessors.extend(_aux_postprocessors())
 
             try:
                 # Self-RAG 自反思模式
@@ -4506,7 +4696,7 @@ def main():
                 else:
                     # 普通模式：使用 RetrieverQueryEngine
                     qe = RetrieverQueryEngine.from_args(
-                        fusion_retriever,
+                        _wrap_with_graph(fusion_retriever),
                         node_postprocessors=postprocessors if postprocessors else None,
                     )
                     # 使用 HyDE 增强的查询进行检索（向量检索受益更大）
@@ -4528,7 +4718,7 @@ def main():
                             print(f"\nA> {format_self_rag_result(result, show_history=False)}")
                         else:
                             qe = RetrieverQueryEngine.from_args(
-                                fusion_retriever,
+                                _wrap_with_graph(fusion_retriever),
                                 node_postprocessors=postprocessors if postprocessors else None,
                             )
                             ans = qe.query(hyde_q)
@@ -4545,6 +4735,7 @@ def main():
             if rerank is not None:
                 postprocessors.append(rerank)
                 print(f"[Rerank] 启用精排，top_n={RERANK_TOP_N}")
+            postprocessors.extend(_aux_postprocessors())
 
             try:
                 # Self-RAG 自反思模式

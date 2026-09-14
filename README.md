@@ -51,6 +51,11 @@ PCB-RAG 面向 PCB 设计规范、工艺资料与工程经验文档，覆盖从�
 | **可切换精排** | 支持 API 精排（Jina / 硅基流动等）与本地精排（Qwen3-Reranker / cross-encoder / SBERT） |
 | **上下文扩展** | 命中的 chunk 自动并入相邻与父级 chunk 内容，缓解长文档上下文割裂 |
 | **Dify 集成** | 提供符合规范的 FastAPI 外部知识库接口，可直接接入 Dify 工作流或对话应用 |
+| **GraphRAG 图检索** | 入库时抽取「实体—关系—实体」三元组构成可遍历图谱，检索时做实体链接与邻域扩展，补足多跳与聚合类问题 |
+| **上下文压缩** | 近似去重 + 抽取式压缩 + 字符预算裁剪，在长召回链路上显著降低 token 消耗 |
+| **多租户权限** | 按租户 / 角色 / 组做检索级过滤（向量库表达式 + 内存兜底双层），并支持访问审计 |
+| **可观测性** | 结构化 tracing（JSONL）、计数器与延迟分位，`/metrics` 直接暴露 |
+| **多模态** | PDF 图片经视觉模型转成可检索描述，表格结构化为 Markdown，列值对应关系不再丢失 |
 | **标准工程结构** | `src/pcb_rag` 包结构 + `pyproject.toml`，便于安装、导入与维护 |
 
 ## 系统架构
@@ -81,15 +86,18 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    Q["用户问题"] --> FLT["元数据过滤解析"]
-    FLT --> EXP["查询扩展 + HyDE"]
+    Q["用户问题"] --> ACL["权限过滤 + 元数据解析"]
+    ACL --> EXP["查询扩展 + HyDE"]
     EXP --> DENSE["向量召回"]
     EXP --> SPARSE["BM25 词法召回"]
+    EXP --> GRAPH["图检索：实体链接 + 邻域"]
     DENSE --> FUSE["加权 RRF 融合"]
     SPARSE --> FUSE
+    GRAPH -.-> FUSE
     FUSE --> RERANK["Rerank 精排"]
     RERANK --> CTX["相邻 / 父级 Chunk 扩展"]
-    CTX --> ANS["LLM 合成答案 + 引用"]
+    CTX --> COMP["去重 + 上下文压缩"]
+    COMP --> ANS["LLM 合成答案 + 引用"]
 ```
 
 ## 技术栈
@@ -238,6 +246,7 @@ Altium Designer 中如何处理高速差分线等长？
 
 | 阶段 | 说明 |
 | --- | --- |
+| 权限过滤 | 按请求头解析出的租户 / 角色生成 ACL 条件，与业务过滤以 AND 合并，在召回阶段就挡掉无权数据 |
 | 元数据过滤解析 | 从问题中提取 `vendor` / `eda` / `layer_count` / `copper_oz` 等条件，缩小检索范围 |
 | 查询理解 | 规则 + LLM 混合的意图识别，输出查询类型与动态检索权重 |
 | 查询分解 | 复合问题拆成多个子问题分别召回，缓解多跳问题漏召 |
@@ -248,6 +257,9 @@ Altium Designer 中如何处理高速差分线等长？
 | 加权 RRF 融合 | 按查询类型动态调整各路线权重并融合排序 |
 | Rerank 精排 | 使用 API 或本地 cross-encoder 对候选重排序 |
 | 上下文扩展 | 命中 chunk 并入相邻 / 父级 chunk，保持上下文完整 |
+| GraphRAG 图检索 | 实体链接命中图谱后取邻域关系与原文依据，作为独立一路参与融合，并顺带补全多跳事实 |
+| 权限复核 | 对召回结果逐条复核，向量库过滤被忽略时也能兜底拦截 |
+| 上下文压缩 | 近似去重 → 抽取式压缩（优先保留含数值 / 标准号的句子）→ 字符预算裁剪 |
 | 答案合成 | 基于 RAG Prompt 生成答案并标注引用来源 |
 
 ## Dify 外部知识库 API
@@ -272,7 +284,8 @@ bash scripts/serve_api.sh
 | `POST /api/ask` | 检索 + LLM 合成答案，支持传入对话历史 |
 | `POST /api/ask/stream` | SSE 流式问答：先推检索来源，再逐 token 推答案 |
 | `POST /api/chat` | 服务端会话记忆问答，返回 `session_id` |
-| `GET /health` | 健康检查，展示索引 / 后端 / 检索参数 / 缓存状态 |
+| `GET /health` | 健康检查，展示索引 / 后端 / 检索参数 / 缓存 / 图谱 / 权限 / 压缩配置 |
+| `GET /metrics` | 运行指标：计数器与延迟分位（p50 / p95 / p99） |
 
 更多步骤见 `docs/DIFY_INTEGRATION_GUIDE.md`。
 
@@ -344,6 +357,56 @@ bash scripts/serve_api.sh
 | `SESSION_DB_PATH` | `./data/sessions.db` | SQLite 会话库路径 |
 | `SELF_RAG_ENABLED` | `0` | 是否启用 Agentic RAG 迭代检索 |
 | `SELF_RAG_MAX_ITERATIONS` | `3` | 迭代检索的最大轮数 |
+
+### GraphRAG（P1-2）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `GRAPH_RAG_ENABLED` | `0` | 是否启用图检索（图谱缺失时自动降级为无图模式） |
+| `GRAPH_PATH` | `./data/graph/kg.json` | 图谱文件路径 |
+| `GRAPH_EXTRACT_BACKEND` | `rule` | 抽取方式：`rule`（零 LLM 成本）/ `llm` / `hybrid` |
+| `GRAPH_HOP` | `1` | 实体邻域扩展跳数 |
+| `GRAPH_TOP_K` | `5` | 图路径返回的候选数 |
+| `GRAPH_WEIGHT` | `0.35` | 图结果参与融合的权重 |
+| `GRAPH_EXPAND_MAX` | `2` | 邻域扩展追加的额外事实条数 |
+| `GRAPH_COMMUNITY_ENABLED` | `0` | 是否生成社区摘要（面向综述类问题） |
+
+开启图检索前先跑一次入库：入库流程会自动抽取三元组并维护 `GRAPH_PATH`。
+
+### 上下文压缩（P2）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CONTEXT_COMPRESSION_ENABLED` | `0` | 是否启用压缩 |
+| `COMPRESSION_MODE` | `extractive` | `extractive` / `llm` / `hybrid` |
+| `COMPRESSION_TARGET_RATIO` | `0.6` | 目标保留比例 |
+| `COMPRESSION_BUDGET_CHARS` | `12000` | 进入上下文的字符预算 |
+| `CONTEXT_DEDUPE_ENABLED` | `1` | 是否做近似去重 |
+| `CONTEXT_DEDUPE_THRESHOLD` | `0.85` | 去重相似度阈值 |
+
+### 访问控制（P2）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ACL_ENABLED` | `0` | 是否启用多租户过滤 |
+| `ACL_DEFAULT_VISIBILITY` | `private` | 入库默认可视性 |
+| `ACL_PUBLIC_VALUE` | `public` | 该 visibility 的文档对所有租户可见 |
+| `ACL_ADMIN_ROLES` | `admin,root` | 可跨租户访问的角色 |
+| `ACL_TRUST_HEADERS` | `1` | 是否信任客户端身份头（对外建议由网关注入后关闭） |
+| `ACL_STRICT_LEGACY` | `0` | 未标注权限字段的历史数据是否拒绝访问 |
+| `ACL_HEADER_TENANT` | `X-Tenant-Id` | 租户请求头，另有 `X-User-Id` / `X-User-Roles` / `X-User-Groups` |
+
+### 可观测性与多模态（P2）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `OBSERVABILITY_ENABLED` | `1` | 观测总开关 |
+| `TRACE_ENABLED` | `1` | 是否记录 tracing |
+| `TRACE_LOG_PATH` | `./data/traces.jsonl` | trace 落盘路径 |
+| `TRACE_SAMPLE_RATE` | `1.0` | 采样率（高 QPS 可降到 `0.1`） |
+| `MULTIMODAL_ENABLED` | `0` | 是否启用 PDF 图片描述（需配置视觉模型） |
+| `MULTIMODAL_VLM_MODEL` | 空 | 视觉模型名（留空复用 `LLM_MODEL`） |
+| `TABLE_MARKDOWN_ENABLED` | `1` | 表格结构化为 Markdown（零成本） |
 
 完整配置见 `.env.example` 与 `docs/CONFIGURATION_GUIDE.md`。
 

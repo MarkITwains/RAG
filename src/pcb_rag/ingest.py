@@ -107,6 +107,22 @@ from pcb_rag.api_clients import (
     get_embedding_dim,
 )
 
+# P1-2：GraphRAG —— 入库阶段抽取实体关系并维护知识图谱
+from pcb_rag.graph_rag import (
+    GRAPH_COMMUNITY_ENABLED,
+    GRAPH_EXTRACT_BACKEND,
+    GRAPH_RAG_ENABLED,
+    KnowledgeGraph,
+    build_graph_from_nodes,
+    summarize_communities,
+)
+
+# P2：多模态 —— PDF 图片描述与表格结构化
+from pcb_rag.multimodal import MULTIMODAL_ENABLED, augment_documents_with_multimodal
+
+# P2：访问控制 —— 入库时写入租户 / 可视性字段
+from pcb_rag.security import ACL_ENABLED, acl_metadata_for_ingest
+
 try:
     import nest_asyncio
 
@@ -3218,6 +3234,45 @@ def _delete_chunks_by_doc_node_id(vector_store, doc_node_id: str) -> int:
         return 0
 
 
+def _update_knowledge_graph(nodes: list, stale_doc_ids=None) -> None:
+    """维护知识图谱：合并本次抽取的三元组，并清理已变更 / 已删除文档的旧关系。
+
+    图谱是**旁路产物**：无论抽取还是落盘失败，都只告警，绝不中断向量入库主流程。
+    """
+
+    if not GRAPH_RAG_ENABLED:
+        return
+
+    try:
+        graph = KnowledgeGraph.load() or KnowledgeGraph()
+
+        if stale_doc_ids:
+            removed = graph.remove_docs(stale_doc_ids)
+            if removed:
+                print(f"[GraphRAG] 已清理 {removed} 条过期关系")
+
+        if not nodes:
+            if graph.edges:
+                graph.save()
+            return
+
+        llm = None
+        if GRAPH_EXTRACT_BACKEND in {"llm", "hybrid"}:
+            llm = getattr(Settings, "llm", None)
+
+        graph = build_graph_from_nodes(nodes, llm, graph=graph, progress=True)
+
+        if GRAPH_COMMUNITY_ENABLED:
+            communities = summarize_communities(graph, llm)
+            print(f"[GraphRAG] 社区摘要: {len(communities)} 个主题簇")
+
+        path = graph.save()
+        stats = graph.stats()
+        print(f"[GraphRAG] 知识图谱已更新: {path} (实体={stats['entities']}, 关系={stats['relations']})")
+    except Exception as exc:
+        print(f"[GraphRAG] 图谱更新失败（不影响入库）: {exc}")
+
+
 def main():
     # 1) 配置 LLM（用于回答）- 后端由 LLM_BACKEND 决定（local=Ollama，api=OpenAI 兼容）
     Settings.llm = build_llm()
@@ -3270,6 +3325,11 @@ def main():
                 # 不覆盖 reader 已经给的字段
                 d.metadata.setdefault(k, v)
 
+        # 9.2) 权限元数据：写入租户 / 可视性 / 授权组，供检索阶段做 ACL 过滤
+        if ACL_ENABLED:
+            for k, v in acl_metadata_for_ingest().items():
+                d.metadata.setdefault(k, v)
+
         # 文本清洗（编码修复 + 乱码清理）
         if os.getenv("NORMALIZE_TEXT", "1") not in {"0", "false", "False"}:
             try:
@@ -3300,6 +3360,13 @@ def main():
             _doc_node_id_of(d): {"path": _doc_source_of(d), "hash": ""}
             for d in documents
         }
+
+    # P2 多模态：表格结构化成 Markdown（零成本），并按需为 PDF 图片生成描述
+    if MULTIMODAL_ENABLED or os.getenv("TABLE_MARKDOWN_ENABLED", "1") not in {"0", "false", "False"}:
+        before_docs = len(to_process)
+        to_process = augment_documents_with_multimodal(to_process, progress=True)
+        if len(to_process) != before_docs:
+            print(f"[Multimodal] 文档增强: {before_docs} → {len(to_process)} 个（含图片描述）")
 
     print(f"📚 共加载 {len(documents)} 个文档，开始向量化并写入 Milvus...")
 
@@ -3388,6 +3455,9 @@ def main():
         for nid in stale_doc_ids:
             deleted_total += _delete_chunks_by_doc_node_id(vector_store, nid)
         print(f"🗑️  已清理 {len(stale_doc_ids)} 个文档的残留 chunk（共 {deleted_total} 条）")
+
+    # P1-2 GraphRAG：抽取实体关系并维护知识图谱（旁路产物，失败不影响入库）
+    _update_knowledge_graph(nodes, stale_doc_ids)
 
     # 更新入库清单（供下次增量比对）
     if INGEST_INCREMENTAL:

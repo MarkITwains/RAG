@@ -136,6 +136,45 @@ from llama_index.vector_stores.milvus import MilvusVectorStore
 from pcb_rag.api_clients import build_llm, describe_backends
 from pcb_rag.cache import all_cache_stats, embed_query_for_cache, get_cache
 
+# P2：上下文压缩（去重 + 抽取式压缩 + 预算裁剪）
+from pcb_rag.compression import (
+    COMPRESSION_ENABLED,
+    compress_pipeline,
+    describe_compression,
+)
+
+# P1-2：GraphRAG 图检索
+from pcb_rag.graph_rag import (
+    GRAPH_HOP,
+    GRAPH_RAG_ENABLED,
+    GRAPH_TOP_K,
+    GRAPH_WEIGHT,
+    GraphRetriever,
+    KnowledgeGraph,
+    describe_graph,
+    expand_nodes_with_graph,
+    fuse_with_graph,
+)
+
+# P2：可观测性（指标快照 / trace / span）
+from pcb_rag.observability import (
+    describe_observability,
+    metrics_snapshot,
+    span,
+    trace_context,
+)
+
+# P2：访问控制（多租户 / 角色）
+from pcb_rag.security import (
+    ACL_ENABLED,
+    current_principal,
+    describe_acl,
+    filter_nodes,
+    reset_request_principal,
+    resolve_principal,
+    set_request_principal,
+)
+
 # ---------------------------------------------------------------------------
 # 1c. 持久 HyDE 线程池 + 第二路变体函数
 #     - _HYDE_EXECUTOR 独立于主检索 pool，不会被 with 语句 shutdown 阻塞
@@ -689,6 +728,27 @@ def _initialize_retrieval_engine() -> None:
         logger.warning("[Rerank] 未启用或加载失败，使用 recall_k=20")
     _app_state["recall_k"] = recall_k
 
+    # GraphRAG：加载知识图谱（缺失 / 未启用时按无图模式运行，不影响主链路）
+    graph, graph_retriever = None, None
+    if GRAPH_RAG_ENABLED:
+        try:
+            graph = KnowledgeGraph.load()
+            if graph is not None and graph.nodes:
+                graph_retriever = GraphRetriever(graph)
+                stats = graph.stats()
+                logger.info(
+                    f"[GraphRAG] 图谱就绪: 实体={stats['entities']}, 关系={stats['relations']}, "
+                    f"社区={stats['communities']}, hop={GRAPH_HOP}"
+                )
+            else:
+                logger.warning("[GraphRAG] 未找到可用图谱，按无图模式运行")
+                graph = None
+        except Exception as e:
+            logger.warning(f"[GraphRAG] 图谱加载失败，按无图模式运行: {e}")
+            graph, graph_retriever = None, None
+    _app_state["graph"] = graph
+    _app_state["graph_retriever"] = graph_retriever
+
     # 初始化 ColBERT Reranker（MultiPath 模式可选）
     colbert_reranker = None
     if MULTIPATH_ENABLED and COLBERT_RERANK_ENABLED and bm25_index is not None:
@@ -763,20 +823,35 @@ app.add_middleware(
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """记录每个请求的方法、路径和耗时，便于排查 Dify 调用问题。"""
+    """记录请求日志，并绑定 trace 与访问主体。
+
+    - trace：沿用外部传入的 ``X-Trace-Id``（没有则生成），并回写到响应头，
+      便于与 Dify 侧日志逐条对齐
+    - 主体：从请求头解析租户 / 角色，写入 ContextVar；FastAPI 执行同步端点时
+      会复制上下文，因此下游的 ACL 过滤无需改动任何端点签名
+    """
     start = time.time()
     method = request.method
     path = request.url.path
     logger.info(f"[REQ] {method} {path} - 开始处理")
+
+    principal = resolve_principal(dict(request.headers))
+    principal_token = set_request_principal(principal)
+    incoming_trace = request.headers.get("X-Trace-Id") or request.headers.get("x-trace-id")
+
     try:
-        response = await call_next(request)
-        elapsed = time.time() - start
-        logger.info(f"[REQ] {method} {path} - {response.status_code} ({elapsed:.1f}s)")
-        return response
+        with trace_context(incoming_trace) as tid, span(f"http.{method}", path=path):
+            response = await call_next(request)
+            elapsed = time.time() - start
+            response.headers["X-Trace-Id"] = tid
+            logger.info(f"[REQ] {method} {path} - {response.status_code} ({elapsed:.1f}s)")
+            return response
     except Exception as e:
         elapsed = time.time() - start
         logger.error(f"[REQ] {method} {path} - 异常 ({elapsed:.1f}s): {e}")
         raise
+    finally:
+        reset_request_principal(principal_token)
 
 
 # ---------------------------------------------------------------------------
@@ -1203,6 +1278,28 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
     return filtered
 
 
+def _graph_augment_nodes(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
+    """把图检索结果与邻域事实融合进召回结果（未启用图时为 no-op）。"""
+
+    graph = _app_state.get("graph")
+    retriever = _app_state.get("graph_retriever")
+    if not GRAPH_RAG_ENABLED or graph is None or retriever is None or not nodes:
+        return nodes
+
+    try:
+        with span("graph.augment", query=query[:120]):
+            graph_nodes = retriever.retrieve(query, top_k=GRAPH_TOP_K)
+            if graph_nodes:
+                nodes = fuse_with_graph(nodes, graph_nodes, graph_weight=GRAPH_WEIGHT)
+                logger.info(f"[GraphRAG] 图检索补充 {len(graph_nodes)} 条关系证据")
+            nodes = expand_nodes_with_graph(
+                nodes, graph, max_extra=int(os.getenv("GRAPH_EXPAND_MAX", "2"))
+            )
+    except Exception as e:
+        logger.warning(f"[GraphRAG] 图检索融合失败（忽略并继续）: {e}")
+    return nodes
+
+
 def retrieve_chunks(user_query: str, top_k: int = 5, score_threshold: float = 0.0) -> List[Record]:
     """
     完整执行 PCB-RAG 检索管道，返回适配 Dify 的 Record 列表。
@@ -1219,6 +1316,24 @@ def retrieve_chunks(user_query: str, top_k: int = 5, score_threshold: float = 0.
         return [Record(**item) for item in cached.get("records", [])]
 
     nodes = _retrieve_nodes(user_query, top_k=top_k, score_threshold=score_threshold)
+
+    # P1-2 GraphRAG：图检索融合 + 邻域事实扩展
+    nodes = _graph_augment_nodes(user_query, nodes)
+
+    # P2 权限复核：向量库过滤条件若被服务端忽略，这里做内存侧兜底拦截
+    if ACL_ENABLED:
+        before_acl = len(nodes)
+        nodes = filter_nodes(nodes, current_principal())
+        if len(nodes) < before_acl:
+            logger.info(f"[ACL] 权限复核过滤 {before_acl - len(nodes)} 条无权访问的记录")
+
+    # P2 上下文压缩：近似去重 + 抽取式压缩 + 字符预算裁剪
+    if COMPRESSION_ENABLED:
+        before_compress = len(nodes)
+        nodes = compress_pipeline(nodes, user_query)
+        if len(nodes) < before_compress:
+            logger.info(f"[Compress] 上下文压缩 {before_compress} → {len(nodes)} 条")
+
     records: List[Record] = []
     for nws in nodes:
         score = float(nws.score) if nws.score is not None else 0.0
@@ -1979,7 +2094,25 @@ def health_check():
         },
         "backends": describe_backends(),
         "cache": all_cache_stats(),
+        "graph_rag": describe_graph(_app_state.get("graph")),
+        "acl": describe_acl(),
+        "compression": describe_compression(),
+        "observability": describe_observability(),
     }
+
+
+@app.get("/metrics", summary="运行指标（计数器 + 延迟分位）")
+def metrics():
+    """返回进程内累计的运行指标。
+
+    口径说明：
+      - ``counters``：累计次数（缓存命中、图检索补充、压缩丢弃、ACL 拦截等）
+      - ``histograms``：滑动窗口内的 count / mean / p50 / p95 / p99
+
+    可直接接入 Prometheus 文本导出器，也便于压测时即时观测。
+    """
+
+    return metrics_snapshot()
 
 
 # ---------------------------------------------------------------------------
