@@ -36,6 +36,7 @@ os.environ.setdefault("HYDE_MAX_LENGTH", "200")
 os.environ.setdefault("HF_RERANK_MAX_LENGTH", "1024")
 os.environ.setdefault("OLLAMA_TIMEOUT", "180")         # qwen3.5:35b-a3b-q4_K_M 生成长答案可能需要 60-150s
 
+import sqlite3
 import sys
 import time
 import asyncio
@@ -363,6 +364,9 @@ from typing import Dict, List, Tuple
 SESSION_EXPIRE_MINUTES = int(os.getenv("SESSION_EXPIRE_MINUTES", "60"))
 SESSION_MAX_COUNT = int(os.getenv("SESSION_MAX_COUNT", "1000"))
 SESSION_CLEANUP_INTERVAL = int(os.getenv("SESSION_CLEANUP_INTERVAL", "300"))
+# 会话持久化：memory（默认，进程重启后丢失）| sqlite（落盘，重启后保留）
+SESSION_STORE = os.getenv("SESSION_STORE", "memory").strip().lower()
+SESSION_DB_PATH = os.getenv("SESSION_DB_PATH", "./data/sessions.db")
 
 
 class SessionManager:
@@ -385,7 +389,111 @@ class SessionManager:
         self._expire_delta = timedelta(minutes=expire_minutes)
         self._lock = threading.Lock()
         self._last_cleanup = datetime.now()
-        logger.info(f"[SessionManager] 初始化完成 (max={max_sessions}, expire={expire_minutes}min)")
+        self._db: Optional[sqlite3.Connection] = None
+        self._init_store()
+        logger.info(
+            f"[SessionManager] 初始化完成 (max={max_sessions}, expire={expire_minutes}min, "
+            f"store={SESSION_STORE})"
+        )
+
+    # ---------------------------------------------------------------- 持久化
+    def _init_store(self) -> None:
+        """按 SESSION_STORE 初始化持久化存储，失败自动回退内存模式。"""
+        if SESSION_STORE != "sqlite":
+            return
+        try:
+            db_path = Path(SESSION_DB_PATH)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._db = sqlite3.connect(str(db_path), check_same_thread=False)
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS sessions "
+                "(session_id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT)"
+            )
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS messages "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+                "content TEXT, timestamp TEXT)"
+            )
+            self._db.commit()
+            self._load_from_db()
+            logger.info(f"[SessionManager] 已启用 SQLite 持久化: {db_path}")
+        except Exception as e:
+            logger.warning(f"[SessionManager] SQLite 初始化失败，回退内存模式: {e}")
+            self._db = None
+
+    def _load_from_db(self) -> None:
+        """启动时把已持久化的会话加载回内存。"""
+        if self._db is None:
+            return
+        try:
+            for sid, created, updated in self._db.execute(
+                "SELECT session_id, created_at, updated_at FROM sessions"
+            ).fetchall():
+                try:
+                    created_dt = datetime.fromisoformat(created)
+                    updated_dt = datetime.fromisoformat(updated)
+                except Exception:
+                    created_dt = updated_dt = datetime.now()
+                self._sessions[sid] = {
+                    "history": [],
+                    "created_at": created_dt,
+                    "updated_at": updated_dt,
+                }
+
+            for sid, role, content, ts in self._db.execute(
+                "SELECT session_id, role, content, timestamp FROM messages ORDER BY id"
+            ).fetchall():
+                session = self._sessions.get(sid)
+                if session is not None:
+                    session["history"].append({"role": role, "content": content, "timestamp": ts})
+        except Exception as e:
+            logger.warning(f"[SessionManager] 加载持久化会话失败: {e}")
+
+    def _db_upsert_session(self, sid: str) -> None:
+        if self._db is None:
+            return
+        try:
+            session = self._sessions.get(sid)
+            if session is None:
+                return
+            self._db.execute(
+                "INSERT OR REPLACE INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)",
+                (sid, session["created_at"].isoformat(), session["updated_at"].isoformat()),
+            )
+            self._db.commit()
+        except Exception as e:
+            logger.debug(f"[SessionManager] 持久化会话元数据失败: {e}")
+
+    def _db_insert_message(self, sid: str, role: str, content: str, ts: str) -> None:
+        if self._db is None:
+            return
+        try:
+            self._db.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                (sid, role, content, ts),
+            )
+            self._db.commit()
+        except Exception as e:
+            logger.debug(f"[SessionManager] 持久化消息失败: {e}")
+
+    def _db_drop_session(self, sid: str) -> None:
+        if self._db is None:
+            return
+        try:
+            self._db.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+            self._db.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+            self._db.commit()
+        except Exception as e:
+            logger.debug(f"[SessionManager] 删除持久化会话失败: {e}")
+
+    def _db_clear_messages(self, sid: str) -> None:
+        if self._db is None:
+            return
+        try:
+            self._db.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+            self._db.commit()
+        except Exception as e:
+            logger.debug(f"[SessionManager] 清空持久化消息失败: {e}")
 
     def create_session(self, session_id: str = None) -> str:
         """创建新会话，返回 session_id。"""
@@ -399,6 +507,7 @@ class SessionManager:
                 }
                 self._sessions.move_to_end(sid)
                 self._evict_if_needed()
+                self._db_upsert_session(sid)
         logger.debug(f"[SessionManager] 创建会话: {sid[:8]}...")
         return sid
 
@@ -433,13 +542,16 @@ class SessionManager:
         with self._lock:
             session = self._sessions.get(session_id)
             if session:
+                ts = datetime.now().isoformat()
                 session["history"].append({
                     "role": role,
                     "content": content,
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": ts,
                 })
                 session["updated_at"] = datetime.now()
                 self._sessions.move_to_end(session_id)
+                self._db_insert_message(session_id, role, content, ts)
+                self._db_upsert_session(session_id)
                 logger.debug(f"[SessionManager] 会话 {session_id[:8]}... 添加消息 ({role})")
 
     def clear_session(self, session_id: str) -> bool:
@@ -449,6 +561,7 @@ class SessionManager:
             if session:
                 session["history"] = []
                 session["updated_at"] = datetime.now()
+                self._db_clear_messages(session_id)
                 return True
         return False
 
@@ -457,6 +570,7 @@ class SessionManager:
         with self._lock:
             if session_id in self._sessions:
                 del self._sessions[session_id]
+                self._db_drop_session(session_id)
                 logger.debug(f"[SessionManager] 删除会话: {session_id[:8]}...")
                 return True
         return False
@@ -484,6 +598,7 @@ class SessionManager:
                     expired.append(sid)
             for sid in expired:
                 del self._sessions[sid]
+                self._db_drop_session(sid)
         if expired:
             logger.info(f"[SessionManager] 清理过期会话: {len(expired)} 个")
         return len(expired)
@@ -493,6 +608,7 @@ class SessionManager:
         while len(self._sessions) > self._max_sessions:
             oldest_sid = next(iter(self._sessions))
             del self._sessions[oldest_sid]
+            self._db_drop_session(oldest_sid)
             logger.info(f"[SessionManager] LRU 淘汰会话: {oldest_sid[:8]}...")
 
 

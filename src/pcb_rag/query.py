@@ -11,7 +11,7 @@ import sys
 import urllib.error
 import urllib.request
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import log
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -315,7 +315,10 @@ LLM_QUERY_REWRITE_ENABLED = os.getenv("LLM_QUERY_REWRITE_ENABLED", "0") not in {
 MULTIPATH_ENABLED = os.getenv("MULTIPATH_ENABLED", "0") not in {"0", "false", "False"}
 # ColBERT 风格 Late Interaction reranker（注意：不适用于生成式模型如 Qwen3-Reranker）
 COLBERT_RERANK_ENABLED = os.getenv("COLBERT_RERANK_ENABLED", "0") not in {"0", "false", "False"}
-COLBERT_MODEL = os.getenv("COLBERT_MODEL", "BAAI/bge-reranker-v2-m3").strip()
+# 注意：ColBERT 需要真正的 late-interaction 模型（如 jinaai/jina-colbert-v2、colbert-ir/colbertv2.0）；
+# cross-encoder 类模型（bge-reranker 等）输出单个相关性分数而非 token 级向量，不适用于本实现，
+# 这类需求请改用 RERANK_BACKEND=api 或 hf。
+COLBERT_MODEL = os.getenv("COLBERT_MODEL", "").strip()
 COLBERT_MAX_LENGTH = int(os.getenv("COLBERT_MAX_LENGTH", "512"))
 COLBERT_BATCH_SIZE = int(os.getenv("COLBERT_BATCH_SIZE", "16"))
 # 多路召回参数
@@ -2010,6 +2013,91 @@ def self_rag_generate_followup_query(
         return f"{query} 详细信息"
 
 
+_AGENTIC_PLAN_PROMPT = """你是 PCB 领域的检索智能体。请判断当前已收集的资料是否足以回答用户问题，并决定下一步动作。
+
+动作说明：
+- ANSWER：资料已足够，可以作答
+- SEARCH：资料不足，需要用一个新的检索查询继续检索
+
+【用户问题】
+{query}
+
+【已收集的资料摘要】
+{scratchpad}
+
+请输出 JSON：
+{{"sufficient": true, "action": "ANSWER", "next_query": "", "reason": "简要理由"}}
+
+要求：
+1. next_query 仅在 action 为 SEARCH 时填写，且必须是能补足缺失信息的新查询
+2. 不要重复使用已经检索过的查询
+3. 只输出 JSON，不要解释"""
+
+
+def _agentic_scratchpad(docs: list, max_docs: int = 6, max_chars: int = 400) -> str:
+    """把已收集的文档压缩成供充分性判断使用的摘要。"""
+    if not docs:
+        return "（暂无资料）"
+
+    lines: list[str] = []
+    for i, doc in enumerate(docs[:max_docs], 1):
+        node = doc.node if hasattr(doc, "node") else doc
+        try:
+            text = node.get_content()
+        except Exception:
+            text = str(node)
+        source = ""
+        try:
+            source = (node.metadata or {}).get("source_path", "")
+        except Exception:
+            source = ""
+        text = " ".join((text or "").split())[:max_chars]
+        lines.append(f"[{i}] {Path(source).stem if source else '未知来源'}：{text}")
+
+    if len(docs) > max_docs:
+        lines.append(f"...（另有 {len(docs) - max_docs} 条未展示）")
+
+    return "\n".join(lines)
+
+
+def _agentic_plan(query: str, docs: list, llm, used_queries: Optional[list] = None) -> dict:
+    """判断检索是否充分，并给出下一步动作。失败时默认「已充分」（避免死循环）。"""
+    default = {"sufficient": True, "action": "ANSWER", "next_query": "", "reason": "判断失败，按充分处理"}
+
+    try:
+        response = llm.complete(
+            _AGENTIC_PLAN_PROMPT.format(query=query, scratchpad=_agentic_scratchpad(docs))
+        )
+        text = response.text if hasattr(response, "text") else str(response)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+
+        match = re.search(r"\{.*?\}", text, re.DOTALL)
+        if not match:
+            return default
+        data = json.loads(match.group())
+
+        next_query = str(data.get("next_query") or "").strip()
+        if used_queries and next_query in used_queries:
+            next_query = ""
+
+        sufficient = bool(data.get("sufficient"))
+        action = str(data.get("action") or "").strip().upper()
+        if action == "ANSWER":
+            sufficient = True
+        if action == "SEARCH" and not next_query:
+            # 说要继续检索却没给查询，按充分处理
+            sufficient = True
+
+        return {
+            "sufficient": sufficient,
+            "action": action or ("ANSWER" if sufficient else "SEARCH"),
+            "next_query": next_query,
+            "reason": str(data.get("reason") or "")[:200],
+        }
+    except Exception:
+        return default
+
+
 def self_rag_query(
     query: str,
     retriever,
@@ -2018,111 +2106,149 @@ def self_rag_query(
     threshold: float = None,
     verbose: bool = None,
 ) -> dict:
-    """Self-RAG 主流程：评分器模式（不干预检索决策）。
+    """Agentic RAG 主流程：检索 → 充分性判断 → 不足则改写重检（迭代）→ 生成答案 → 自评估。
 
-    工作流程：
-    1. 执行首轮检索和答案生成
-    2. LLM 自我评估答案质量（仅打分）
-    3. 不进行补充查询、不进行迭代重检索
-    
+    与旧版「评分器模式」的区别：旧实现只对答案打分、``max_iterations`` 被写死为 1，
+    实际上从不重检索。现在把「检索不充分」作为继续迭代的信号：
+
+    1. 用当前查询检索，与已有结果按 node_id 去重合并
+    2. 让 LLM 判断已收集的资料是否足以作答，并给出下一步动作与补充查询
+    3. 不充分则用补充查询继续检索，直到满足或达到 ``max_iterations`` 上限
+    4. 基于全部收集到的资料生成最终答案，并做一次自评估（保留评分能力）
+
     Args:
         query: 用户查询
         retriever: 检索器实例
         llm: LLM 实例
-        max_iterations: 最大迭代次数（默认使用配置）
-        threshold: 质量阈值（默认使用配置）
+        max_iterations: 最大迭代次数（默认使用 SELF_RAG_MAX_ITERATIONS）
+        threshold: 质量阈值（默认使用配置，低于该分数视为需要继续检索）
         verbose: 是否显示详细过程（默认使用配置）
-        
+
     Returns:
-        包含最终答案、引用和迭代历史的结果字典
+        包含最终答案、引用与迭代历史的结果字典
     """
-    if not SELF_RAG_ENABLED:
-        # Self-RAG 未启用，使用普通流程
-        docs = retriever.retrieve(query)
-        return generate_answer_with_citation(query, docs, llm)
-    
     if llm is None:
         llm = Settings.llm
-    if max_iterations is None:
-        max_iterations = 1
-    if threshold is None:
-        threshold = SELF_RAG_THRESHOLD
     if verbose is None:
         verbose = SELF_RAG_VERBOSE
-    
-    # 评分器模式：仅记录一轮
-    iteration_history = []
-    all_retrieved_docs = []
-    seen_doc_ids = set()
-    if verbose:
-        print(f"\n[Self-RAG] === 评分模式（单轮）===")
-        print(f"[Self-RAG] 当前查询: {query[:80]}...")
 
-    # Step 1: 首轮检索
-    new_docs = retriever.retrieve(query)
+    # 未启用时保持原行为：单轮检索 + 生成
+    if not SELF_RAG_ENABLED:
+        docs = retriever.retrieve(query)
+        return generate_answer_with_citation(query, docs, llm)
 
-    # 去重并合并文档（仅一轮）
-    for doc in new_docs:
-        node = doc.node if hasattr(doc, 'node') else doc
-        doc_id = node.node_id if hasattr(node, 'node_id') else str(id(node))
-        if doc_id not in seen_doc_ids:
-            seen_doc_ids.add(doc_id)
-            all_retrieved_docs.append(doc)
+    if max_iterations is None:
+        max_iterations = max(1, int(SELF_RAG_MAX_ITERATIONS))
+    if threshold is None:
+        threshold = SELF_RAG_THRESHOLD
+
+    all_docs: list = []
+    seen_ids: set = set()
+    history: list[dict] = []
+    used_queries: list[str] = [query]
+    current_query = query
 
     if verbose:
-        print(f"[Self-RAG] 首轮检索文档: {len(new_docs)}, 去重后: {len(all_retrieved_docs)}")
+        print(f"\n[Agentic-RAG] === 迭代检索开始（最多 {max_iterations} 轮）===")
+        print(f"[Agentic-RAG] 初始查询: {query[:80]}")
 
-    # Step 2: 生成答案（首轮文档不截断，保障召回覆盖）
-    final_result = generate_answer_with_citation(
-        query,
-        all_retrieved_docs,
-        llm
-    )
+    for iteration in range(1, max_iterations + 1):
+        # ---- 1) 用当前查询检索 ----
+        try:
+            new_docs = retriever.retrieve(current_query)
+        except Exception as e:
+            if verbose:
+                print(f"[Agentic-RAG] 第 {iteration} 轮检索失败: {e}")
+            new_docs = []
 
-    if verbose:
-        print(f"[Self-RAG] 答案预览: {final_result['answer'][:100]}...")
+        added = 0
+        for doc in new_docs:
+            node = doc.node if hasattr(doc, "node") else doc
+            doc_id = (
+                getattr(node, "node_id", None)
+                or getattr(node, "id_", None)
+                or str(id(node))
+            )
+            if doc_id in seen_ids:
+                continue
+            seen_ids.add(doc_id)
+            all_docs.append(doc)
+            added += 1
 
-    # Step 3: 自评估（仅评分，不驱动重检索）
+        # ---- 2) 充分性判断与下一步动作 ----
+        plan = _agentic_plan(query, all_docs, llm, used_queries) if all_docs else {
+            "sufficient": False, "action": "SEARCH", "next_query": "", "reason": "尚未检索到资料"
+        }
+        sufficient = bool(plan.get("sufficient"))
+        next_query = str(plan.get("next_query") or "").strip()
+
+        history.append({
+            "iteration": iteration,
+            "query_used": current_query,
+            "docs_retrieved": len(new_docs),
+            "docs_added": added,
+            "docs_total": len(all_docs),
+            "sufficient": sufficient,
+            "reason": plan.get("reason", ""),
+        })
+
+        if verbose:
+            print(f"[Agentic-RAG] 第 {iteration} 轮: 新增 {added} 条, 累计 {len(all_docs)} 条, "
+                  f"充分={sufficient} ({plan.get('reason', '')[:60]})")
+
+        if sufficient or iteration >= max_iterations:
+            break
+        if not next_query or next_query in used_queries:
+            break
+
+        current_query = next_query
+        used_queries.append(next_query)
+        if verbose:
+            print(f"[Agentic-RAG] 补充查询: {current_query[:80]}")
+
+    # ---- 3) 生成最终答案 ----
+    final_result = generate_answer_with_citation(query, all_docs, llm)
+
+    # ---- 4) 自评估（保留评分能力）----
     eval_result = self_rag_evaluate(
         query,
-        final_result['answer'],
-        all_retrieved_docs[:RAG_TOP_DOCS],
-        llm
+        final_result["answer"],
+        all_docs[:RAG_TOP_DOCS],
+        llm,
     )
-    iteration_history.append({
-        "iteration": 1,
-        "query_used": query,
-        "docs_retrieved": len(new_docs),
-        "docs_total": len(all_retrieved_docs),
+    final_score = float(eval_result.get("overall", 0) or 0)
+    history.append({
+        "iteration": len(history) + 1,
+        "phase": "evaluate",
         "evaluation": eval_result,
     })
 
     if verbose:
-        print(f"[Self-RAG] 自评分: {float(eval_result.get('overall', 3))}/5")
-        print(f"[Self-RAG] 评估理由: {eval_result.get('reason', 'N/A')[:80]}")
-    
-    # 添加 Self-RAG 元信息
-    final_result['self_rag_info'] = {
-        'enabled': True,
-        'mode': 'scorer_only',
-        'iterations': len(iteration_history),
-        'final_score': iteration_history[-1]['evaluation'].get('overall', 0) if iteration_history else 0,
-        'history': iteration_history,
+        print(f"[Agentic-RAG] 最终自评分: {final_score}/5 (阈值 {threshold})")
+
+    final_result["self_rag_info"] = {
+        "enabled": True,
+        "mode": "iterative",
+        "iterations": len(used_queries),
+        "final_score": final_score,
+        "history": history,
+        "queries_used": used_queries,
+        "evaluation": eval_result,
     }
 
     # 为评估流程提供检索结果（不影响线上展示）
-    final_result['retrieved_docs'] = all_retrieved_docs
+    final_result["retrieved_docs"] = all_docs
     retrieved_ids: list[str] = []
-    for doc in all_retrieved_docs:
+    for doc in all_docs:
         try:
-            node = doc.node if hasattr(doc, 'node') else doc
-            nid = getattr(node, 'node_id', None) or getattr(node, 'id_', None) or getattr(node, 'id', None)
+            node = doc.node if hasattr(doc, "node") else doc
+            nid = getattr(node, "node_id", None) or getattr(node, "id_", None) or getattr(node, "id", None)
             if isinstance(nid, str) and nid:
                 retrieved_ids.append(nid)
         except Exception:
             pass
-    final_result['retrieved_node_ids'] = retrieved_ids
-    
+    final_result["retrieved_node_ids"] = retrieved_ids
+
     return final_result
 
 
@@ -2581,6 +2707,14 @@ class ColBERTReranker:
         """延迟加载模型，避免启动时内存占用过高。"""
         if self._initialized:
             return
+
+        # 架构校验：必须是 late-interaction 模型，否则 MaxSim 计算没有意义
+        if "colbert" not in (self.model_name or "").lower():
+            raise ValueError(
+                f"ColBERTReranker 需要 late-interaction 模型，当前配置为 '{self.model_name}'。"
+                "\n- 推荐改用 RERANK_BACKEND=api（无需本地显存）或 hf"
+                "\n- 或提供真正的 ColBERT 模型，例如 jinaai/jina-colbert-v2、colbert-ir/colbertv2.0"
+            )
 
         import torch
         from transformers import AutoModel, AutoTokenizer
@@ -3167,7 +3301,11 @@ def _try_build_colbert_reranker() -> Optional[ColBERTReranker]:
     # 验证模型名称格式
     model_name = COLBERT_MODEL.strip()
     if not model_name:
-        print(f"[ColBERT] 错误: COLBERT_MODEL 为空")
+        print("[ColBERT] 未配置 COLBERT_MODEL，跳过（仅需精排请使用 RERANK_BACKEND=api 或 hf）")
+        return None
+    if "colbert" not in model_name.lower():
+        print(f"[ColBERT] COLBERT_MODEL='{model_name}' 不是 late-interaction 模型，已跳过")
+        print("[ColBERT] 可用的 ColBERT 模型示例: jinaai/jina-colbert-v2, colbert-ir/colbertv2.0")
         return None
     
     # 检查是否是常见的错误模型名称
@@ -3632,6 +3770,26 @@ class _Bm25Index:
     k1: float = 1.5  # 调高 k1 增强词频影响（PCB文档专业术语重复度高）
     b: float = 0.75
     delta: float = 1.0  # BM25+ 的 delta 参数，防止长文档过度惩罚
+    # 倒排索引：term -> 候选文档下标，把检索从 O(全部文档) 降到 O(候选文档)
+    inverted: dict = field(default_factory=dict)
+
+    def candidates(self, query_tokens: list[str], max_postings: int = 5000) -> set:
+        """返回可能命中的候选文档下标（基于倒排索引）。
+
+        ``max_postings`` 用于限制单个高频词带来的候选爆炸。
+        """
+        if not self.inverted:
+            return set(range(len(self.docs)))
+
+        out: set = set()
+        for term in query_tokens:
+            postings = self.inverted.get(term)
+            if not postings:
+                continue
+            if len(postings) > max_postings:
+                postings = postings[:max_postings]
+            out.update(postings)
+        return out
 
     def score(self, query_tokens: list[str], doc_i: int) -> float:
         """计算 BM25+ 评分。
@@ -3754,7 +3912,10 @@ class LocalBM25Retriever(BaseRetriever):
         query_str = getattr(query_bundle, "query_str", str(query_bundle))
         q_tokens = _tokenize(query_str)
         scored: list[tuple[float, int]] = []
-        for i in range(len(self._bm25.docs)):
+
+        # 先用倒排索引取候选文档，避免对全量文档打分（O(N) → O(候选数)）
+        candidate_ids = self._bm25.candidates(q_tokens)
+        for i in candidate_ids:
             if self._filters is not None:
                 md = self._bm25.docs[i].metadata or {}
                 if not self._match_filters(md, self._filters):
@@ -3901,16 +4062,18 @@ def _load_or_build_bm25(vector_store: MilvusVectorStore) -> Optional[_Bm25Index]
 
     tfs: list[Counter] = []
     df: Counter = Counter()
+    inverted: dict[str, list[int]] = {}
     total_len = 0
-    for node in docs:
+    for i, node in enumerate(docs):
         tokens = _tokenize(node.text)
         tf = Counter(tokens)
         tfs.append(tf)
         total_len += sum(tf.values())
         for term in tf.keys():
             df[term] += 1
+            inverted.setdefault(term, []).append(i)
     avgdl = total_len / max(len(docs), 1)
-    return _Bm25Index(docs=docs, tfs=tfs, df=df, avgdl=avgdl)
+    return _Bm25Index(docs=docs, tfs=tfs, df=df, avgdl=avgdl, inverted=inverted)
 
 def build_index(llm_model: str):
     _configure_llm(llm_model)

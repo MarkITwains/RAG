@@ -7,6 +7,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/MarkITwains/RAG/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/MarkITwains/RAG/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
   <img alt="LlamaIndex" src="https://img.shields.io/badge/Built%20with-LlamaIndex-6E56CF">
   <img alt="Milvus" src="https://img.shields.io/badge/Vector%20Store-Milvus-00A1EA">
@@ -45,6 +46,7 @@ PCB-RAG 面向 PCB 设计规范、工艺资料与工程经验文档，覆盖从�
 | **领域化文档处理** | 面向 PCB 规范、EDA 工具文档与工艺参数，内置编码修复、OCR 乱码清理、结构感知切块与元数据抽取 |
 | **混合检索架构** | Milvus 向量检索 + BM25 词法检索 + HyDE 查询扩展 + 加权 RRF 多路融合，提升专业问题召回率 |
 | **查询理解** | 意图识别与动态权重、复合问题自动分解、过于具体的问题自动 Step-back 补充背景知识 |
+| **Agentic RAG** | 可选的迭代检索：检索 → 充分性判断 → 信息不足则改写查询重检，直到满足或达到迭代上限 |
 | **Contextual Retrieval** | 入库时为每个 chunk 注入「文档 · 章节 · 标准号」语境前缀，缓解切块导致的上下文丢失 |
 | **可切换精排** | 支持 API 精排（Jina / 硅基流动等）与本地精排（Qwen3-Reranker / cross-encoder / SBERT） |
 | **上下文扩展** | 命中的 chunk 自动并入相邻与父级 chunk 内容，缓解长文档上下文割裂 |
@@ -108,6 +110,7 @@ flowchart LR
 .
 ├── .env.example                  # 环境变量模板（本地 / API 双后端）
 ├── .gitlab-ci.yml                # CI：lint + pytest
+├── .github/workflows/ci.yml      # GitHub Actions：ruff 静态检查 + 构建 + pytest
 ├── requirements.txt              # Python 依赖
 ├── pyproject.toml                # Python 包配置
 ├── src/pcb_rag/                  # 核心源码包
@@ -117,6 +120,7 @@ flowchart LR
 │   ├── query.py                  # 检索链路与交互式问答
 │   ├── preprocess_docs.py        # 编码修复与乱码清理
 │   └── dify_external_api.py      # Dify 外部知识库 API 服务
+├── tests/                        # 单元测试（缓存 / 评测指标 / 文档预处理）
 ├── eval/                         # 评测体系（黄金集 + 四指标）
 │   ├── build_golden_dataset.py   # 数据集构建
 │   ├── metrics.py                # 忠实度 / 相关性 / 精确率 / 召回率
@@ -336,6 +340,10 @@ bash scripts/serve_api.sh
 | `API_PORT` | `8000` | API 服务端口 |
 | `SESSION_EXPIRE_MINUTES` | `60` | 会话过期时间（分钟） |
 | `SESSION_MAX_COUNT` | `1000` | 最大会话数 |
+| `SESSION_STORE` | `memory` | 会话存储：`memory` / `sqlite`（重启后保留） |
+| `SESSION_DB_PATH` | `./data/sessions.db` | SQLite 会话库路径 |
+| `SELF_RAG_ENABLED` | `0` | 是否启用 Agentic RAG 迭代检索 |
+| `SELF_RAG_MAX_ITERATIONS` | `3` | 迭代检索的最大轮数 |
 
 完整配置见 `.env.example` 与 `docs/CONFIGURATION_GUIDE.md`。
 

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import re
 import site
@@ -3089,6 +3090,134 @@ def _attention_semantic_parse(documents) -> list:
     return nodes
 
 
+# =============================================================================
+# 增量入库：文档变更检测（Phase 5）
+#
+#   - manifest 记录每个文档的指纹（路径 + 大小 + mtime）
+#   - 入库时只处理「新增 / 变更」的文档，未变更的跳过（省去重复切块与向量化）
+#   - 数据目录中已移除的文档，其 chunk 会从向量库删除
+#   - 设 INGEST_INCREMENTAL=0 可退回「每次全量处理」的旧行为
+# =============================================================================
+
+INGEST_INCREMENTAL = os.getenv("INGEST_INCREMENTAL", "1") not in {"0", "false", "False"}
+INGEST_MANIFEST_PATH = os.getenv("INGEST_MANIFEST_PATH", "./data/ingest_manifest.json")
+
+
+def _file_fingerprint(path: Path) -> str:
+    """文件指纹：路径 + 大小 + mtime（比内容哈希轻量，足够判断变更）。"""
+    try:
+        st = path.stat()
+        raw = f"{path.resolve()}|{st.st_size}|{int(st.st_mtime)}"
+    except OSError:
+        raw = str(path)
+    return hashlib.md5(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
+def _doc_source_of(doc) -> str:
+    md = getattr(doc, "metadata", None) or {}
+    return str(md.get("file_path") or md.get("filename") or getattr(doc, "hash", "") or "")
+
+
+def _doc_node_id_of(doc) -> str:
+    """文档级节点 id，与 _parent_child_parse 中保持一致。"""
+    doc_id = getattr(doc, "id_", None) or hashlib.md5(
+        _doc_source_of(doc).encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
+    return hashlib.md5(f"doc-{doc_id}".encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
+def _load_manifest() -> dict:
+    path = Path(INGEST_MANIFEST_PATH)
+    if not path.exists():
+        return {"version": 1, "docs": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("docs"), dict):
+            return data
+    except Exception as e:
+        print(f"⚠️  读取入库清单失败，按全新入库处理: {e}")
+    return {"version": 1, "docs": {}}
+
+
+def _save_manifest(docs_map: dict) -> None:
+    path = Path(INGEST_MANIFEST_PATH)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"version": 1, "docs": docs_map}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"⚠️  写入入库清单失败: {e}")
+
+
+def _diff_documents(documents: list, manifest: dict) -> tuple:
+    """比对文档与清单。
+
+    Returns:
+        (待处理文档列表, 需要先清理旧 chunk 的 doc_node_id 列表, 新的清单条目)
+    """
+    old_docs = manifest.get("docs", {}) or {}
+    to_process: list = []
+    stale_ids: list[str] = []
+    current: dict[str, dict] = {}
+
+    for d in documents:
+        node_id = _doc_node_id_of(d)
+        src = _doc_source_of(d)
+        fingerprint = _file_fingerprint(Path(src)) if src else str(getattr(d, "hash", ""))
+        current[node_id] = {"path": src, "hash": fingerprint}
+
+        old = old_docs.get(node_id)
+        if old is None:
+            to_process.append(d)                       # 新增
+        elif old.get("hash") != fingerprint:
+            stale_ids.append(node_id)                  # 变更：需先删除旧 chunk
+            to_process.append(d)
+
+    # 清单中存在、但数据目录已移除的文档
+    stale_ids.extend(nid for nid in old_docs if nid not in current)
+    return to_process, stale_ids, current
+
+
+def _delete_chunks_by_doc_node_id(vector_store, doc_node_id: str) -> int:
+    """按 doc_node_id 删除该文档的所有 chunk（用于变更覆盖与文档删除）。"""
+    try:
+        client = getattr(vector_store, "client", None)
+        if client is None:
+            return 0
+
+        async def _do_delete():
+            return await client.delete(
+                collection_name=COLLECTION,
+                filter=f'doc_node_id == "{doc_node_id}"',
+            )
+
+        try:
+            asyncio.get_running_loop()
+            has_running_loop = True
+        except RuntimeError:
+            has_running_loop = False
+
+        if has_running_loop:
+            result = asyncio.get_event_loop().run_until_complete(_do_delete())
+        else:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(_do_delete())
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+
+        if isinstance(result, dict):
+            return int(result.get("delete_count", 0) or 0)
+        return 0
+    except Exception as e:
+        print(f"⚠️  删除文档 chunk 失败 ({doc_node_id[:8]}...): {e}")
+        return 0
+
+
 def main():
     # 1) 配置 LLM（用于回答）- 后端由 LLM_BACKEND 决定（local=Ollama，api=OpenAI 兼容）
     Settings.llm = build_llm()
@@ -3155,7 +3284,23 @@ def main():
     
     if garbage_cleaned_count > 0:
         print(f"🧹 已清理 {garbage_cleaned_count} 个文档的OCR乱码")
-    
+
+    # 3.2) 增量比对：只处理新增 / 变更的文档
+    manifest = _load_manifest() if INGEST_INCREMENTAL else {"version": 1, "docs": {}}
+    if INGEST_INCREMENTAL:
+        to_process, stale_doc_ids, current_docs = _diff_documents(documents, manifest)
+        print(
+            f"🔍 增量比对: 共 {len(documents)} 个文档, 待处理 {len(to_process)} 个, "
+            f"待清理旧 chunk 的文档 {len(stale_doc_ids)} 个"
+        )
+    else:
+        to_process = list(documents)
+        stale_doc_ids = []
+        current_docs = {
+            _doc_node_id_of(d): {"path": _doc_source_of(d), "hash": ""}
+            for d in documents
+        }
+
     print(f"📚 共加载 {len(documents)} 个文档，开始向量化并写入 Milvus...")
 
     # 4) 连接 Milvus 向量库（Standalone 端口 19530）
@@ -3198,25 +3343,28 @@ def main():
     # 注意：先进行node parsing，然后截断过长文本，最后建索引
     from llama_index.core.ingestion import IngestionPipeline
     
-    # 根据模式选择切块方式
-    if use_parent_child_mode:
+    # 根据模式选择切块方式（增量模式下只处理新增 / 变更的文档）
+    if not to_process:
+        print("⏭️  没有新增或变更的文档，跳过切块")
+        nodes = []
+    elif use_parent_child_mode:
         print("📦 使用 Parent-Child 两层结构切块...")
-        nodes = _parent_child_parse(documents)
+        nodes = _parent_child_parse(to_process)
         print(f"   生成 {len(nodes)} 个 children chunks")
     elif use_structure_mode:
         print("📐 使用结构感知切块...")
-        nodes = _structure_aware_parse(documents)
+        nodes = _structure_aware_parse(to_process)
         print(f"   生成 {len(nodes)} 个结构化chunks")
     elif use_attention_mode:
         print("🧠 使用 Transformer 注意力语义切块...")
-        nodes = _attention_semantic_parse(documents)
+        nodes = _attention_semantic_parse(to_process)
         print(f"   生成 {len(nodes)} 个语义chunks")
     else:
         # 使用配置的node_parser
-        nodes = Settings.node_parser.get_nodes_from_documents(documents, show_progress=True)
+        nodes = Settings.node_parser.get_nodes_from_documents(to_process, show_progress=True)
     
     # Contextual Retrieval：为每个 chunk 注入语境前缀，提升脱离上下文片段的召回
-    nodes = apply_contextual_retrieval(nodes, documents)
+    nodes = apply_contextual_retrieval(nodes, to_process)
 
     # 截断超长文本（避免超过Milvus的65535字符限制）
     nodes = _truncate_text_nodes(nodes, max_bytes=60000, target_bytes=12000)
@@ -3229,8 +3377,22 @@ def main():
         min_len = min(chunk_lengths)
         print(f"📊 Chunk统计: 数量={len(chunk_lengths)}, 平均长度={avg_len:.0f}, 最小={min_len}, 最大={max_len}")
     
-    # 从nodes构建索引
-    index = VectorStoreIndex(nodes=nodes, storage_context=storage_context, show_progress=True)
+    # 增量写入：只插入本次新增 / 变更文档的 chunk（相同 id 会被 upsert 覆盖）
+    index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
+    if nodes:
+        index.insert_nodes(nodes)
+
+    # 清理变更 / 已删除文档的残留 chunk
+    if stale_doc_ids:
+        deleted_total = 0
+        for nid in stale_doc_ids:
+            deleted_total += _delete_chunks_by_doc_node_id(vector_store, nid)
+        print(f"🗑️  已清理 {len(stale_doc_ids)} 个文档的残留 chunk（共 {deleted_total} 条）")
+
+    # 更新入库清单（供下次增量比对）
+    if INGEST_INCREMENTAL:
+        _save_manifest(current_docs)
+        print(f"💾 入库清单已更新: {INGEST_MANIFEST_PATH}")
 
     print(f"✅ Ingest done. docs={len(documents)} chunks={len(nodes)} collection={COLLECTION}")
 
