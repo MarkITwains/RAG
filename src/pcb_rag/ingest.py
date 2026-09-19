@@ -1,10 +1,10 @@
 import asyncio
 import hashlib
-import json
 import os
 import re
 import site
 import sys
+import time
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -88,6 +88,12 @@ def _sanitize_proxy_env_for_httpx() -> None:
     os.environ[no_proxy_key] = ",".join(entries)
 
 
+# 先加载仓库根目录的 .env（直接 `python -m pcb_rag.ingest` 时也能读到配置），
+# 再执行代理规范化：这样 .env 里写的 HTTP_PROXY / ALL_PROXY 也会被一并处理
+from pcb_rag.env_loader import load_project_env
+
+load_project_env()
+
 _sanitize_proxy_env_for_httpx()
 
 from llama_index.core import Settings, SimpleDirectoryReader, StorageContext, VectorStoreIndex
@@ -97,6 +103,7 @@ from llama_index.readers.file import PyMuPDFReader, DocxReader, RTFReader
 from llama_index.vector_stores.milvus import MilvusVectorStore
 
 # 统一模型客户端工厂：LLM / Embedding 支持 local（Ollama）与 api 双后端
+from pcb_rag import incremental
 from pcb_rag.api_clients import (
     EMBED_BACKEND,
     LLM_BACKEND,
@@ -2889,6 +2896,18 @@ def _parent_child_parse(documents) -> list:
             node_id = hashlib.md5(f"{doc_id}-pc-{idx}".encode('utf-8'), usedforsecurity=False).hexdigest()
             chunk_node_ids.append(node_id)
         
+        # 预先聚合每个 parent 的子块区间：一次 O(n) 扫描。
+        # 原实现是在下面这层循环里再遍历一遍 chunks 找同 parent 的首尾，
+        # 整体是 O(n²)：1e4 chunk 约 30~60s，1e5 chunk 要跑一小时以上。
+        parent_span: dict = {}
+        for _idx, (_, _meta) in enumerate(chunks):
+            _pidx = _meta.get('parent_idx', 0)
+            _span = parent_span.get(_pidx)
+            if _span is None:
+                parent_span[_pidx] = [_idx, _idx]
+            else:
+                _span[1] = _idx
+
         # 第二遍：构建节点
         for idx, (chunk_text, chunk_meta) in enumerate(chunks):
             node_id = chunk_node_ids[idx]
@@ -2897,17 +2916,16 @@ def _parent_child_parse(documents) -> list:
             prev_id = chunk_node_ids[idx - 1] if idx > 0 else None
             next_id = chunk_node_ids[idx + 1] if idx < len(chunks) - 1 else None
             
-            # 查找同一 parent 内的邻居
+            # 同一 parent 内的位置信息（O(1) 查表）
             current_parent_idx = chunk_meta.get('parent_idx', 0)
-            parent_first_child = None
-            parent_last_child = None
-            
-            for other_idx, (_, other_meta) in enumerate(chunks):
-                if other_meta.get('parent_idx') == current_parent_idx:
-                    if parent_first_child is None:
-                        parent_first_child = other_idx
-                    parent_last_child = other_idx
-            
+            parent_first_child, parent_last_child = parent_span.get(current_parent_idx, [idx, idx])
+
+            # 父块锚点：指向同一 parent 的首个子块，与 attention 模式下
+            # 「parent_id = 章节起始 chunk」的语义保持一致。
+            # expand_chunks_with_context 是按 id 从向量库取回父节点的，因此锚点必须
+            # 是一个真实入库的 node；首个子块自身不再自引用。
+            parent_id = chunk_node_ids[parent_first_child] if idx != parent_first_child else ''
+
             # 构建完整元数据
             merged_meta = {
                 **chunk_meta,
@@ -2915,6 +2933,8 @@ def _parent_child_parse(documents) -> list:
                 'prev_id': prev_id or '',
                 'next_id': next_id or '',
                 'doc_node_id': doc_node_id,
+                # 父块锚点（供 expand_chunks_with_context 做父级扩展）
+                'parent_id': parent_id,
                 
                 # Parent 内的位置信息
                 'is_first_in_parent': (idx == parent_first_child),
@@ -3118,78 +3138,58 @@ def _attention_semantic_parse(documents) -> list:
 INGEST_INCREMENTAL = os.getenv("INGEST_INCREMENTAL", "1") not in {"0", "false", "False"}
 INGEST_MANIFEST_PATH = os.getenv("INGEST_MANIFEST_PATH", "./data/ingest_manifest.json")
 
+# 指纹 / 比对 / 清单读写的实现已下沉到 pcb_rag/incremental.py（纯标准库，可单测）。
+# 这里保留原名作为薄封装：ingest 内部与 tests 都在按旧名引用，
+# 改名会造成无谓破坏；同时保证"仓库里只有一份增量逻辑"。
+MANIFEST_VERSION = incremental.MANIFEST_VERSION
+
+
+def _content_hash(path: Path) -> str:
+    return incremental.content_hash(path)
+
 
 def _file_fingerprint(path: Path) -> str:
-    """文件指纹：路径 + 大小 + mtime（比内容哈希轻量，足够判断变更）。"""
-    try:
-        st = path.stat()
-        raw = f"{path.resolve()}|{st.st_size}|{int(st.st_mtime)}"
-    except OSError:
-        raw = str(path)
-    return hashlib.md5(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
+    return incremental.file_fingerprint(path)
+
+
+def _doc_fingerprint_of(doc) -> str:
+    return incremental.doc_fingerprint_of(doc)
 
 
 def _doc_source_of(doc) -> str:
-    md = getattr(doc, "metadata", None) or {}
-    return str(md.get("file_path") or md.get("filename") or getattr(doc, "hash", "") or "")
+    return incremental.doc_source_of(doc)
 
 
 def _doc_node_id_of(doc) -> str:
     """文档级节点 id，与 _parent_child_parse 中保持一致。"""
-    doc_id = getattr(doc, "id_", None) or hashlib.md5(
-        _doc_source_of(doc).encode("utf-8"), usedforsecurity=False
-    ).hexdigest()
-    return hashlib.md5(f"doc-{doc_id}".encode("utf-8"), usedforsecurity=False).hexdigest()
+    return incremental.doc_node_id_of(doc)
 
 
 def _load_manifest() -> dict:
     path = Path(INGEST_MANIFEST_PATH)
-    if not path.exists():
-        return {"version": 1, "docs": {}}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("docs"), dict):
-            return data
-    except Exception as e:
-        print(f"⚠️  读取入库清单失败，按全新入库处理: {e}")
-    return {"version": 1, "docs": {}}
+    manifest = incremental.load_manifest(INGEST_MANIFEST_PATH)
+    if path.exists() and incremental.needs_full_reprocess(manifest):
+        print(
+            f"ℹ️  入库清单为旧版本(v{manifest.get('version')})：指纹算法已从 mtime 改为内容哈希，"
+            "本次将全量重嵌入一次，之后恢复正常增量。"
+        )
+    return manifest
 
 
 def _save_manifest(docs_map: dict) -> None:
-    path = Path(INGEST_MANIFEST_PATH)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"version": 1, "docs": docs_map}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        incremental.save_manifest(INGEST_MANIFEST_PATH, docs_map)
     except Exception as e:
         print(f"⚠️  写入入库清单失败: {e}")
 
 
 def _diff_documents(documents: list, manifest: dict) -> tuple:
-    """比对文档与清单。
+    """比对文档与清单（实现见 :func:`pcb_rag.incremental.diff_documents`）。
 
     Returns:
         (待处理文档列表, 需要先清理旧 chunk 的 doc_node_id 列表, 新的清单条目)
     """
-    old_docs = manifest.get("docs", {}) or {}
-    to_process: list = []
-    stale_ids: list[str] = []
-    current: dict[str, dict] = {}
-
-    for d in documents:
-        node_id = _doc_node_id_of(d)
-        src = _doc_source_of(d)
-        fingerprint = _file_fingerprint(Path(src)) if src else str(getattr(d, "hash", ""))
-        current[node_id] = {"path": src, "hash": fingerprint}
-
-        old = old_docs.get(node_id)
-        if old is None:
-            to_process.append(d)                       # 新增
-        elif old.get("hash") != fingerprint:
-            stale_ids.append(node_id)                  # 变更：需先删除旧 chunk
-            to_process.append(d)
+    return incremental.diff_documents(documents, manifest)
 
     # 清单中存在、但数据目录已移除的文档
     stale_ids.extend(nid for nid in old_docs if nid not in current)
@@ -3371,20 +3371,27 @@ def main():
         print(f"🧹 已清理 {garbage_cleaned_count} 个文档的OCR乱码")
 
     # 3.2) 增量比对：只处理新增 / 变更的文档
-    manifest = _load_manifest() if INGEST_INCREMENTAL else {"version": 1, "docs": {}}
-    if INGEST_INCREMENTAL:
-        to_process, stale_doc_ids, current_docs = _diff_documents(documents, manifest)
+    #
+    # 是否重建集合：默认关闭，避免每次入库清空历史数据（首次建库可设 INGEST_OVERWRITE=1）。
+    # 必须在比对之前读取：OVERWRITE 会把整个集合清空，此时 manifest 里的指纹全部失效，
+    # 若仍按指纹比对就会得到空 to_process —— 重建后的库是空的，而 manifest 还声称"全都在"，
+    # 后续每次增量入库都会继续匹配、继续空转，只能手删 manifest 才能恢复。
+    overwrite_collection = os.getenv("INGEST_OVERWRITE", "0") not in {"0", "false", "False"}
+    if overwrite_collection:
+        print("♻️  INGEST_OVERWRITE=1：集合将被重建，忽略入库清单，本次全量处理")
+
+    manifest = _load_manifest()
+    to_process, stale_doc_ids, current_docs, did_diff = incremental.plan_ingest(
+        documents,
+        manifest,
+        incremental=INGEST_INCREMENTAL,
+        overwrite=overwrite_collection,
+    )
+    if did_diff:
         print(
             f"🔍 增量比对: 共 {len(documents)} 个文档, 待处理 {len(to_process)} 个, "
             f"待清理旧 chunk 的文档 {len(stale_doc_ids)} 个"
         )
-    else:
-        to_process = list(documents)
-        stale_doc_ids = []
-        current_docs = {
-            _doc_node_id_of(d): {"path": _doc_source_of(d), "hash": ""}
-            for d in documents
-        }
 
     # P2 多模态：表格结构化成 Markdown（零成本），并按需为 PDF 图片生成描述
     if MULTIMODAL_ENABLED or os.getenv("TABLE_MARKDOWN_ENABLED", "1") not in {"0", "false", "False"}:
@@ -3396,9 +3403,7 @@ def main():
     print(f"📚 共加载 {len(documents)} 个文档，开始向量化并写入 Milvus...")
 
     # 4) 连接 Milvus 向量库（Standalone 端口 19530）
-    # 是否重建集合：默认关闭，避免每次入库清空历史数据（首次建库可设 INGEST_OVERWRITE=1）
-    overwrite_collection = os.getenv("INGEST_OVERWRITE", "0") not in {"0", "false", "False"}
-
+    # overwrite_collection 已在「3.2) 增量比对」之前读取（见上方注释）
     async def _init_store() -> MilvusVectorStore:
         return MilvusVectorStore(
             uri=MILVUS_URI,
@@ -3499,6 +3504,12 @@ def main():
     print(f"✅ Ingest done. docs={len(documents)} chunks={len(nodes)} collection={COLLECTION}")
 
     # 清理词法检索缓存，确保下次查询基于最新语料重建 BM25 索引
+    #
+    # 注意：删除缓存只对「下次启动进程」有效。长驻的 API 进程在启动时就把
+    # BM25 索引加载进内存了，删文件不会让它重新加载 —— 新入库的文档会缺失
+    # 整条稀疏路投票，被系统性降权。为此这里额外写一个 sentinel 文件（带
+    # mtime），由 API 侧轮询 mtime 变化后触发重建（见 dify_external_api 的
+    # _maybe_reload_lexical_index）。
     try:
         cache_path = Path(os.getenv("LEXICAL_CACHE_PATH", "./data/lexical_corpus.jsonl"))
         if cache_path.exists():
@@ -3506,6 +3517,14 @@ def main():
             print(f"🧹 已清理词法检索缓存: {cache_path}")
     except Exception as e:
         print(f"⚠️  清理词法缓存失败: {e}")
+
+    try:
+        stamp_path = Path(os.getenv("LEXICAL_RELOAD_STAMP", str(cache_path) + ".stamp"))
+        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp_path.write_text(str(time.time()), encoding="utf-8")
+        print(f"🔔 已写入词法索引重载标记: {stamp_path}")
+    except Exception as e:
+        print(f"⚠️  写入词法重载标记失败: {e}")
 
 
 def _fix_file_encodings(data_dir: str) -> int:

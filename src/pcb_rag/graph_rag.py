@@ -93,8 +93,10 @@ GRAPH_LLM_MAX_CHARS = int(os.getenv("GRAPH_LLM_MAX_CHARS", "1600"))
 # 图检索
 GRAPH_HOP = int(os.getenv("GRAPH_HOP", "1"))
 GRAPH_TOP_K = int(os.getenv("GRAPH_TOP_K", "5"))
-# 图路召回在最终结果中的权重（用于与向量 / BM25 结果融合时的加权）
+# 图路召回在最终结果中的权重（作为一路 RRF 的权重，见 fuse_with_graph）
 GRAPH_WEIGHT = float(os.getenv("GRAPH_WEIGHT", "0.35"))
+# 图路 RRF 平滑参数 k（与主融合 FUSION_RRF_K 同量级，便于横向比较）
+GRAPH_RRF_K = int(os.getenv("GRAPH_RRF_K", "60"))
 GRAPH_MAX_ENTITIES_PER_QUERY = int(os.getenv("GRAPH_MAX_ENTITIES_PER_QUERY", "8"))
 GRAPH_MAX_NEIGHBORS = int(os.getenv("GRAPH_MAX_NEIGHBORS", "24"))
 GRAPH_EVIDENCE_CHARS = int(os.getenv("GRAPH_EVIDENCE_CHARS", "240"))
@@ -1281,7 +1283,14 @@ def expand_nodes_with_graph(
 
         node = TextNode(
             text=text,
-            metadata={"source_type": "knowledge_graph_expand", "graph_anchor": anchor, "entities": [anchor]},
+            metadata={
+                "source_type": "knowledge_graph_expand",
+                "graph_anchor": anchor,
+                "entities": [anchor],
+                # 标记为「图证据」：调用方据此给它单独配额，避免它凭相对分数
+                # 挤占真实检索结果的 top-k 名额（见 dify_external_api Step 7）
+                "graph_evidence": True,
+            },
         )
         # 分数取已召回结果的最高分略作衰减，保证排在原结果之后但仍可能进入上下文
         base = max((float(getattr(n, "score", 0.0) or 0.0) for n in nodes), default=0.5)
@@ -1309,16 +1318,39 @@ def fuse_with_graph(
     graph_nodes: Optional[Sequence[Any]],
     *,
     graph_weight: float = GRAPH_WEIGHT,
+    rrf_k: int = GRAPH_RRF_K,
+    overwrite_scores: bool = True,
     max_total: Optional[int] = None,
 ) -> List[Any]:
-    """把图检索结果按权重融合进主召回结果（加权 RRF 风格的简化实现）。
+    """把图检索结果作为**独立一路**，用 RRF 与主结果融合。
 
-    - 图侧分数乘以 ``graph_weight`` 后与主结果同池排序
-    - 以 ``node_id`` / 文本指纹去重，优先保留分数更高者
+    早先的实现是「图侧分数 × graph_weight 后与主结果同池按 score 排序」，
+    问题在于两路分数量纲根本不可比：
+
+    - 图侧是规则分（实体名长度 / 链接分），量级约 0.2 ~ 1.0；
+    - 主结果是加权 RRF 分 ``w/(k+rank)``（k=40, w≈1）≈ 0.0125 ~ 0.024，
+      或 rerank 概率 0 ~ 1。
+
+    差两个数量级，于是 ``0.35 × 0.55 = 0.19 ≫ 0.02``：图节点无条件霸榜，
+    把真正的检索结果挤下去（CLI 里融合发生在 rerank 之前，后果最严重）。
+
+    RRF 只依赖排名、与绝对分数量纲无关，因此这里改为标准的
+    ``score(d) = Σ w_route / (k + rank_route(d))``：
+    - 主结果整体作为第 1 路（权重 1.0）
+    - 图结果作为第 2 路（权重 ``graph_weight``）
+
+    ``overwrite_scores``：
+    - ``True``（默认，CLI 融合前置场景）：把融合分写回 ``item.score``；
+    - ``False``（API 在 rerank 之后调用）：只决定顺序、保留原始分数，
+      避免把已经量纲良好的 rerank 概率覆盖成 RRF 分。
     """
 
-    merged: List[Any] = []
-    seen: Dict[str, int] = {}
+    base = list(base_nodes or [])
+    graph = list(graph_nodes or [])
+    if not base and not graph:
+        return []
+    if not base:
+        base, graph = graph, []
 
     def _key(item: Any) -> str:
         node = getattr(item, "node", item)
@@ -1328,34 +1360,60 @@ def fuse_with_graph(
         text = _node_text(node)
         return str(hash(text[:200]))
 
-    for item in base_nodes or []:
-        key = _key(item)
-        if key in seen:
-            existing = merged[seen[key]]
-            if float(getattr(item, "score", 0.0) or 0.0) > float(getattr(existing, "score", 0.0) or 0.0):
-                merged[seen[key]] = item
-            continue
-        seen[key] = len(merged)
-        merged.append(item)
+    merged: List[Any] = []
+    seen: Dict[str, int] = {}
+    # 融合分单独放一张表，避免中途用 item.score 互相覆盖
+    fused: List[float] = []
 
-    for item in graph_nodes or []:
+    def _mark_graph_evidence(item: Any) -> None:
+        """标记"这条节点只有图这一路贡献"。
+
+        调用方据此给它单独配额。否则它虽然排名被 RRF 正确压制，却仍会凭自带的
+        规则分（0.2~1.0）在"按 score 排序截断 top_k"那一步挤掉真实检索结果。
+        """
         try:
-            item.score = float(getattr(item, "score", 0.0) or 0.0) * graph_weight
+            node = getattr(item, "node", item)
+            md = getattr(node, "metadata", None)
+            if isinstance(md, dict):
+                md["graph_evidence"] = True
         except Exception:
             pass
+
+    def _add(item: Any, score: float, *, prefer_score: bool, graph_only: bool = False) -> None:
         key = _key(item)
         if key in seen:
-            existing = merged[seen[key]]
-            if float(getattr(item, "score", 0.0) or 0.0) > float(getattr(existing, "score", 0.0) or 0.0):
-                merged[seen[key]] = item
-            continue
+            pos = seen[key]
+            if prefer_score:
+                old = float(getattr(merged[pos], "score", 0.0) or 0.0)
+                new = float(getattr(item, "score", 0.0) or 0.0)
+                if new > old:
+                    merged[pos] = item
+            fused[pos] += score
+            return
+        if graph_only:
+            _mark_graph_evidence(item)
         seen[key] = len(merged)
         merged.append(item)
+        fused.append(score)
 
-    merged.sort(key=lambda x: -(float(getattr(x, "score", 0.0) or 0.0)))
-    if max_total and len(merged) > max_total:
-        merged = merged[:max_total]
-    return merged
+    for rank, item in enumerate(base, 1):
+        _add(item, 1.0 / (rrf_k + rank), prefer_score=True)
+    for rank, item in enumerate(graph, 1):
+        _add(item, float(graph_weight) / (rrf_k + rank), prefer_score=False, graph_only=True)
+
+    order = sorted(range(len(merged)), key=lambda i: -fused[i])
+    result = [merged[i] for i in order]
+
+    if overwrite_scores:
+        for i in order:
+            try:
+                merged[i].score = float(fused[i])
+            except Exception:
+                pass
+
+    if max_total and len(result) > max_total:
+        result = result[:max_total]
+    return result
 
 
 def describe_graph(graph: Optional[KnowledgeGraph] = None) -> Dict[str, Any]:

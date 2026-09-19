@@ -1,4 +1,11 @@
 import os
+
+# 先加载仓库根目录的 .env：直接 `python -m pcb_rag.query` 时也能读到配置
+# （必须早于下方任何环境变量读取）
+from pcb_rag.env_loader import load_project_env
+
+load_project_env()
+
 # 设置 HuggingFace 镜像端点（国内加速）- 必须在任何 HF 相关 import 之前
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
@@ -111,7 +118,6 @@ warnings.filterwarnings(
 from llama_index.core import Settings, StorageContext, VectorStoreIndex
 from llama_index.vector_stores.milvus import MilvusVectorStore
 from llama_index.core.base.base_retriever import BaseRetriever
-from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
 from llama_index.core.retrievers import QueryFusionRetriever
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.schema import MetadataMode, NodeWithScore, QueryBundle, TextNode
@@ -125,6 +131,7 @@ from llama_index.core.vector_stores.types import (
 )
 
 # 统一模型客户端工厂：LLM / Embedding / Rerank 均支持 local（Ollama/HF）与 api 双后端
+from pcb_rag import fusion
 from pcb_rag.api_clients import (
     EMBED_BACKEND,
     LLM_BACKEND,
@@ -336,8 +343,16 @@ QUERY_EXPANSION_MAX_TERMS = int(os.getenv("QUERY_EXPANSION_MAX_TERMS", "6"))  # 
 # =============================================================================
 # Fusion + 多扩展查询 + Rerank 检索配置
 # =============================================================================
-# mode: RECIPROCAL_RANK (RRF) | DIST_BASED_SCORE (加权融合) | RELATIVE_SCORE
+# Fusion 融合算法：本实现**只有**加权 RRF（见 _weighted_rrf_fuse_three_routes，
+# score(d) = Σ w_route / (k + rank)）。
+#
+# FUSION_MODE 仅为历史兼容与启动信息保留：设成 DIST_BASED_SCORE / RELATIVE_SCORE
+# 等取值**不会**改变任何融合行为。历史上三份文档把 FUSION_MODE=DIST_BASED_SCORE
+# 写成 v1.3 的核心变更，而代码里它只用来挑一个打印字符串 —— 典型文档与实现脱节，
+# 现已在此处和文档中一并纠正。
 FUSION_MODE = os.getenv("FUSION_MODE", "RECIPROCAL_RANK").strip().upper()
+FUSION_MODE_EFFECTIVE = "RECIPROCAL_RANK"
+FUSION_MODE_UNSUPPORTED = FUSION_MODE != FUSION_MODE_EFFECTIVE
 # 权重：[向量检索权重, BM25权重]，平衡语义和精确匹配
 FUSION_WEIGHTS = [float(x) for x in os.getenv("FUSION_WEIGHTS", "0.45,0.55").split(",")]
 # 查询改写/扩展数量：多扩展查询核心参数，默认 4（平衡速度和召回覆盖）
@@ -1391,42 +1406,25 @@ def hybrid_query_enhance(query: str, llm=None, prefer_hyde: bool = True) -> tupl
     return vector_query, bm25_query
 
 
+# 融合实现已下沉到 pcb_rag/fusion.py（纯逻辑、无重型依赖、可单测）。
+# 这里保留原名字作为薄封装：dify_external_api / evaluate_recall / tests 都在按
+# 旧名字导入，改名会造成无谓的破坏；同时确保"仓库里只有一份 RRF"。
 def _node_id_key(node: NodeWithScore) -> str:
-    try:
-        nid = getattr(node.node, "node_id", None)
-        if nid:
-            return str(nid)
-    except Exception:
-        pass
-    return str(id(node))
+    return node_id_key(node)
 
 
 def _weighted_rrf_fuse_three_routes(
     routes: list[tuple[list[NodeWithScore], float]],
     top_n: int,
-    rrf_k: int = 60,
+    rrf_k: int = fusion.DEFAULT_RRF_K,
 ) -> list[NodeWithScore]:
-    scores: dict[str, float] = {}
-    nodes_map: dict[str, NodeWithScore] = {}
+    """加权三路 RRF 融合（实现见 :func:`pcb_rag.fusion.weighted_rrf_fuse`）。
 
-    for nodes, route_weight in routes:
-        weight = float(route_weight)
-        if weight <= 0:
-            continue
-        for rank, n in enumerate(nodes, 1):
-            key = _node_id_key(n)
-            nodes_map.setdefault(key, n)
-            scores[key] = scores.get(key, 0.0) + weight / float(rrf_k + rank)
-
-    ranked = sorted(scores.items(), key=lambda x: -x[1])
-    out: list[NodeWithScore] = []
-    for key, score in ranked[: max(0, int(top_n))]:
-        node = nodes_map.get(key)
-        if node is None:
-            continue
-        node.score = float(score)
-        out.append(node)
-    return out
+    ``rrf_k`` 的默认值保持 60 只是为了和 :mod:`pcb_rag.fusion` 一致；
+    线上两处调用点（query.py 主流程 / dify）都显式传 ``FUSION_RRF_K``（默认 40），
+    因此 CLI 与 API 的实际取值是 40，签名默认值不参与线上路径。
+    """
+    return fusion.weighted_rrf_fuse(routes, top_n=top_n, rrf_k=rrf_k)
 
 
 class ThreeWayHyDEFusionRetriever(BaseRetriever):
@@ -3657,20 +3655,32 @@ def _tokenize(text: str) -> list[str]:
         if use_jieba:
             # ===== 使用 jieba 精确模式分词 =====
             import jieba
-            # 精确模式 + 搜索引擎模式双重分词，最大化召回
+            # 精确模式（cut）决定"这段文本里出现了哪些词、各出现几次"，必须保留词频：
+            # BM25 的 tf 项、以及 k1（词频饱和参数）都依赖它。
+            # 搜索引擎模式（cut_for_search）只用来补充精确模式没切出来的新词以提升召回，
+            # 不重复计入词频。
+            #
+            # 早先的实现把 cut_words + search_words 合并后按词去重，等于把文档侧 tf
+            # 压成了 0/1：同一片段里「阻抗」出现 3 次也只剩 1 次。后果是 k1 形同虚设
+            # —— tf=1 且 dl=avgdl 时 tf_component = (k1+1)/(1+k1) ≡ 1，k1 完全不起作用，
+            # 只剩下长度惩罚曲线的陡度含义，与"调高 k1 增强词频影响"的注释自相矛盾。
             cut_words = list(jieba.cut(part, cut_all=False))
             search_words = list(jieba.cut_for_search(part))
-            
-            # 合并去重（保持顺序）
-            seen_words: set[str] = set()
+
             jieba_tokens: list[str] = []
-            for w in cut_words + search_words:
+            seen_words: set[str] = set()
+            for w in cut_words:
                 w = w.strip()
                 if not w or w in _STOPWORDS:
                     continue
-                if w not in seen_words:
-                    seen_words.add(w)
-                    jieba_tokens.append(w)
+                jieba_tokens.append(w)      # 保留重复 → 保留词频
+                seen_words.add(w)
+            for w in search_words:
+                w = w.strip()
+                if not w or w in _STOPWORDS or w in seen_words:
+                    continue
+                seen_words.add(w)
+                jieba_tokens.append(w)      # 只补新词，避免重复计入词频
             
             if jieba_tokens:
                 tokens.extend(jieba_tokens)
@@ -3809,27 +3819,38 @@ class _Bm25Index:
     tfs: list[Counter]
     df: Counter
     avgdl: float
-    k1: float = 1.5  # 调高 k1 增强词频影响（PCB文档专业术语重复度高）
-    b: float = 0.75
+    # k1：控制 tf 的饱和速度。注意在 tf 已被压缩为 1 的语料上它不起作用
+    #     （tf=1 且 dl=avgdl 时 tf_component ≡ 1），此时它只影响长度惩罚曲线的陡度。
+    #     词频修好后（_tokenize 保留 cut_words 的重复），它才真正是"词频饱和"参数。
+    k1: float = 1.5
+    b: float = 0.75  # 长度归一化强度：0=不归一化，1=完全按 dl/avgdl（继承 BM25 惯用默认值）
     delta: float = 1.0  # BM25+ 的 delta 参数，防止长文档过度惩罚
     # 倒排索引：term -> 候选文档下标，把检索从 O(全部文档) 降到 O(候选文档)
     inverted: dict = field(default_factory=dict)
 
-    def candidates(self, query_tokens: list[str], max_postings: int = 5000) -> set:
+    #: 单个高频词的 postings 上限；<=0 表示不截断。
+    #  早先默认 5000 且 postings 是按入库顺序 append 的 —— 结果不是"限量"而是
+    #  "系统性丢弃后入库的文档"：高频词的前 5000 个候选永远被老文档占满，
+    #  新文档即使包含该词也进不了候选集（与 BM25 不重载叠加，问题被进一步放大）。
+    #  DF > 80% 的词已在 score() 里被过滤，这里默认不截断。
+    max_postings: int = 0
+
+    def candidates(self, query_tokens: list[str], max_postings: Optional[int] = None) -> set:
         """返回可能命中的候选文档下标（基于倒排索引）。
 
-        ``max_postings`` 用于限制单个高频词带来的候选爆炸。
+        ``max_postings`` 仅在显式给正数时才截断（用于极端语料下限制候选爆炸）。
         """
         if not self.inverted:
             return set(range(len(self.docs)))
 
+        limit = self.max_postings if max_postings is None else int(max_postings)
         out: set = set()
         for term in query_tokens:
             postings = self.inverted.get(term)
             if not postings:
                 continue
-            if len(postings) > max_postings:
-                postings = postings[:max_postings]
+            if limit > 0 and len(postings) > limit:
+                postings = postings[:limit]
             out.update(postings)
         return out
 
@@ -3848,7 +3869,9 @@ class _Bm25Index:
 
         score = 0.0
         N = max(len(self.docs), 1)
-        df_threshold = N * 0.8  # 文档频率阈值：超过80%文档包含的词不计入
+        # DF 过滤阈值 0.8：与 IDF 功能部分重复（超高频词的 IDF 已经很低），
+        # 属经验值，无 ablation 支撑。小语料几乎不触发，大语料下有误杀领域通用词的风险。
+        df_threshold = N * 0.8
 
         # 去重查询词并计算词频（同一查询词出现多次应增加权重）
         query_tf = Counter(query_tokens)
@@ -3867,7 +3890,9 @@ class _Bm25Index:
             # 改进的 IDF：使用 log((N+1)/(n+0.5)) 确保非负
             idf = log((N + 1.0) / (n_qi + 0.5))
 
-            # 专业术语加权：如果是 PCB 专业术语，IDF 额外乘以 1.2
+            # 专业术语加权：PCB 术语的 IDF 额外 ×1.2。
+            # 经验值，无 ablation 出处：文档只说"额外加权"。
+            # 注意它与查询侧 qtf 封顶是两种不同的偏置，调参时不要重复加权。
             if term in _PCB_TERMS:
                 idf *= 1.2
 
@@ -3878,8 +3903,10 @@ class _Bm25Index:
             # BM25+ 添加 delta 防止长文档过度惩罚
             term_score = idf * (tf_component + self.delta)
 
-            # 查询词频加权（同一词出现多次在查询中，增加权重）
-            score += term_score * min(qtf, 3)  # 最多3倍
+            # 查询词频加权（同一词出现多次在查询中，增加权重），最多 3 倍。
+            # 这里与文档侧曾经的不一致：文档侧 tf 一度被压成 0/1，查询侧却保留 3 倍空间；
+            # 词频修复（_tokenize 保留 cut_words 重复）之后两侧口径才一致。
+            score += term_score * min(qtf, 3)
 
         return score
 
@@ -4352,10 +4379,15 @@ def main():
             else:
                 print(f"  - ColBERT重排: 未启用，使用标准Rerank")
     elif bm25_index is not None:
-        fusion_mode_name = FUSION_MODE if hasattr(FUSION_MODES, FUSION_MODE) else "RECIPROCAL_RANK"
         print(f"[检索模式] 三路召回 Fusion + Rerank")
         print(f"  - 召回路由: 原始向量 + HyDE向量 + BM25+")
-        print(f"  - Fusion: mode={fusion_mode_name}, weights={FUSION_WEIGHTS}")
+        if FUSION_MODE_UNSUPPORTED:
+            print(
+                f"  - Fusion: FUSION_MODE={FUSION_MODE} 不受支持，实际按 "
+                f"{FUSION_MODE_EFFECTIVE} 执行（该变量当前不改变融合行为）, weights={FUSION_WEIGHTS}"
+            )
+        else:
+            print(f"  - Fusion: mode={FUSION_MODE_EFFECTIVE}, weights={FUSION_WEIGHTS}")
         print(f"  - HyDE路降权: raw_vec=1.0, hyde_vec={HYDE_ROUTE_WEIGHT}")
         print(f"  - 多扩展查询: num_queries={FUSION_NUM_QUERIES}, enabled={MULTI_EXPAND_ENABLED}")
         print(f"  - Rerank: enabled={RERANK_ENABLED}, top_n={RERANK_TOP_N}")
@@ -4699,8 +4731,12 @@ def main():
                         _wrap_with_graph(fusion_retriever),
                         node_postprocessors=postprocessors if postprocessors else None,
                     )
-                    # 使用 HyDE 增强的查询进行检索（向量检索受益更大）
-                    ans = qe.query(hyde_q)
+                    # 必须用 expanded_q 作为检索入口查询：
+                    #   primed_queries 的键就是 expanded_q，命中的值 (hyde_q, q2doc_q) 才决定
+                    #   HyDE 路与 BM25 路各自的输入。早先这里传 hyde_q，导致 primed 查表 misses
+                    #   → 又对 hyde_q 跑一次 HyDE（多一次 LLM 调用），且原始查询根本没进检索、
+                    #   BM25 被喂进一段 LLM 生成的长文（长文会稀释 tf）。详见 README 已知问题。
+                    ans = qe.query(expanded_q)
                     print("\nA> ", ans)
             except Exception as e:
                 # Ollama runner 可能因为模型过大/内存不足崩溃：500 + runner terminated。
@@ -4721,7 +4757,7 @@ def main():
                                 _wrap_with_graph(fusion_retriever),
                                 node_postprocessors=postprocessors if postprocessors else None,
                             )
-                            ans = qe.query(hyde_q)
+                            ans = qe.query(expanded_q)
                             print("\nA> ", ans)
                     except Exception as e2:
                         print(f"\n[错误] 仍然失败：{e2}")
