@@ -8,6 +8,8 @@ variables:
   PYTHONUNBUFFERED: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  # 让 tests/test_ci_dependencies.py 校验关键回归测试的依赖齐全（缺依赖 = 失败）
+  REQUIRE_LLAMA_INDEX: "1"
 
 cache:
   key: "$CI_COMMIT_REF_SLUG"
@@ -51,8 +53,10 @@ pytest:
   script:
     - |
       if [ -d tests ] || [ -f pytest.ini ] || [ -f tox.ini ] || [ -f setup.cfg ]; then
+        # test_llama extra：让 ACL 过滤合并等关键回归测试不被 importorskip 静默跳过
+        pip install -e ".[test_llama]"
         python -m pip install pytest
-        pytest -q
+        pytest -q -rs
       else
         echo "No tests config found, skipping tests."
       fi

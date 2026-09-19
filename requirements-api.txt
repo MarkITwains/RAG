@@ -1,0 +1,47 @@
+# =============================================================================
+# 纯 API / 无 GPU 部署的最小依赖集
+#
+# 用法：
+#   pip install -r requirements-api.txt && pip install -e .
+#
+# 与 requirements.txt 的区别：**不安装** torch / transformers /
+# sentence-transformers / huggingface_hub。这些包只在「本地精排」
+# （RERANK_BACKEND=hf / qwen3reranker / sbert）和本地模型加载时才会被
+# 延迟导入，纯 API 后端用不到，省下约 2–3 GB 磁盘与安装时间。
+#
+# 何时需要改回 requirements.txt：
+#   - RERANK_BACKEND 不是 api（即使用本地 Qwen3-Reranker / HF / SBERT）
+#   - LLM_BACKEND=local 或 EMBED_BACKEND=local（需要 Ollama 后端包，见下方）
+#   - 需要跑 scripts/run_query.sh 的本地交互模式
+# =============================================================================
+
+# ---- RAG 框架与向量库 ----
+llama-index
+llama-index-vector-stores-milvus
+llama-index-readers-file
+pymilvus
+
+# ---- 模型后端：OpenAI 兼容 API ----
+llama-index-llms-openai-like
+llama-index-embeddings-openai
+
+# ---- 文档处理与检索 ----
+jieba
+numpy
+chardet
+tqdm
+pypdf
+pymupdf
+python-docx
+requests
+
+# ---- 服务层（仅当需要运行 dify_external_api 时）----
+fastapi
+uvicorn[standard]
+pydantic
+nest_asyncio
+
+# ---- Ollama 后端（仅在 LLM_BACKEND=local / EMBED_BACKEND=local 时需要）----
+# 二者均为延迟导入，纯 API 部署可以不装：
+# llama-index-llms-ollama
+# llama-index-embeddings-ollama

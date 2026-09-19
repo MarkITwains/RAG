@@ -15,6 +15,10 @@ PURE_LOGIC_MODULES = [
     "pcb_rag.cache",
     "pcb_rag.preprocess_docs",
     "eval.metrics",
+    # 检索核心逻辑必须保持"无重型依赖"，否则测试只能靠 importorskip 静默跳过
+    # （曾经的教训：同一套 RRF 在仓库里长出了好几份实现，而一份都测不到）
+    "pcb_rag.fusion",
+    "pcb_rag.incremental",
 ]
 
 HEAVY_MODULES = [

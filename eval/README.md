@@ -90,3 +90,93 @@ python eval/evaluate.py --no-rerank --out eval/reports/no_rerank.json
 - 指标实现为自包含的 LLM-as-Judge（见 `metrics.py`），不依赖 `ragas` 等外部框架，
   避免引入额外的依赖树；如需切换到官方 RAGAS 口径，可自行替换 `metrics.py` 中的函数。
 - LLM judge 存在偏差，建议定期人工抽检并与自动分数比对校准。
+
+---
+
+# 召回评测：`evaluate_recall.py`
+
+本目录下有两套评测，**度量对象不同，不要混用**：
+
+| 脚本 | 度量对象 | 指标 | 需要标注 |
+| --- | --- | --- | --- |
+| `evaluate.py` + `metrics.py` | **生成质量**（端到端） | Faithfulness / Answer Relevancy / Context Precision / Context Recall | 问题 + 参考答案 |
+| `evaluate_recall.py` | **检索排序质量** | MRR / MAP / Hit@K / Recall@K / Precision@K / NDCG@K / F1@K（+ 软匹配） | 问题 + 真值 chunk_id |
+
+只看 Hit@K 会掩盖"捞到了但排不对"的问题，因此**必须同时看 MRR 与 NDCG@K**。
+
+## 数据格式
+
+JSONL，每行一条：
+
+```json
+{"query": "问题文本",
+ "ground_truth_ids": ["chunk_id_1"],
+ "ground_truth_text": ["真值 chunk 原文"],
+ "ground_truth_metadata": {"source_type": "standard", "source_path": "GB-T 4588.4-2017.txt"}}
+```
+
+- `ground_truth_ids` 用于 Hard Match（chunk 级精确命中）
+- `ground_truth_text` 用于 Soft Match（语义命中判定）
+- **本仓库数据集每条问题只绑定 1 个真值 chunk**，此时 `recall@K` 与 `hit_rate@K` 数值恒等，
+  `recall` 字段没有独立信息量
+
+## 无显卡 / 纯 API 部署
+
+脚本本身不依赖本地 GPU，只要满足：OpenAI 兼容的 LLM + Embedding + Rerank，
+以及可访问的 Milvus。`.env` 关键项：
+
+```bash
+LLM_BACKEND=api
+EMBED_BACKEND=api
+EMBED_MODEL=BAAI/bge-m3
+EMBED_DIM=1024          # 必须显式填，Milvus 建表要用
+RERANK_BACKEND=api      # 默认是 qwen3reranker（本地模型），纯 API 环境必须改
+RERANK_API_URL=https://api.siliconflow.cn/v1/rerank
+RERANK_API_MODEL=...
+```
+
+> `RERANK_BACKEND` 默认值是本地模型；不改会在无 GPU 机器上初始化失败并回退为"仅召回"，
+> 此时 `--rerank` 实际不生效，指标会明显偏低。
+
+## 常用命令
+
+```bash
+python -m py_compile eval/evaluate_recall.py            # 部署后先做语法自检
+
+# 基线：融合 + 多查询扩展 + 重排（最接近线上）
+python eval/evaluate_recall.py \
+  --dataset ./eval/eval_dataset.json \
+  --mode fusion_expand --rerank \
+  --recall-k 200 --rerank-top-n 10 \
+  --ks 1,3,5,10,20 \
+  --out ./eval/reports/base.json
+
+# 消融：关掉重排做对比
+python eval/evaluate_recall.py --mode fusion_expand --no-rerank --out ./eval/reports/no_rerank.json
+
+# 消融：RRF 平滑参数 k 扫描（线上默认 40，本脚本默认 60 —— 见下方注意事项）
+for k in 10 20 40 60 80; do
+  python eval/evaluate_recall.py --mode fusion_expand --rrf-k "$k" --out "./eval/reports/k_$k.json"
+done
+
+# 软匹配（语义命中，用 embedding 阈值判定）
+python eval/evaluate_recall.py --mode fusion_expand --rerank \
+  --soft-match embed --embed-threshold 0.78 \
+  --out ./eval/reports/soft_embed.json
+```
+
+## 注意事项（读数前必看）
+
+1. **`--rrf-k` 默认 60，而线上 `query.py` 的 `FUSION_RRF_K` 默认 40**，两者从未对齐。
+   要复现线上行为需显式传 `--rrf-k 40`；要比较"评测口径"与"线上口径"的差异就分别跑。
+2. **`--recall-k` 默认 40，而线上 `RECALL_TOP_K` 默认 200**。同样需要显式对齐。
+3. **`--rerank-top-n 0`（默认）会沿用 `query.py` 的 `RERANK_TOP_N=200`**，即 200 条候选全部过重排。
+   纯 API 部署下这是 200 条/次的远程调用，建议显式传 `--rerank-top-n 10`。
+4. **Hit@K 不衡量顺序**：`Hit@10` 高只说明"捞到了"。同时报 `mrr` 与 `ndcg` 才有意义。
+5. **真值由 chunk 反推问题生成**（`build_golden_dataset.py`），该 chunk 按定义相关，
+   因此所有指标都会被系统性高估。**指标只用于同数据集内的配置对比，不代表线上召回率。**
+6. **跨数据集不可比**：仓库内多版数据集互不重合，换集后的分数不能与旧集对比。
+7. 软匹配的 LLM 判定默认复用 `LLM_MODEL`（与生成同源）。要消除同源偏差，
+   用 `SOFT_JUDGE_*` 指向另一个厂商的模型。
+8. `multipath_colbert` / `multipath_full` 需要本地 ColBERT 模型，纯 API 环境会打印提示
+   并自动降级为 RRF 融合，不要把这些 mode 的分数当作 ColBERT 的效果。

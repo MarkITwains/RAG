@@ -38,8 +38,7 @@ cat > .env << 'EOF'
 OLLAMA_LLM_MODEL=glm-4.7-flash:q8_0
 OLLAMA_NUM_CTX=4096
 
-# 检索配置
-FUSION_MODE=DIST_BASED_SCORE
+# 检索配置（FUSION_MODE 当前不改变融合行为，见「混合检索」一节的说明）
 FUSION_WEIGHTS=0.35,0.65
 RECALL_TOP_K=40
 
@@ -214,19 +213,28 @@ export CHUNK_OVERLAP=150
 
 | 变量名 | 默认值 | 可选值 | 说明 |
 |--------|--------|--------|------|
-| `FUSION_MODE` | `DIST_BASED_SCORE` | `RECIPROCAL_RANK`, `DIST_BASED_SCORE`, `RELATIVE_SCORE` | 融合模式 |
+| `FUSION_MODE` | `RECIPROCAL_RANK` | 仅 `RECIPROCAL_RANK` 生效 | **当前不改变行为**：实现只有加权 RRF，其它取值只在启动横幅里提示 |
 | `FUSION_WEIGHTS` | `0.35,0.65` | `0.0-1.0,0.0-1.0` | [向量权重, BM25权重] |
 | `FUSION_NUM_QUERIES` | `5` | 1-10 | 查询改写数量 |
 | `RECALL_TOP_K` | `40` | 10-200 | 召回文档数量 |
 
-**融合模式说明：**
-- `RECIPROCAL_RANK`：RRF 倒数排名融合，对分数不敏感
-- `DIST_BASED_SCORE`：加权分数融合（推荐），支持权重调节
-- `RELATIVE_SCORE`：相对分数融合
+**融合模式说明（重要更正）：**
+
+当前实现**只有加权 RRF 一种融合**（`_weighted_rrf_fuse_three_routes`，`score = w/(k+rank)`，实现已下沉到 `src/pcb_rag/fusion.py`）。`FUSION_MODE` 变量仅为历史兼容与启动信息保留 —— 设成 `DIST_BASED_SCORE` / `RELATIVE_SCORE` **不会改变任何融合行为**，CLI 会在启动横幅里显式提示"该变量当前不改变融合行为"。
+
+> 早期版本文档曾把 `FUSION_MODE=DIST_BASED_SCORE` 写成 v1.3 的核心变更，那属于文档与实现脱节（该变量当时只用来挑一个打印字符串）。现已更正。
+
+真正影响融合的旋钮：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `FUSION_WEIGHTS` | `0.45,0.55` | `[向量权重, BM25权重]`，可被查询意图动态覆盖 |
+| `FUSION_RRF_K` | `40` | 主融合 RRF 的 k。k 越小头部越激进，k 越大长尾相对受益 |
+| `HYDE_ROUTE_WEIGHT` | `0.85` | HyDE 路相对原始向量路的权重 |
+| `STEPBACK_ROUTE_WEIGHT` | — | Step-back 路的权重系数 |
 
 ```bash
 # 高召回配置（BM25 主导）
-export FUSION_MODE=DIST_BASED_SCORE
 export FUSION_WEIGHTS=0.3,0.7
 export FUSION_NUM_QUERIES=5
 export RECALL_TOP_K=50
@@ -348,7 +356,7 @@ python eval/evaluate_recall.py [OPTIONS]
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|----------|--------|------|
-| `--soft-match` | `SOFT_MATCH` | `none` | `none/llm/embed` |
+| `--soft-match` | `SOFT_MATCH` | `none` | `none/llm/embed`。**默认关闭**：报告里的"软匹配 0.932 vs 硬匹配 0.829"是显式开启后跑出来的，不是默认配置 |
 | `--soft-llm-base-url` | `OLLAMA_BASE` | `http://127.0.0.1:11434` | LLM 服务地址 |
 | `--soft-llm-model` | `OLLAMA_EVAL_JUDGE_MODEL` | `` | 判断模型 |
 | `--soft-llm-timeout` | `OLLAMA_EVAL_JUDGE_TIMEOUT` | `60` | 超时（秒） |
@@ -395,8 +403,7 @@ export NODE_PARSER_MODE=semantic
 export SEMANTIC_CHUNK_SIZE=2000
 export SEMANTIC_BREAKPOINT_THRESHOLD=85
 
-# 检索配置
-export FUSION_MODE=DIST_BASED_SCORE
+# 检索配置（FUSION_MODE 当前不改变行为，见上文"融合模式说明"）
 export FUSION_WEIGHTS=0.35,0.65
 export FUSION_NUM_QUERIES=5
 export RECALL_TOP_K=50
@@ -461,8 +468,7 @@ export RERANK_TOP_N=5
 
 ```bash
 # 针对 PCB 标准文档的特殊配置
-export FUSION_MODE=DIST_BASED_SCORE
-export FUSION_WEIGHTS=0.25,0.75  # BM25 权重更高
+export FUSION_WEIGHTS=0.25,0.75  # BM25 权重更高（FUSION_MODE 不生效，已省略）
 export QUERY_EXPANSION_ENABLED=1
 export QUERY_ROUTING_ENABLED=1
 ```
@@ -572,8 +578,7 @@ RERANK_API_URL=
 RERANK_API_KEY=
 RERANK_API_MODEL=
 
-# 检索
-FUSION_MODE=DIST_BASED_SCORE
+# 检索（FUSION_MODE 当前不改变行为，如需保留请显式设为 RECIPROCAL_RANK）
 FUSION_WEIGHTS=0.35,0.65
 FUSION_NUM_QUERIES=5
 RECALL_TOP_K=40

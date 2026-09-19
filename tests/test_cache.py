@@ -230,3 +230,24 @@ class TestScopeIsolation:
         cache = SemanticCache()
         cache.set("q", "v")
         assert cache.get("q") == "v"
+
+    def test_unscoped_call_emits_warning_once(self):
+        """忘记传 scope 是静默危险，至少要留下可观测的告警（且只告警一次）。"""
+        import pcb_rag.cache as cache_mod
+
+        original = cache_mod._unscoped_warned
+        cache_mod._unscoped_warned = False
+        try:
+            cache = SemanticCache()
+            cache.set("q", "v")           # 未传 scope
+            assert cache_mod._unscoped_warned is True
+        finally:
+            cache_mod._unscoped_warned = original
+
+    def test_scoped_cache_is_structurally_separate(self):
+        """scope 直接进 key 前缀，因此"忘了传"只会读到同为空 scope 的条目。"""
+        cache = SemanticCache()
+        cache.set("q", "shared", scope="")
+        cache.set("q", "acme", scope="acme")
+        assert cache.get("q") == "shared"
+        assert cache.get("q", scope="acme") == "acme"

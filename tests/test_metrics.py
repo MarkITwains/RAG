@@ -79,9 +79,14 @@ class TestFaithfulness:
         llm = FakeLLM({"statements": [{"text": "a", "supported": True}]})
         assert faithfulness("答案", ["上下文"], llm) == pytest.approx(1.0)
 
-    def test_missing_statements_yields_zero(self):
+    def test_missing_statements_is_not_a_zero_score(self):
+        """三态回归：judge 表示"没有可判定陈述"= 无法判定，而不是 0 分。
+
+        早先这里返回 0.0，把"judge 说没有可判定陈述"和"全不被支持"混为一谈，
+        方向上系统性低估所有指标。
+        """
         llm = FakeLLM({"statements": []})
-        assert faithfulness("答案", ["上下文"], llm) == 0.0
+        assert faithfulness("答案", ["上下文"], llm) is None
 
     def test_empty_inputs_yield_zero(self):
         llm = FakeLLM({"statements": [{"text": "a", "supported": True}]})
@@ -92,8 +97,9 @@ class TestFaithfulness:
         llm = FakeLLM({"statements": [{"text": "a", "supported": True}, "噪声"]})
         assert faithfulness("答案", ["上下文"], llm) == pytest.approx(0.5)
 
-    def test_broken_llm_falls_back_to_zero(self):
-        assert faithfulness("答案", ["上下文"], BrokenLLM()) == 0.0
+    def test_broken_llm_is_reported_as_failure_not_zero(self):
+        """三态回归：judge 调用异常 = 评测失败（None），不是 0 分。"""
+        assert faithfulness("答案", ["上下文"], BrokenLLM()) is None
 
 
 class TestAnswerRelevancy:
@@ -103,8 +109,8 @@ class TestAnswerRelevancy:
     def test_out_of_range_score_is_clipped(self):
         assert answer_relevancy("问题", "回答", FakeLLM({"score": 5})) == 1.0
 
-    def test_missing_score_yields_zero(self):
-        assert answer_relevancy("问题", "回答", FakeLLM({"unexpected": 1})) == 0.0
+    def test_missing_score_is_reported_as_failure(self):
+        assert answer_relevancy("问题", "回答", FakeLLM({"unexpected": 1})) is None
 
     def test_empty_inputs_yield_zero(self):
         assert answer_relevancy("", "回答", FakeLLM({"score": 1})) == 0.0
@@ -157,7 +163,9 @@ class TestAggregation:
             "context_precision",
             "context_recall",
             "overall",
+            "judge_failed",
         }
+        assert result["judge_failed"] == []
         assert result["faithfulness"] == pytest.approx(0.5)
         assert result["answer_relevancy"] == pytest.approx(1.0)
         assert result["context_precision"] == pytest.approx(1.0)
@@ -168,7 +176,7 @@ class TestAggregation:
         result = evaluate_case(
             "问题", "回答", ["c1"], "参考答案", FakeLLM({"relevant": True}), metrics=["context_precision"]
         )
-        assert set(result) == {"context_precision", "overall"}
+        assert set(result) == {"context_precision", "overall", "judge_failed"}
 
     def test_summarize_marks_threshold_pass_and_fail(self):
         summary = summarize([{"faithfulness": 0.9, "context_recall": 0.1, "overall": 0.5}])
@@ -190,3 +198,74 @@ class TestAggregation:
 
     def test_thresholds_cover_all_metrics(self):
         assert set(THRESHOLDS) == set(ALL_METRICS)
+
+
+# ---------------------------------------------------------------------------
+# 判卷失败的分列统计（三态）
+#
+# 核心诉求：报告必须能回答"这份数字里有多少是没判出来的"。
+# 失败样本既不补零、也不计入均值，失败率超阈值时整份报告标记 invalid。
+# ---------------------------------------------------------------------------
+class TestJudgeFailureAccounting:
+    def test_evaluate_case_records_failed_metrics(self):
+        result = evaluate_case("问题", "回答", ["c1"], "参考答案", BrokenLLM())
+        assert set(result["judge_failed"]) == set(ALL_METRICS)
+        assert "overall" not in result, "全部判卷失败时不应给出 overall 数字"
+
+    def test_evaluate_case_overall_ignores_failures(self):
+        """部分失败时，overall 只对有效分数求均值（不把失败当 0）。"""
+        payloads = [
+            {"statements": [{"text": "a", "supported": True}]},   # faithfulness = 1.0
+            "不是 JSON",                                          # relevancy → None
+        ]
+        result = evaluate_case(
+            "问题", "回答", ["c1"], "参考答案", FakeLLM(*payloads), metrics=["faithfulness", "answer_relevancy"]
+        )
+        assert result["faithfulness"] == pytest.approx(1.0)
+        assert result["answer_relevancy"] is None
+        assert result["judge_failed"] == ["answer_relevancy"]
+        assert result["overall"] == pytest.approx(1.0), "失败项不应拉低 overall"
+
+    def test_context_precision_bails_out_on_judge_failure(self):
+        """AP 依赖位置序列，任一条判卷失败就无法可靠计算 → None。"""
+        llm = FakeLLM({"relevant": True}, "坏响应")
+        assert context_precision("问题", ["c1", "c2"], llm) is None
+
+    def test_summarize_separates_evaluated_and_failed(self):
+        summary = summarize(
+            [
+                {"faithfulness": 0.8, "context_recall": None, "overall": 0.8},
+                {"faithfulness": 0.6, "context_recall": None, "overall": 0.6},
+            ]
+        )
+        assert summary["faithfulness"]["avg"] == pytest.approx(0.7)
+        assert summary["faithfulness"]["evaluated"] == 2
+        assert summary["faithfulness"]["failed"] == 0
+        assert summary["context_recall"]["evaluated"] == 0
+        assert summary["context_recall"]["failed"] == 2
+        assert summary["context_recall"]["avg"] is None, "全失败时不能伪装成 0 分"
+        assert summary["judge_failures"] == 2
+
+    def test_failure_rate_over_threshold_marks_report_invalid(self):
+        rows = [{"faithfulness": None}] * 4 + [{"faithfulness": 0.9}]
+        summary = summarize(rows)
+        assert summary["judge_failure_rate"] == pytest.approx(0.8)
+        assert summary["invalid"] is True
+
+    def test_healthy_report_is_not_invalid(self):
+        summary = summarize([{"faithfulness": 0.9}, {"faithfulness": 0.85}])
+        assert summary["invalid"] is False
+        assert summary["judge_failures"] == 0
+
+    def test_format_summary_surfaces_judge_failures(self):
+        text = format_summary(summarize([{"faithfulness": None}, {"faithfulness": 0.9}]))
+        assert "判卷失败" in text or "n/a" in text
+
+    def test_format_summary_flags_invalid_report(self):
+        rows = [{"faithfulness": None}] * 4 + [{"faithfulness": 0.9}]
+        assert "不可信" in format_summary(summarize(rows))
+
+    def test_all_failed_summary_has_no_fake_average(self):
+        summary = summarize([{"context_recall": None}])
+        assert summary["context_recall"]["avg"] is None
+        assert summary["context_recall"]["passed"] is None

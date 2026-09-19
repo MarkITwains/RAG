@@ -19,6 +19,18 @@ dev = [
     "chardet>=5.0",
 ]
 
+# 「让关键回归测试真的跑起来」所需的最小依赖。
+#
+# 问题背景：`ACL 过滤合并`（security.merge_filters）是曾经出过真实权限 bug 的地方，
+# 它的回归测试用 pytest.importorskip("llama_index.core") 守卫 —— 没装依赖时
+# **静默跳过**，而 skipped 不会让流水线变红。"CI 全绿"于是可能意味着"这条测试根本没跑"。
+# 这里只装过滤器所需的最小集合（llama-index-core + Milvus 过滤器编译器），
+# 不涉及 torch / 模型权重 / Milvus 服务，安装量可控。
+test_llama = [
+    "llama-index-core>=0.11",
+    "llama-index-vector-stores-milvus>=0.2",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

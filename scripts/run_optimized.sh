@@ -80,7 +80,9 @@ set_defaults() {
     export NORMALIZE_TEXT="${NORMALIZE_TEXT:-1}"
     
     # 检索配置
-    export FUSION_MODE="${FUSION_MODE:-DIST_BASED_SCORE}"
+    # FUSION_MODE 仅为历史兼容保留：实现只有加权 RRF（见 docs/CONFIGURATION_GUIDE.md）。
+    # 这里不再默认设成 DIST_BASED_SCORE —— 那会让日志显示一个不会被执行的融合模式。
+    export FUSION_MODE="${FUSION_MODE:-RECIPROCAL_RANK}"
     export FUSION_WEIGHTS="${FUSION_WEIGHTS:-0.35,0.65}"
     export FUSION_NUM_QUERIES="${FUSION_NUM_QUERIES:-5}"
     export RECALL_TOP_K="${RECALL_TOP_K:-40}"

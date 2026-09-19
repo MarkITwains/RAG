@@ -34,8 +34,20 @@ def _node(text: str, metadata: dict) -> SimpleNamespace:
 # ---------------------------------------------------------------------------
 # 主体解析
 # ---------------------------------------------------------------------------
+@pytest.fixture
+def trust_headers(monkeypatch):
+    """显式打开"信任客户端身份头"。
+
+    默认值是 False（fail-safe）：打开 ACL 后若同时信任客户端自报头，任何调用方
+    自报 X-User-Roles: admin 就能读全库。因此凡是验证"从 header 解析主体"的
+    用例，都必须显式开启信任，而不是依赖默认值。
+    """
+    monkeypatch.setattr(security, "ACL_TRUST_HEADERS", True)
+    return security
+
+
 class TestResolvePrincipal:
-    def test_reads_headers(self):
+    def test_reads_headers(self, trust_headers):
         headers = {
             "X-User-Id": "u1",
             "X-Tenant-Id": "acme",
@@ -49,9 +61,18 @@ class TestResolvePrincipal:
         assert principal.groups == frozenset({"pcb_team"})
         assert principal.authenticated is True
 
-    def test_headers_are_case_insensitive(self):
+    def test_headers_are_case_insensitive(self, trust_headers):
         principal = resolve_principal({"x-tenant-id": "acme"})
         assert principal.tenant_id == "acme"
+
+    def test_headers_ignored_when_trust_disabled(self):
+        """回归：信任头关闭（默认）时，客户端自报 admin 不生效，退化为匿名租户。"""
+        principal = resolve_principal(
+            {"X-Tenant-Id": "acme", "X-User-Roles": "admin", "X-User-Id": "u1"}
+        )
+        assert principal.is_admin is False
+        assert principal.tenant_id == security.ACL_ANONYMOUS_TENANT
+        assert principal.user_id == "anonymous"
 
     def test_explicit_args_override_headers(self):
         principal = resolve_principal({"X-Tenant-Id": "acme"}, tenant_id="other")
@@ -211,6 +232,38 @@ class TestDescribeAcl:
         assert "enabled" in info
         assert info["tenant_field"] == security.ACL_TENANT_FIELD
         assert isinstance(info["admin_roles"], list)
+        assert "trust_headers" in info
+
+
+# ---------------------------------------------------------------------------
+# 启动自检：ACL 开启 + 信任客户端自报头 = 自报 admin 即可读全库 → 拒绝启动
+# ---------------------------------------------------------------------------
+class TestValidateAclSecurity:
+    def test_acl_off_is_always_safe(self):
+        assert security.validate_acl_security() is None
+
+    def test_acl_on_without_trust_headers_is_safe(self, monkeypatch):
+        monkeypatch.setattr(security, "ACL_ENABLED", True)
+        monkeypatch.setattr(security, "ACL_TRUST_HEADERS", False)
+        assert security.validate_acl_security() is None
+
+    def test_acl_on_with_trust_headers_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(security, "ACL_ENABLED", True)
+        monkeypatch.setattr(security, "ACL_TRUST_HEADERS", True)
+        monkeypatch.setattr(security, "ACL_TRUST_HEADERS_ACK", False)
+        problem = security.validate_acl_security()
+        assert problem is not None
+        assert "ACL_TRUST_HEADERS" in problem
+
+    def test_explicit_ack_allows_trust_headers(self, monkeypatch):
+        monkeypatch.setattr(security, "ACL_ENABLED", True)
+        monkeypatch.setattr(security, "ACL_TRUST_HEADERS", True)
+        monkeypatch.setattr(security, "ACL_TRUST_HEADERS_ACK", True)
+        assert security.validate_acl_security() is None
+
+    def test_default_trust_headers_is_false(self):
+        """默认必须是 fail-safe：打开 ACL 后不会因为忘关信任头而静默全开。"""
+        assert security.ACL_TRUST_HEADERS is False
 
 
 # ---------------------------------------------------------------------------

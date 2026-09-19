@@ -99,9 +99,8 @@
 
 方式2: 手动配置
 ────────────────────────────────────────────────────────────
-  # 推荐配置
+  # 推荐配置（FUSION_MODE 当前不改变融合行为，已从推荐项移除）
   export NODE_PARSER_MODE=semantic
-  export FUSION_MODE=DIST_BASED_SCORE
   export FUSION_WEIGHTS=0.35,0.65
   export FUSION_NUM_QUERIES=5
   export QUERY_EXPANSION_ENABLED=1
@@ -115,7 +114,6 @@
 方式3: 仅优化检索(不重新摄取)
 ────────────────────────────────────────────────────────────
   # 如果已有向量库,只需配置检索参数
-  export FUSION_MODE=DIST_BASED_SCORE
   export FUSION_WEIGHTS=0.35,0.65
   export FUSION_NUM_QUERIES=5
   export QUERY_EXPANSION_ENABLED=1
@@ -258,8 +256,27 @@ score = Σ IDF(t) * (tf(t,d) * (k1+1)) / (tf(t,d) + k1*(1-b+b*|d|/avgdl)) + delt
 ```
 
 关键参数调整：
-- `k1`: 1.2 → 1.5（增强词频影响，PCB文档专业术语重复度高）
+- `k1`: 1.2 → 1.5
 - `delta`: 新增 = 1.0（防止长文档过度惩罚）
+
+> **更正（k1 的真实作用）**：早期这里写的是"调高 k1 增强词频影响"，但当时的
+> 分词实现把文档侧 tf 压成了 0/1（`cut` + `cut_for_search` 合并去重，同一片段里
+> "阻抗"出现 3 次也只留 1 次），而 tf=1 且 dl=avgdl 时
+> `tf_component = (k1+1)/(1+k1)` 恒等于 1 —— k1 完全不起作用，只剩下"长度惩罚曲线
+> 陡度"这一个含义。
+> 该分词缺陷已修复（`cut_words` 保留词频，`search_words` 只补新词），现在 k1 才
+> 真正是"词频饱和"参数。同理，同时期的 `b=0.75` 属继承 BM25 惯用默认值，本仓库
+> 从未做过 ablation；`IDF×1.2`（PCB 术语加权）、`DF>80% 丢弃`、查询侧 `qtf 上限 3`
+> 也都是无 ablation 出处的经验值。
+
+#### 1.3.1 融合实现的统一
+
+仓库里曾经存在多份语义不同的 RRF：加权三路（`w/(k+rank)`）、`MultiPathRetriever`
+的无权重版（`1/(k+rank+1)`）、评测脚本里带 overlap boost + dynamic k 的版本等。
+现已把加权 RRF 下沉为纯函数 `src/pcb_rag/fusion.py::weighted_rrf_fuse`
+（无 llama-index / torch 依赖，可被轻量单测覆盖），`query.py` 只保留薄封装，
+CLI 与 API 共用同一实现。评测脚本内的历史变体仍按各自口径保留（用于复现旧报告），
+但**不再作为线上行为**。
 
 #### 1.4 N-gram 支持
 - 添加英文 bigram（如 "annular_ring"）
@@ -451,7 +468,7 @@ python eval/evaluate_recall.py \
 | `QUERY_ROUTING_ENABLED` | 1 | 启用查询分类路由 |
 | `QUERY_EXPANSION_ENABLED` | 1 | 启用查询扩展 |
 | `QUERY_EXPANSION_MAX_TERMS` | 5 | 最大扩展词数 |
-| `FUSION_MODE` | DIST_BASED_SCORE | 融合模式 |
+| `FUSION_MODE` | RECIPROCAL_RANK | 仅为历史兼容保留；实现只有加权 RRF，其它取值不改变行为 |
 | `FUSION_WEIGHTS` | 0.35,0.65 | [向量权重, BM25权重] |
 | `FUSION_NUM_QUERIES` | 5 | 查询改写数量 |
 

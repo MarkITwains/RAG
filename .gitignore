@@ -38,9 +38,11 @@ data/*
 !data/README.md
 !data/.gitkeep
 # 评测数据集与报告（评测脚本本身保留在版本库）
+# 数据集含 ground_truth_text（语料原文片段），属受限内容，不得进入公开仓库
 eval/datasets/
 eval/reports/
 eval/*.json
+eval/*.jsonl
 history/
 existing_repo/
 rag.code-workspace

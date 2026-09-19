@@ -49,7 +49,7 @@ PCB-RAG 面向 PCB 设计规范、工艺资料与工程经验文档，覆盖从�
 | **Agentic RAG** | 可选的迭代检索：检索 → 充分性判断 → 信息不足则改写查询重检，直到满足或达到迭代上限 |
 | **Contextual Retrieval** | 入库时为每个 chunk 注入「文档 · 章节 · 标准号」语境前缀，缓解切块导致的上下文丢失 |
 | **可切换精排** | 支持 API 精排（Jina / 硅基流动等）与本地精排（Qwen3-Reranker / cross-encoder / SBERT） |
-| **上下文扩展** | 命中的 chunk 自动并入相邻与父级 chunk 内容，缓解长文档上下文割裂 |
+| **上下文扩展** | 命中的 chunk 自动并入相邻 chunk（`prev_id`/`next_id`）与父块锚点内容，缓解长文档上下文割裂 |
 | **Dify 集成** | 提供符合规范的 FastAPI 外部知识库接口，可直接接入 Dify 工作流或对话应用 |
 | **GraphRAG 图检索** | 入库时抽取「实体—关系—实体」三元组构成可遍历图谱，检索时做实体链接与邻域扩展，补足多跳与聚合类问题 |
 | **上下文压缩** | 近似去重 + 抽取式压缩 + 字符预算裁剪，在长召回链路上显著降低 token 消耗 |
@@ -257,7 +257,7 @@ Altium Designer 中如何处理高速差分线等长？
 | 加权 RRF 融合 | 按查询类型动态调整各路线权重并融合排序 |
 | Rerank 精排 | 使用 API 或本地 cross-encoder 对候选重排序 |
 | 上下文扩展 | 命中 chunk 并入相邻 / 父级 chunk，保持上下文完整 |
-| GraphRAG 图检索 | 实体链接命中图谱后取邻域关系与原文依据，作为独立一路参与融合，并顺带补全多跳事实 |
+| GraphRAG 图检索 | 实体链接命中图谱后取邻域关系与原文依据，作为独立一路（有独立权重与 rank）参与 RRF 融合，并顺带补全多跳事实 |
 | 权限复核 | 对召回结果逐条复核，向量库过滤被忽略时也能兜底拦截 |
 | 上下文压缩 | 近似去重 → 抽取式压缩（优先保留含数值 / 标准号的句子）→ 字符预算裁剪 |
 | 答案合成 | 基于 RAG Prompt 生成答案并标注引用来源 |
@@ -284,7 +284,8 @@ bash scripts/serve_api.sh
 | `POST /api/ask` | 检索 + LLM 合成答案，支持传入对话历史 |
 | `POST /api/ask/stream` | SSE 流式问答：先推检索来源，再逐 token 推答案 |
 | `POST /api/chat` | 服务端会话记忆问答，返回 `session_id` |
-| `GET /health` | 健康检查，展示索引 / 后端 / 检索参数 / 缓存 / 图谱 / 权限 / 压缩配置 |
+| `GET /health` | 轻量健康检查（LB / 探针用），只返回状态与依赖就绪标记，不含敏感配置 |
+| `GET /health/detail` | 完整配置摘要（索引 / 后端 / 检索参数 / 缓存 / 图谱 / 权限 / 压缩），需鉴权 |
 | `GET /metrics` | 运行指标：计数器与延迟分位（p50 / p95 / p99） |
 
 更多步骤见 `docs/DIFY_INTEGRATION_GUIDE.md`。
@@ -318,15 +319,17 @@ bash scripts/serve_api.sh
 | `DATA_DIR` | `./data/clear_docs` | 待入库文档目录 |
 | `MILVUS_URI` | `http://127.0.0.1:19530` | Milvus 服务地址 |
 | `COLLECTION` | `pcb_kb` | 向量集合名称 |
-| `INGEST_OVERWRITE` | `0` | 入库时是否清空重建集合 |
+| `INGEST_OVERWRITE` | `0` | 入库时是否清空重建集合（重建时**忽略**入库清单，本次全量处理并重写清单） |
+| `INGEST_INCREMENTAL` | `1` | 增量入库：按内容哈希指纹只处理新增 / 变更文档 |
 | `LEXICAL_CACHE_TTL_HOURS` | `24` | 词法索引缓存有效期（小时） |
+| `LEXICAL_RELOAD_STAMP` | `<词法缓存>.stamp` | 入库结束后写入的重载标记；长驻 API 按它轮询并热重载 BM25 |
 
 ### 检索与生成
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RECALL_TOP_K` | `200` | 初始召回数量 |
-| `RERANK_TOP_N` | `200` | 精排后保留数量 |
+| `RECALL_TOP_K` | `200`（API 进程 `setdefault` 亦为 `200`） | 初始召回数量 |
+| `RERANK_TOP_N` | `200`（**API 进程强制 `setdefault` 为 `10`**） | 送入精排并保留的候选数量 |
 | `CHUNK_EXPAND_MAX_EXTRA` | `5` | 上下文扩展可额外返回的条数 |
 | `HYDE_ENABLED` | `1` | 是否启用 HyDE 查询增强 |
 | `QUERY_UNDERSTANDING_MODE` | `hybrid` | 查询理解模式：`rule` / `llm` / `hybrid` |
@@ -349,7 +352,8 @@ bash scripts/serve_api.sh
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DIFY_API_TOKEN` | `change-me` | Dify 外部知识库鉴权 Token |
+| `DIFY_API_TOKEN` | 无（**未设置时服务拒绝启动**） | Dify 外部知识库鉴权 Token；占位值 `change-me` 同样会被拒绝 |
+| `CORS_ALLOW_ORIGINS` | 空（不下发跨域头） | 允许跨域的来源白名单，逗号分隔；需要浏览器直连时才配置 |
 | `API_PORT` | `8000` | API 服务端口 |
 | `SESSION_EXPIRE_MINUTES` | `60` | 会话过期时间（分钟） |
 | `SESSION_MAX_COUNT` | `1000` | 最大会话数 |
@@ -367,7 +371,9 @@ bash scripts/serve_api.sh
 | `GRAPH_EXTRACT_BACKEND` | `rule` | 抽取方式：`rule`（零 LLM 成本）/ `llm` / `hybrid` |
 | `GRAPH_HOP` | `1` | 实体邻域扩展跳数 |
 | `GRAPH_TOP_K` | `5` | 图路径返回的候选数 |
-| `GRAPH_WEIGHT` | `0.35` | 图结果参与融合的权重 |
+| `GRAPH_WEIGHT` | `0.35` | 图路在 RRF 融合中的权重（独立一路，有独立 rank） |
+| `GRAPH_RRF_K` | `60` | 图路 RRF 平滑参数 k |
+| `GRAPH_EVIDENCE_MAX` | `2` | 图证据在最终结果中的独立配额（不占主结果 top-k 名额） |
 | `GRAPH_EXPAND_MAX` | `2` | 邻域扩展追加的额外事实条数 |
 | `GRAPH_COMMUNITY_ENABLED` | `0` | 是否生成社区摘要（面向综述类问题） |
 
@@ -392,7 +398,8 @@ bash scripts/serve_api.sh
 | `ACL_DEFAULT_VISIBILITY` | `private` | 入库默认可视性 |
 | `ACL_PUBLIC_VALUE` | `public` | 该 visibility 的文档对所有租户可见 |
 | `ACL_ADMIN_ROLES` | `admin,root` | 可跨租户访问的角色 |
-| `ACL_TRUST_HEADERS` | `1` | 是否信任客户端身份头（对外建议由网关注入后关闭） |
+| `ACL_TRUST_HEADERS` | `0` | 是否信任客户端自报的身份头。默认关闭：打开后任何人都能自报 `X-User-Roles: admin` 读全库 |
+| `ACL_TRUST_HEADERS_ACK` | `0` | 显式确认「网关已剥离客户端同名头」。`ACL_ENABLED=1` 且 `ACL_TRUST_HEADERS=1` 而未设此项时，服务拒绝启动 |
 | `ACL_STRICT_LEGACY` | `0` | 未标注权限字段的历史数据是否拒绝访问 |
 | `ACL_HEADER_TENANT` | `X-Tenant-Id` | 租户请求头，另有 `X-User-Id` / `X-User-Roles` / `X-User-Groups` |
 
@@ -471,7 +478,9 @@ Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确�
 <details>
 <summary>重新入库后 BM25 仍在检索旧内容？</summary>
 
-词法索引缓存在 `LEXICAL_CACHE_PATH`，入库完成后会自动清理；同时 `LEXICAL_CACHE_TTL_HOURS`（默认 24 小时）超期后会自动重建。如需强制刷新，删除该缓存文件即可。
+词法索引缓存在 `LEXICAL_CACHE_PATH`，入库完成后会自动清理，同时写一个 `LEXICAL_RELOAD_STAMP` 标记文件：
+- **长驻 API 进程**会按该标记的 mtime 做惰性热重载（后台线程重建，本次检索仍用旧索引），无需重启；
+- **CLI / 一次性进程**下次启动时自然重建；`LEXICAL_CACHE_TTL_HOURS`（默认 24 小时）超期也会重建。
 
 </details>
 
@@ -480,7 +489,67 @@ Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确�
 
 设置 `INGEST_OVERWRITE=1` 后重新执行入库脚本即可清空重建集合；保持默认 `0` 时为增量 upsert。
 
+注意：`INGEST_OVERWRITE=1` 会**忽略并重写**入库清单（`INGEST_MANIFEST_PATH`）。这一步是必须的 —— 集合被清空后清单里的指纹全部失效，若仍按指纹比对会得到「无需处理的文档」，重建后的库将是空的，而清单还声称数据都在，后续增量入库会继续空转。
+
 </details>
+
+<details>
+<summary>入库后新文档检索不到 / 排得很靠后？</summary>
+
+依次检查三件事：
+1. **词法索引是否已重载** —— 长驻 API 会按 `LEXICAL_RELOAD_STAMP` 自动热重载，`/metrics` 里的 `lexical.reloaded` 计数可确认；
+2. **入库清单是否与实际数据一致** —— 重建库后若没走 `INGEST_OVERWRITE` 全量，清单会与库脱节；
+3. **是否只看了 Hit@K** —— 新文档缺一路投票时 Hit@K 可能不变，但 MRR/NDCG 会掉。
+
+</details>
+
+## 已知问题（Known Issues）
+
+列在这里的目的是**可证伪**：每条都写清现象、根因、当前状态与彻底修法，便于接手的人复核。
+
+| # | 现象 | 根因 | 当前状态 |
+| --- | --- | --- | --- |
+| 1 | 评测脚本与评测报告未入库 | `eval/reports/`、`eval/*.json(l)` 被 `.gitignore` 排除（数据集含语料原文，不宜公开）；`eval/evaluate_recall.py` 亦未纳入版本控制 | **未修（唯一需要人工决策的一条）**：脱敏后提交脚本 + 报告摘要，或在 README 给出「数据集规模 / 该集指标 / 脚本版本」对照表。在提交之前，README 里的所有 MRR / Hit@K / NDCG 数字都无法被第三方复现 |
+| 2 | 指标绝对值不可跨数据集比较 | 仓库内多版数据集互不重合（`eval_dataset.json` / `eval_dataset_146.json`）；真值由 chunk 反推问题生成，chunk 按定义相关 | 只用于**同数据集内**的配置对比；换集必须重跑基线。生成侧偏差方向明确：共享词汇使 Hit/Recall 系统性**高估** |
+| 3 | LLM 出题 / 判卷与生成同源 | `build_golden_dataset.py`、`evaluate.py`、`metrics.py` 都用 `build_llm()` | 部分修：`evaluate_recall.py` 支持 `SOFT_JUDGE_*` 指向另一厂商模型；生成侧 judge 仍同源，**需人工抽检 20~30 条校准并报告 judge 与人评一致率** |
+| 4 | 每请求一个 `ThreadPoolExecutor` | `dify_external_api` 在同步端点里按请求开池（`min(n_workers, 8)`），叠加 anyio 线程池与全局 HyDE 线程池 | 未修（检索是 IO 密集，正解是 `asyncio + httpx.AsyncClient`）。当前并发受 anyio 的 40 线程与 HyDE 的 2 worker 约束，不是无界增长 |
+| 5 | SSE 断开后已提交的 HyDE 调用仍会跑完 | 线程池任务无法取消（`Future.cancel()` 只能取消未开始的任务） | 未修；短期可加"同 query 结果缓存"与队列上限，长期改 asyncio 任务 + `wait_for` |
+| 6 | 分路贡献无 ablation | 只有整体开关对比，没有关掉单路的对照实验 | `fusion.route_contribution()` 已提供"这条只靠哪一路进来"的归因工具；完整 ablation 表待补 |
+| 7 | 父块扩展语义弱于"分层检索" | 默认 `parent_child` 模式下父块文本未单独入库，`parent_id` 指向同父块的首个子块 | 部分修：父级扩展已真实生效（此前是 no-op）。真正的"子块检索 + 父块替换"需要把父块也写入向量库并加 `node_level` 过滤 |
+| 8 | O(n²) 的其它潜在热点 | 已修 `_parent_child_parse` 的邻居查找（此前 1e4 chunk 约 30~60s）；其它循环未逐一审计 | 未完全修 |
+
+### 本轮已修复（可对照 git log 复核）
+
+| 问题 | 现象 | 修法 |
+| --- | --- | --- |
+| `INGEST_OVERWRITE` 与 manifest 冲突 | 重建集合后清单未失效 → `to_process` 为空 → **库被清空且什么都不插入**，后续增量继续空转 | `incremental.plan_ingest()`：overwrite 时忽略清单并写入真实指纹 |
+| 增量指纹用 mtime | `git clone` / `cp -r` 改写 mtime → 全量误判重嵌入 | 改为 size 快筛 + blake2b 内容哈希，路径不进指纹 |
+| CLI HyDE 键错位 | `primed_queries` 以 `expanded_q` 为键，却用 `hyde_q` 发起查询 → 原始查询没进检索、BM25 被喂 LLM 长文 | 改用 `expanded_q` 发起查询（与 eval / API 一致） |
+| 图融合量纲 | 图规则分（0.2~1.0）× 0.35 与 RRF 分（~0.02）同池排序 → 图节点无条件霸榜 | 改为独立的 rank-based RRF 路；API 侧再加独立配额 `GRAPH_EVIDENCE_MAX` |
+| BM25 不重载 | 长驻 API 只在启动时建一次索引 → 新文档缺一整路投票 | 入库写 `LEXICAL_RELOAD_STAMP`，API 按 mtime 惰性后台重载 |
+| BM25 文档侧 tf 被压成 0/1 | `cut` + `cut_for_search` 合并去重 → k1 完全失效，与"调高 k1 增强词频"的注释矛盾 | `cut_words` 保留词频，`search_words` 只补新词 |
+| IDF 高频词 postings 截断 | `postings[:5000]` 按入库顺序截断 → 新文档永远进不了高频词候选 | 默认不截断（DF>80% 已在打分阶段过滤） |
+| judge 静默降级为 0 分 | judge 失败 / 无可判定陈述都返回 0.0 → 所有生成侧指标被低估且无人察觉 | 三态返回（`None` = 评测失败），汇总分列 evaluated / failed，失败率超阈值标记 `invalid` |
+| ACL 合并把 OR 摊平 | ACL 的 `tenant OR public` 被并进外层 AND → 本租户私有文档全部不可见 | `merge_filters` 保留 OR 子树（已提交，含真实编译表达式回归测试） |
+| 缓存跨租户复用 | 缓存 key 不含访问主体 → 语义命中会跨租户返回 | scope 前缀 + 同 scope 语义匹配；未传 scope 时告警 |
+| `/api/ask` 绕过兜底 | 直调 `_retrieve_nodes` → 少了内存侧权限复核，且 GraphRAG 完全不生效 | 两步都下沉到 `_retrieve_nodes` 末尾，所有端点共享 |
+| 默认不安全 | `DIFY_API_TOKEN=change-me` 可启动；`ACL_TRUST_HEADERS` 默认信任自报头（自报 admin 即读全库）；CORS 通配 | Token 缺失/占位时拒绝启动；信任头默认关闭 + 需显式 ACK；CORS 改白名单 |
+| `/health` 泄露配置 | 无鉴权的 `/health` 返回租户字段名、admin 角色、后端地址 | 拆为 `/health`（探针用）与 `/health/detail`（需鉴权） |
+| 纯逻辑不可测 | 融合 / 增量比对与重型 import 绑在一起，测试只能 `importorskip` 静默跳过 | 下沉到 `pcb_rag/fusion.py`、`pcb_rag/incremental.py`，新增 60+ 用例；CI 增加依赖自检让"被跳过"变成硬失败 |
+| `FUSION_MODE` 空转 | 三份文档把它当 v1.3 核心变更，代码里只用来挑打印字符串 | 代码与文档同步标注为"不改变行为"，CLI 启动横幅显式提示 |
+
+## 评测口径速查
+
+| 口径 | CLI / eval | API 进程 |
+| --- | --- | --- |
+| `RECALL_TOP_K` | 200（`FUSION_RRF_K`=40） | 200 |
+| `RERANK_TOP_N` | 200 | **10**（`dify_external_api` 顶部 `setdefault`） |
+| 实际喂给 LLM | `RAG_TOP_DOCS`=5 | 5 |
+| `--soft-match` 默认 | `none`（`0.78` 是 **embed 模式**的阈值，非命中判定默认） | — |
+| `--rrf-k` / `--recall-k` 默认 | 60 / 40 | 40 / 200 |
+
+> 复现线上行为：`python eval/evaluate_recall.py --rrf-k 40 --recall-k 200 --rerank --rerank-top-n 10`。
+> 未显式传参时，评测脚本与线上并不同参，分数不可直接当作线上指标。
 
 ## 开发意义
 
