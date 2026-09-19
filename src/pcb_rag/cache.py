@@ -41,6 +41,39 @@ SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.95"))
 SEMANTIC_CACHE_MAX_PROBE = int(os.getenv("SEMANTIC_CACHE_MAX_PROBE", "256"))
 
 
+#: 未显式传 scope 时的兜底隔离域。生产调用方**必须**传 scope：
+#: 缓存里存的是"已经过 ACL 过滤"的结果，不区分访问主体就会跨租户复用。
+UNSCOPED = ""
+
+_unscoped_warned = False
+_unscoped_warn_lock = threading.Lock()
+
+
+def _warn_unscoped_once() -> None:
+    """调用方忘记传 scope 时告警一次。
+
+    默认值设计得再安全，只要"忘记传"是静默的，就一定会有人忘记 —— 让它在日志里
+    可见，是把静默风险变成可观测问题的第一步。生产代码请显式传 scope
+    （见 dify_external_api._cache_scope_for_principal）。
+    """
+    global _unscoped_warned
+    if _unscoped_warned:
+        return
+    with _unscoped_warn_lock:
+        if _unscoped_warned:
+            return
+        _unscoped_warned = True
+    try:  # pragma: no cover - 纯告警路径
+        import logging
+
+        logging.getLogger("pcb-rag-cache").warning(
+            "[Cache] 调用方未传 scope：该条目会与所有同样未传 scope 的调用方共享。"
+            "若缓存内容与访问权限相关（如检索结果），请显式传入租户/用户隔离域。"
+        )
+    except Exception:
+        pass
+
+
 def normalize_query(query: str) -> str:
     """归一化查询文本，用于精确匹配。"""
     return " ".join((query or "").strip().lower().split())
@@ -120,13 +153,19 @@ class SemanticCache:
         self,
         query: str,
         embedding: Optional[Sequence[float]] = None,
-        scope: str = "",
+        scope: Optional[str] = None,
     ) -> Optional[Any]:
-        """命中返回缓存值，未命中返回 None。只在相同 ``scope`` 内查找。"""
+        """命中返回缓存值，未命中返回 None。只在相同 ``scope`` 内查找。
+
+        ``scope=None`` 表示调用方未指定隔离域，等价于 ``UNSCOPED``（保持旧行为）
+        并会打一次告警 —— 与访问权限相关的缓存必须显式传 scope。
+        """
         if not self._enabled or not query:
             return None
 
-        scope = scope or ""
+        if scope is None:
+            _warn_unscoped_once()
+        scope = scope or UNSCOPED
         key = self._make_key(query, scope)
         now = time.time()
 
@@ -170,13 +209,18 @@ class SemanticCache:
         query: str,
         value: Any,
         embedding: Optional[Sequence[float]] = None,
-        scope: str = "",
+        scope: Optional[str] = None,
     ) -> None:
-        """写入缓存；``embedding`` 为空时只支持精确匹配。"""
+        """写入缓存；``embedding`` 为空时只支持精确匹配。
+
+        ``scope=None`` 语义同 :meth:`get`（未指定隔离域，会告警一次）。
+        """
         if not self._enabled or not query:
             return
 
-        scope = scope or ""
+        if scope is None:
+            _warn_unscoped_once()
+        scope = scope or UNSCOPED
         key = self._make_key(query, scope)
         entry = _Entry(
             value=value,

@@ -20,6 +20,14 @@ Dify 外部知识库 API 规范：
 # 0. 最先设置代理和镜像环境变量（必须在任何 HF 相关 import 之前执行）
 # ---------------------------------------------------------------------------
 import os
+
+# 先加载仓库根目录的 .env：直接 `uvicorn pcb_rag.dify_external_api:app` 或
+# `python -m pcb_rag.dify_external_api` 时也能读到 LLM / Embedding / Rerank /
+# Token 配置（否则只有走 scripts/*.sh 才会有）
+from pcb_rag.env_loader import load_project_env
+
+load_project_env()
+
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 # ---------------------------------------------------------------------------
@@ -41,6 +49,7 @@ import sys
 import time
 import asyncio
 import logging
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -158,6 +167,7 @@ from pcb_rag.graph_rag import (
 
 # P2：可观测性（指标快照 / trace / span）
 from pcb_rag.observability import (
+    counter,
     describe_observability,
     metrics_snapshot,
     span,
@@ -173,6 +183,7 @@ from pcb_rag.security import (
     reset_request_principal,
     resolve_principal,
     set_request_principal,
+    validate_acl_security,
 )
 
 # ---------------------------------------------------------------------------
@@ -389,7 +400,28 @@ logger = logging.getLogger("pcb-rag-dify")
 # ---------------------------------------------------------------------------
 # 3. API 鉴权 Token（需与 Dify 后台「外部知识库」配置的 API Key 保持一致）
 # ---------------------------------------------------------------------------
-API_TOKEN: str = os.getenv("DIFY_API_TOKEN", "change-me")
+#: 占位默认值。这是公开字符串，等于没有鉴权，因此启动时必须拒绝（见 _assert_token_configured）。
+_DEFAULT_API_TOKEN = "change-me"
+API_TOKEN: str = os.getenv("DIFY_API_TOKEN", _DEFAULT_API_TOKEN).strip()
+
+
+def _assert_token_configured() -> None:
+    """启动自检：Token 未配置 / 仍是占位值时直接拒绝启动。
+
+    "默认不安全 + 文档里提醒"不算安全设计：判据是「配置错误时是否 fail-safe」。
+    这里把最常见的配置错误（忘了设 DIFY_API_TOKEN）变成一次响亮的启动失败，
+    而不是一个静默的全开放服务。
+    """
+    if not API_TOKEN or API_TOKEN == _DEFAULT_API_TOKEN:
+        raise RuntimeError(
+            "DIFY_API_TOKEN 未配置（当前值：" + (API_TOKEN or "<empty>") + "）。"
+            "默认占位值等于无鉴权，服务拒绝启动。请在 .env 或环境变量中设置一个强随机 Token，"
+            "并与 Dify「外部知识库 API Key」保持一致。"
+        )
+    if len(API_TOKEN) < 16:
+        logger.warning(
+            "[Security] DIFY_API_TOKEN 长度 < 16，建议使用至少 16 位的随机串。"
+        )
 
 # ---------------------------------------------------------------------------
 # 3b. 会话管理器（服务端对话记忆）
@@ -768,10 +800,85 @@ def _initialize_retrieval_engine() -> None:
     logger.info("=== PCB-RAG 初始化完成，开始服务 ===")
 
 
+_lexical_reload_lock = threading.Lock()
+_lexical_stamp_seen: Optional[float] = None
+#: 入库脚本结束时会写入该 sentinel（见 ingest.py 末尾），mtime 变化即代表语料变了
+LEXICAL_RELOAD_STAMP = os.getenv(
+    "LEXICAL_RELOAD_STAMP", os.getenv("LEXICAL_CACHE_PATH", "./data/lexical_corpus.jsonl") + ".stamp"
+)
+
+
+def _lexical_stamp_mtime() -> Optional[float]:
+    try:
+        return Path(LEXICAL_RELOAD_STAMP).stat().st_mtime
+    except OSError:
+        return None
+
+
+def _rebuild_lexical_index_worker() -> None:
+    """后台重建 BM25（失败则保留旧索引，绝不让检索因此不可用）。"""
+    try:
+        index = _app_state.get("index")
+        if index is None:
+            return
+        logger.info("[BM25] 检测到语料变更，后台重建词法索引...")
+        new_index = _load_or_build_bm25(index.storage_context.vector_store)
+        if new_index is not None:
+            _app_state["bm25_index"] = new_index
+            counter("lexical.reloaded", 1)
+            logger.info(f"[BM25] 词法索引已重载，文档数={len(new_index.docs)}")
+        else:
+            logger.warning("[BM25] 词法索引重建失败，继续使用旧索引")
+    except Exception as e:
+        logger.warning(f"[BM25] 词法索引重载异常（继续使用旧索引）: {e}")
+    finally:
+        try:
+            _lexical_reload_lock.release()
+        except RuntimeError:
+            pass
+
+
+def _maybe_reload_lexical_index() -> None:
+    """sentinel mtime 变新则异步重建 BM25；本次检索继续用旧索引，不阻塞请求。
+
+    为什么必须有这一步：长驻 API 进程只在启动时构建一次 BM25，入库脚本删缓存
+    对它毫无影响 —— 新文档因此缺失整条稀疏路投票，在融合中被系统性降权。
+    成本是每次检索一次 ``stat``，可忽略。
+    """
+    global _lexical_stamp_seen
+
+    stamp = _lexical_stamp_mtime()
+    if stamp is None:
+        return
+    if _lexical_stamp_seen is not None and stamp <= _lexical_stamp_seen:
+        return
+    if _lexical_stamp_seen is None and _app_state.get("bm25_index") is None:
+        # 启动时就没有词法索引（LEXICAL_ENABLED=0 等），不必热重载
+        _lexical_stamp_seen = stamp
+        return
+    if not _lexical_reload_lock.acquire(blocking=False):
+        return  # 已有一次重建在进行
+    _lexical_stamp_seen = stamp  # 先记账，避免同一变更触发多次重建
+    threading.Thread(
+        target=_rebuild_lexical_index_worker, name="bm25-reload", daemon=True
+    ).start()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI 生命周期：启动时完成初始化，关闭时释放资源。"""
+    # 先做配置自检（fail-fast），再做昂贵的模型 / Milvus 初始化
+    _assert_token_configured()
+    _acl_problem = validate_acl_security()
+    if _acl_problem:
+        raise RuntimeError(_acl_problem)
+    if not CORS_ALLOW_ORIGINS:
+        logger.info("[CORS] 未配置 CORS_ALLOW_ORIGINS，不下发跨域头（同源 / 服务端调用不受影响）")
+
     _initialize_retrieval_engine()
+
+    global _lexical_stamp_seen
+    _lexical_stamp_seen = _lexical_stamp_mtime()  # 记录词法热重载基线
 
     _session_cleanup_task = asyncio.create_task(_session_cleanup_worker())
 
@@ -812,12 +919,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS 中间件：允许 Dify 等外部服务跨域调用
+# CORS 中间件
+#
+# 默认不开通配。威胁模型：本服务是 Bearer 认证、不使用 cookie，浏览器不会自动
+# 携带 Authorization，因此 allow_origins=["*"] 不构成直接的凭证泄露；但它没有任何
+# 理由常开，而且一旦将来改成 cookie 认证（或打开 allow_credentials），通配会立刻
+# 变成严重漏洞。所以这里改成显式白名单，并显式关闭 credentials。
+CORS_ALLOW_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,   # 空列表 = 不下发任何 CORS 头（浏览器默认阻止跨域）
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-Trace-Id"],
 )
 
 
@@ -891,8 +1007,14 @@ class RetrievalRes(BaseModel):
 # 7. 鉴权依赖
 # ---------------------------------------------------------------------------
 def verify_token(authorization: str = Header(None)):
-    """验证 Bearer Token，与 Dify 后台配置保持一致。"""
-    if not authorization or authorization != f"Bearer {API_TOKEN}":
+    """验证 Bearer Token，与 Dify 后台配置保持一致。
+
+    用 ``secrets.compare_digest`` 做常量时间比较。说明威胁模型：跨网络的计时攻击
+    在实践中极难成立（抖动远大于单次比较的差异），这条属于「成本极低、顺手就该修」，
+    不是高危漏洞。
+    """
+    expected = f"Bearer {API_TOKEN}"
+    if not authorization or not secrets.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing API token.")
 
 
@@ -912,6 +1034,9 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
       6. Chunk 上下文扩展（邻近 Chunk 合并）
       7. 按得分阈值过滤 + top_k 截断
     """
+    # 入库后 BM25 会被自动重载（按 sentinel mtime）；本次请求仍可能用到旧索引
+    _maybe_reload_lexical_index()
+
     index       = _app_state["index"]
     bm25_index  = _app_state["bm25_index"]
     rerank      = _app_state["rerank"]
@@ -1237,6 +1362,14 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
         except Exception as e:
             logger.warning(f"[ChunkExpand] 扩展失败，跳过: {e}")
 
+    # ── Step 6b: GraphRAG 图检索融合 + 邻域事实扩展 ──────────────────────
+    # 放在阈值 / 截断之前：图证据必须和主结果一起参与 top_k 竞争，
+    # 否则会被截断悄悄丢掉。放在 _retrieve_nodes 里而不是只放在 /retrieval，
+    # 是因为 /api/ask、/api/chat 等端点直接调本函数 —— 早先它们既拿不到图增强，
+    # 也绕过了内存侧权限复核。
+    if GRAPH_RAG_ENABLED and retrieved_nodes:
+        retrieved_nodes = _graph_augment_nodes(user_query, retrieved_nodes)
+
     # ── Step 7: 按得分阈值过滤 + top_k 截断 ──────────────────────────────
     # RRF 分数（约 0.01~0.05）与 rerank 概率（0~1）量纲不同，直接套用阈值会误过滤
     effective_threshold = score_threshold
@@ -1246,6 +1379,9 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
 
     # 扩展上下文节点享有独立配额，避免被 top_k 直接截断导致扩展功能失效
     max_expand_extra = max(0, int(os.getenv("CHUNK_EXPAND_MAX_EXTRA", "5")))
+    # 图证据同样独立配额：它的规则分（0.2~1.0）与 rerank 概率不同量纲，
+    # 若和主结果一起竞争 top_k，会凭分数把真实检索结果挤出去。
+    max_graph_extra = max(0, int(os.getenv("GRAPH_EVIDENCE_MAX", "2")))
     ordered = sorted(
         retrieved_nodes,
         key=lambda x: -(float(x.score) if x.score is not None else 0.0),
@@ -1254,6 +1390,7 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
     filtered: List[NodeWithScore] = []
     primary_count = 0
     extra_count = 0
+    graph_count = 0
     for nws in ordered:
         score = float(nws.score) if nws.score is not None else 0.0
         if effective_threshold > 0.0 and score < effective_threshold:
@@ -1262,15 +1399,30 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
         content = node.get_content(metadata_mode=MetadataMode.NONE).strip()
         if not content:
             continue
-        if (node.metadata or {}).get("is_context_expansion"):
+        meta = node.metadata or {}
+        if meta.get("is_context_expansion"):
             if extra_count >= max_expand_extra:
                 continue
             extra_count += 1
+        elif meta.get("graph_evidence"):
+            if graph_count >= max_graph_extra:
+                continue
+            graph_count += 1
         else:
             if primary_count >= top_k:
                 continue
             primary_count += 1
         filtered.append(nws)
+
+    # ── Step 8: 权限兜底复核（安全控制必须在最低层强制执行）──────────────
+    # 向量库过滤条件若被服务端忽略 / 编译出错被吞，这里是最后一道拦截。
+    # 放在 _retrieve_nodes 末尾意味着"任何返回给用户的 node 都经过复核"，
+    # 而不是依赖每个端点记得调用 filter_nodes（/api/ask 曾经就是漏的那个）。
+    if ACL_ENABLED:
+        before_acl = len(filtered)
+        filtered = filter_nodes(filtered, current_principal())
+        if len(filtered) < before_acl:
+            logger.info(f"[ACL] 权限复核过滤 {before_acl - len(filtered)} 条无权访问的记录")
 
     t_total = time.time()
     logger.info(f"[Timing] 检索总耗时: {t_total - t_start:.2f}s → {len(filtered)} 条 "
@@ -1290,7 +1442,11 @@ def _graph_augment_nodes(query: str, nodes: List[NodeWithScore]) -> List[NodeWit
         with span("graph.augment", query=query[:120]):
             graph_nodes = retriever.retrieve(query, top_k=GRAPH_TOP_K)
             if graph_nodes:
-                nodes = fuse_with_graph(nodes, graph_nodes, graph_weight=GRAPH_WEIGHT)
+                # 这里在 rerank 之后调用：只让图结果按 RRF 排名参与排序，
+                # 不要覆盖已经量纲良好的 rerank 概率（overwrite_scores=False）
+                nodes = fuse_with_graph(
+                    nodes, graph_nodes, graph_weight=GRAPH_WEIGHT, overwrite_scores=False
+                )
                 logger.info(f"[GraphRAG] 图检索补充 {len(graph_nodes)} 条关系证据")
             nodes = expand_nodes_with_graph(
                 nodes, graph, max_extra=int(os.getenv("GRAPH_EXPAND_MAX", "2"))
@@ -1333,17 +1489,10 @@ def retrieve_chunks(user_query: str, top_k: int = 5, score_threshold: float = 0.
         logger.info(f"[Cache] 检索命中缓存（query={user_query[:40]}...）")
         return [Record(**item) for item in cached.get("records", [])]
 
+    # GraphRAG 融合 / 邻域扩展与 ACL 兜底复核已下沉到 _retrieve_nodes 末尾，
+    # 所有端点（/retrieval、/api/ask、/api/chat、/api/ask/stream）共享同一条链路，
+    # 不会再出现"某个端点少了兜底或少了图增强"的分叉。
     nodes = _retrieve_nodes(user_query, top_k=top_k, score_threshold=score_threshold)
-
-    # P1-2 GraphRAG：图检索融合 + 邻域事实扩展
-    nodes = _graph_augment_nodes(user_query, nodes)
-
-    # P2 权限复核：向量库过滤条件若被服务端忽略，这里做内存侧兜底拦截
-    if ACL_ENABLED:
-        before_acl = len(nodes)
-        nodes = filter_nodes(nodes, current_principal())
-        if len(nodes) < before_acl:
-            logger.info(f"[ACL] 权限复核过滤 {before_acl - len(nodes)} 条无权访问的记录")
 
     # P2 上下文压缩：近似去重 + 抽取式压缩 + 字符预算裁剪
     if COMPRESSION_ENABLED:
@@ -2089,14 +2238,33 @@ def cleanup_sessions(_: str = Depends(verify_token)):
 # ---------------------------------------------------------------------------
 # 12. 健康检查端点（供 Dify 或 AD 监控服务状态）
 # ---------------------------------------------------------------------------
-@app.get("/health", summary="健康检查")
+@app.get("/health", summary="健康检查（LB / 探针用，不含敏感配置）")
 def health_check():
+    """轻量健康检查：只回答「进程活着、依赖是否就绪」。
+
+    早先这里返回 describe_acl() / describe_backends() / cache 统计等明细，而这些
+    端点没有鉴权 —— 租户字段名、admin 角色名、匿名租户名、后端 URL、缓存命中数
+    都会对匿名调用者暴露。现在拆成两个端点：
+
+    - ``/health``：只给 LB / k8s 探针用，无敏感信息、无需鉴权
+    - ``/health/detail``：完整配置摘要，需要 Bearer Token
+    """
+    return {
+        "status": "ok",
+        "index_ready": "index" in _app_state,
+        "bm25_ready": _app_state.get("bm25_index") is not None,
+        "rerank_ready": _app_state.get("rerank") is not None,
+    }
+
+
+@app.get("/health/detail", summary="健康检查明细（需鉴权）")
+def health_detail(_: str = Depends(verify_token)):
     sm = get_session_manager()
     sessions = sm.list_sessions()
     return {
         "status": "ok",
         "index_ready": "index" in _app_state,
-        "bm25_ready":  _app_state.get("bm25_index") is not None,
+        "bm25_ready": _app_state.get("bm25_index") is not None,
         "rerank_ready": _app_state.get("rerank") is not None,
         "recall_k": _app_state.get("recall_k"),
         "session_manager": {

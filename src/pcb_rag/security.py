@@ -92,8 +92,17 @@ ACL_HEADER_USER = os.getenv("ACL_HEADER_USER", "X-User-Id").strip()
 ACL_HEADER_TENANT = os.getenv("ACL_HEADER_TENANT", "X-Tenant-Id").strip()
 ACL_HEADER_ROLES = os.getenv("ACL_HEADER_ROLES", "X-User-Roles").strip()
 ACL_HEADER_GROUPS = os.getenv("ACL_HEADER_GROUPS", "X-User-Groups").strip()
-# 允许客户端直接指定租户（单机 / 内网场景默认开启；生产建议关闭并由网关注入）
-ACL_TRUST_HEADERS = _env_bool("ACL_TRUST_HEADERS", True)
+# 是否信任客户端自报的身份头（X-User-Id / X-Tenant-Id / X-User-Roles / X-User-Groups）。
+#
+# 默认 **关闭**：打开 ACL 后若同时信任客户端头，任何调用方只要自报
+# ``X-User-Roles: admin`` 就能读全库 —— 而 ``build_acl_filters`` 对 admin 返回
+# None（全放行）。安全设计的判据是「配置错误时是否 fail-safe」，早先的默认值把
+# 最常见的一种配置错误（只打开 ACL、忘了关信任头）变成了静默全开。
+# 需要由网关注入身份时，显式设 ACL_TRUST_HEADERS=1，由网关剥离客户端同名头。
+ACL_TRUST_HEADERS = _env_bool("ACL_TRUST_HEADERS", False)
+# 确认为"网关已剥离客户端自报头"的显式开关。缺省时若 ACL_ENABLED 与
+# ACL_TRUST_HEADERS 同时为真，启动会拒绝（fail-fast），避免自以为安全。
+ACL_TRUST_HEADERS_ACK = _env_bool("ACL_TRUST_HEADERS_ACK", False)
 # 未携带任何身份信息时的兜底租户（ACL_ENABLED=1 时用于「匿名用户」）
 ACL_ANONYMOUS_TENANT = os.getenv("ACL_ANONYMOUS_TENANT", "public").strip() or "public"
 # 段分隔符
@@ -495,3 +504,25 @@ def describe_acl() -> Dict[str, Any]:
         "audit": ACL_AUDIT_ENABLED,
         "anonymous_tenant": ACL_ANONYMOUS_TENANT,
     }
+
+
+def validate_acl_security() -> Optional[str]:
+    """启动自检：把「配置错误导致静默全开」变成一次性拒绝启动。
+
+    危险组合：``ACL_ENABLED=1`` + ``ACL_TRUST_HEADERS=1``。此时任何客户端自报
+    ``X-User-Roles: admin`` 即读全库；而 ``build_acl_filters`` 对 admin 返回 None
+    表示全放行。要求显式设置 ``ACL_TRUST_HEADERS_ACK=1`` 来确认"网关已剥离
+    客户端同名头"，否则返回错误信息由调用方拒绝启动。
+
+    Returns:
+        None 表示配置安全；否则返回错误描述。
+    """
+
+    if ACL_ENABLED and ACL_TRUST_HEADERS and not ACL_TRUST_HEADERS_ACK:
+        return (
+            "ACL_ENABLED=1 且 ACL_TRUST_HEADERS=1：服务将无条件信任客户端自报的 "
+            f"{ACL_HEADER_ROLES} 等身份头，自报 admin 即可读取全库。"
+            "若确实由网关注入身份并已剥离客户端同名头，请显式设置 "
+            "ACL_TRUST_HEADERS_ACK=1 确认；否则请关闭 ACL_TRUST_HEADERS。"
+        )
+    return None

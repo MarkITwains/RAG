@@ -36,9 +36,14 @@ for _path in (str(ROOT / "src"), str(ROOT)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+from pcb_rag.env_loader import load_project_env  # noqa: E402
+
+load_project_env()  # 直接 `python eval/evaluate.py` 时也能读到 .env 里的 API 配置
+
 from pcb_rag.api_clients import build_llm  # noqa: E402
 from eval.metrics import (  # noqa: E402
     ALL_METRICS,
+    JUDGE_FAILURE_RATE_THRESHOLD,
     evaluate_case,
     format_summary,
     summarize,
@@ -269,8 +274,15 @@ def run(
             item["ground_truth"] = ground_truth
             results.append(item)
 
-            score_brief = ", ".join(f"{k}={v:.2f}" for k, v in scores.items() if k != "overall")
+            # 指标可能是 None（判卷失败 = 无法判定），不能直接按 float 格式化
+            score_brief = ", ".join(
+                f"{k}={v:.2f}" if isinstance(v, (int, float)) else f"{k}=n/a"
+                for k, v in scores.items()
+                if k not in {"overall", "judge_failed"}
+            )
             print(f"  [{idx}/{len(rows)}] {question[:36]}...  {score_brief}")
+            if scores.get("judge_failed"):
+                print(f"      ↳ 判卷失败（无法判定，不计入均值）: {', '.join(scores['judge_failed'])}")
         except Exception as exc:
             item["error"] = str(exc)
             results.append(item)
@@ -289,6 +301,13 @@ def run(
             "mode": "retrieval" if retrieval_only else "full",
             "metrics": ["context_precision", "context_recall"] if retrieval_only else metrics,
             "elapsed_seconds": round(elapsed, 1),
+            # 判卷可用性：数字只有在 judge 正常工作时才有意义，因此把状态写进报告
+            "judge": {
+                "failures": summary.get("judge_failures", 0),
+                "failure_rate": summary.get("judge_failure_rate", 0.0),
+                "failure_rate_threshold": JUDGE_FAILURE_RATE_THRESHOLD,
+                "invalid": summary.get("invalid", False),
+            },
         },
         "summary": summary,
         "rows": results,
