@@ -39,6 +39,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
+from pcb_rag.env_loader import load_project_env  # noqa: E402
+
+load_project_env()  # 直接运行本脚本时也能读到 .env 里的 API 配置
+
 from pcb_rag.api_clients import build_llm  # noqa: E402
 
 
