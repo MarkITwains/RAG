@@ -333,7 +333,18 @@ def build_acl_filters(principal: Optional[Principal]) -> Optional[Any]:
 
 
 def merge_filters(base: Optional[Any], extra: Optional[Any]) -> Optional[Any]:
-    """以 AND 语义合并两组过滤条件（任一侧为空时返回另一侧）。"""
+    """以 AND 语义合并两组过滤条件（任一侧为空时返回另一侧）。
+
+    注意：``MetadataFilters`` 自身带有 ``condition``（AND / OR）。合并时**不能**把子组的
+    ``filters`` 摊平进外层 AND —— 否则 ``build_acl_filters`` 产出的
+    ``tenant == X OR visibility == public`` 会退化成 ``tenant == X AND visibility == public``，
+    导致用户对本租户的私有文档全部不可见。这里的策略：
+
+    - 子组本身就是 AND 组 → 可以安全摊平（AND 满足结合律）
+    - 子组是 OR 组（或单个 ``MetadataFilter``）→ 作为一个整体挂到外层 AND 之下（嵌套）
+
+    llama-index 的 Milvus 适配器支持嵌套 ``MetadataFilters``，会编译成带括号的表达式。
+    """
 
     if base is None:
         return extra
@@ -342,16 +353,31 @@ def merge_filters(base: Optional[Any], extra: Optional[Any]) -> Optional[Any]:
 
     from llama_index.core.vector_stores.types import FilterCondition, MetadataFilters
 
-    def _as_list(node: Any) -> List[Any]:
+    def _as_and_operands(node: Any) -> List[Any]:
+        """把一侧拆成可以直接挂到外层 AND 下的操作数列表。"""
         if node is None:
             return []
         if isinstance(node, MetadataFilters):
-            return list(node.filters)
+            if not node.filters:
+                return []
+            cond = getattr(node, "condition", None)
+            if cond is None or cond == FilterCondition.AND:
+                # AND 组可以摊平（结合律），子元素可能仍是嵌套组，保持原样
+                return list(node.filters)
+            if cond == FilterCondition.OR and len(node.filters) == 1:
+                # 单元素 OR 组等价于该元素本身（NOT 组不能这样拆）
+                return [node.filters[0]]
+            # OR / NOT 组：整体作为一个操作数，保留其内部语义
+            return [node]
         return [node]
 
-    merged = _as_list(base) + _as_list(extra)
+    merged = _as_and_operands(base) + _as_and_operands(extra)
+    if not merged:
+        return None
     if len(merged) == 1:
-        return merged[0]
+        only = merged[0]
+        # 顶层必须是 MetadataFilters（下游 retriever 期望该类型）
+        return only if isinstance(only, MetadataFilters) else MetadataFilters(filters=[only], condition=FilterCondition.AND)
     return MetadataFilters(filters=merged, condition=FilterCondition.AND)
 
 

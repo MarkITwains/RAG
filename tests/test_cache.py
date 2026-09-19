@@ -196,3 +196,37 @@ class TestConcurrency:
 
         assert errors == []
         assert cache.stats()["size"] <= 64
+
+
+# ---------------------------------------------------------------------------
+# 回归：缓存必须按 scope（租户 / 主体）隔离，语义命中也不能跨 scope
+# ---------------------------------------------------------------------------
+class TestScopeIsolation:
+    def test_exact_hit_is_scoped(self):
+        cache = SemanticCache()
+        cache.set("4层板阻抗", "acme-result", scope="acme")
+        assert cache.get("4层板阻抗", scope="acme") == "acme-result"
+        assert cache.get("4层板阻抗", scope="globex") is None
+        assert cache.get("4层板阻抗") is None  # 空 scope 也不能读到别人的
+
+    def test_semantic_hit_is_scoped(self):
+        cache = SemanticCache(similarity_threshold=0.9)
+        vec = [1.0, 0.0, 0.0]
+        cache.set("q-a", "acme-result", embedding=vec, scope="acme")
+        # 同 scope、不同文本、向量完全一致 → 语义命中
+        assert cache.get("q-b", embedding=vec, scope="acme") == "acme-result"
+        # 不同 scope、同一向量 → 必须 miss
+        assert cache.get("q-b", embedding=vec, scope="globex") is None
+
+    def test_same_query_different_scopes_coexist(self):
+        cache = SemanticCache()
+        cache.set("q", "A", scope="acme")
+        cache.set("q", "B", scope="globex")
+        assert cache.get("q", scope="acme") == "A"
+        assert cache.get("q", scope="globex") == "B"
+        assert cache.stats()["size"] == 2
+
+    def test_default_scope_backward_compatible(self):
+        cache = SemanticCache()
+        cache.set("q", "v")
+        assert cache.get("q") == "v"

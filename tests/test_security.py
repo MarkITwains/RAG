@@ -211,3 +211,83 @@ class TestDescribeAcl:
         assert "enabled" in info
         assert info["tenant_field"] == security.ACL_TENANT_FIELD
         assert isinstance(info["admin_roles"], list)
+
+
+# ---------------------------------------------------------------------------
+# 回归：merge_filters 不能把 ACL 的 OR 组摊平进外层 AND
+# ---------------------------------------------------------------------------
+class TestMergeFilters:
+    @pytest.fixture
+    def li(self):
+        pytest.importorskip("llama_index.core")
+        from llama_index.core.vector_stores.types import (
+            FilterCondition,
+            FilterOperator,
+            MetadataFilter,
+            MetadataFilters,
+        )
+        return SimpleNamespace(
+            FilterCondition=FilterCondition,
+            FilterOperator=FilterOperator,
+            MetadataFilter=MetadataFilter,
+            MetadataFilters=MetadataFilters,
+        )
+
+    def _biz(self, li):
+        return li.MetadataFilters(
+            filters=[li.MetadataFilter(key="vendor", operator=li.FilterOperator.EQ, value="JLC")],
+            condition=li.FilterCondition.AND,
+        )
+
+    def test_none_passthrough(self, li):
+        biz = self._biz(li)
+        assert security.merge_filters(None, None) is None
+        assert security.merge_filters(biz, None) is biz
+        assert security.merge_filters(None, biz) is biz
+
+    def test_or_group_is_kept_as_nested_subtree(self, acl_on, li):
+        biz = self._biz(li)
+        acl = security.build_acl_filters(Principal(tenant_id="acme"))
+        assert acl is not None and acl.condition == li.FilterCondition.OR
+
+        merged = security.merge_filters(biz, acl)
+        assert isinstance(merged, li.MetadataFilters)
+        assert merged.condition == li.FilterCondition.AND
+        # 顶层应是 [vendor==JLC, (tenant==acme OR visibility==public)]，共 2 个操作数
+        assert len(merged.filters) == 2
+        nested = [f for f in merged.filters if isinstance(f, li.MetadataFilters)]
+        assert len(nested) == 1
+        assert nested[0].condition == li.FilterCondition.OR
+        assert {f.key for f in nested[0].filters} == {
+            security.ACL_TENANT_FIELD,
+            security.ACL_VISIBILITY_FIELD,
+        }
+
+    def test_milvus_expression_keeps_or_semantics(self, acl_on, li):
+        """真实编译成 Milvus 表达式：私有文档（tenant 命中但非 public）必须能通过。"""
+        pytest.importorskip("llama_index.vector_stores.milvus")
+        from llama_index.vector_stores.milvus.utils import parse_standard_filters
+
+        merged = security.merge_filters(self._biz(li), security.build_acl_filters(Principal(tenant_id="acme")))
+        _, expr = parse_standard_filters(merged)
+        # 摊平的错误形态是 "vendor == 'JLC' and tenant_id == 'acme' and visibility == 'public'"
+        assert " or " in expr
+        assert expr.count(" and ") == 1
+
+    def test_and_groups_are_flattened(self, li):
+        a = self._biz(li)
+        b = li.MetadataFilters(
+            filters=[li.MetadataFilter(key="layer_count", operator=li.FilterOperator.EQ, value=4)],
+            condition=li.FilterCondition.AND,
+        )
+        merged = security.merge_filters(a, b)
+        assert merged.condition == li.FilterCondition.AND
+        assert [f.key for f in merged.filters] == ["vendor", "layer_count"]
+
+    def test_single_filter_is_wrapped(self, li):
+        single = li.MetadataFilter(key="vendor", operator=li.FilterOperator.EQ, value="JLC")
+        merged = security.merge_filters(single, None)
+        assert merged is single  # 一侧为空时原样返回
+        merged2 = security.merge_filters(single, self._biz(li))
+        assert isinstance(merged2, li.MetadataFilters)
+        assert len(merged2.filters) == 2

@@ -68,10 +68,15 @@ class _Entry:
     created_at: float
     embedding: Optional[list[float]] = None
     query: str = ""
+    scope: str = ""
 
 
 class SemanticCache:
-    """线程安全的语义缓存。"""
+    """线程安全的语义缓存。
+
+    ``scope`` 用于做租户 / 主体隔离：精确匹配与语义匹配都只在同一 ``scope`` 内进行，
+    否则「语义相近」的查询会把 A 租户的检索结果返回给 B 租户。
+    """
 
     def __init__(
         self,
@@ -106,12 +111,23 @@ class SemanticCache:
             self._store.pop(k, None)
 
     # ------------------------------------------------------------------ 读写
-    def get(self, query: str, embedding: Optional[Sequence[float]] = None) -> Optional[Any]:
-        """命中返回缓存值，未命中返回 None。"""
+    @staticmethod
+    def _make_key(query: str, scope: str) -> str:
+        # scope 放前缀并用不可能出现在 normalize 结果里的分隔符隔开
+        return f"{scope}\x1f{normalize_query(query)}"
+
+    def get(
+        self,
+        query: str,
+        embedding: Optional[Sequence[float]] = None,
+        scope: str = "",
+    ) -> Optional[Any]:
+        """命中返回缓存值，未命中返回 None。只在相同 ``scope`` 内查找。"""
         if not self._enabled or not query:
             return None
 
-        key = normalize_query(query)
+        scope = scope or ""
+        key = self._make_key(query, scope)
         now = time.time()
 
         with self._lock:
@@ -124,7 +140,7 @@ class SemanticCache:
                 self._hits_exact += 1
                 return entry.value
 
-            # 2) 语义匹配
+            # 2) 语义匹配（同 scope 内）
             if embedding is not None:
                 probe = 0
                 best_key: Optional[str] = None
@@ -134,7 +150,7 @@ class SemanticCache:
                     if probe > SEMANTIC_CACHE_MAX_PROBE:
                         break
                     cand = self._store[k]
-                    if cand.embedding is None:
+                    if cand.scope != scope or cand.embedding is None:
                         continue
                     score = cosine_similarity(embedding, cand.embedding)
                     if score > best_score:
@@ -154,17 +170,20 @@ class SemanticCache:
         query: str,
         value: Any,
         embedding: Optional[Sequence[float]] = None,
+        scope: str = "",
     ) -> None:
         """写入缓存；``embedding`` 为空时只支持精确匹配。"""
         if not self._enabled or not query:
             return
 
-        key = normalize_query(query)
+        scope = scope or ""
+        key = self._make_key(query, scope)
         entry = _Entry(
             value=value,
             created_at=time.time(),
             embedding=list(embedding) if embedding is not None else None,
             query=query,
+            scope=scope,
         )
         with self._lock:
             self._purge_expired_locked(time.time())

@@ -1300,17 +1300,35 @@ def _graph_augment_nodes(query: str, nodes: List[NodeWithScore]) -> List[NodeWit
     return nodes
 
 
+def _cache_scope_for_principal() -> str:
+    """语义缓存的隔离域。
+
+    缓存里存的是**已经过 ACL 过滤**的检索结果，必须按访问主体隔离：
+    - ACL 关闭：所有请求共享一个域（原行为）
+    - 管理员：单独一个域（能看到全部数据）
+    - 普通用户：租户 + user_id + 角色/组指纹。带 user_id 是因为 owner 级放行
+      会让同租户、同角色的两个人看到不同的私有文档。
+    """
+    if not ACL_ENABLED:
+        return ""
+    p = current_principal()
+    if p.is_admin:
+        return "admin"
+    return f"{p.tenant_id.lower()}|{p.user_id.lower()}|{p.fingerprint()}"
+
+
 def retrieve_chunks(user_query: str, top_k: int = 5, score_threshold: float = 0.0) -> List[Record]:
     """
     完整执行 PCB-RAG 检索管道，返回适配 Dify 的 Record 列表。
     内部调用 _retrieve_nodes 获取 NodeWithScore，再转换为 Record。
-    带语义缓存：相同或语义相近的查询直接复用结果。
+    带语义缓存：相同或语义相近的查询直接复用结果（按访问主体隔离，避免跨租户泄漏）。
     """
     cache = get_cache("retrieval")
+    cache_scope = _cache_scope_for_principal()
     cache_key = f"{user_query}|top_k={top_k}|thr={score_threshold}"
     query_vec = embed_query_for_cache(user_query)
 
-    cached = cache.get(cache_key, query_vec)
+    cached = cache.get(cache_key, query_vec, scope=cache_scope)
     if isinstance(cached, dict) and cached.get("params") == [top_k, score_threshold]:
         logger.info(f"[Cache] 检索命中缓存（query={user_query[:40]}...）")
         return [Record(**item) for item in cached.get("records", [])]
@@ -1357,6 +1375,7 @@ def retrieve_chunks(user_query: str, top_k: int = 5, score_threshold: float = 0.
         cache_key,
         {"params": [top_k, score_threshold], "records": [r.model_dump() for r in records]},
         query_vec,
+        scope=cache_scope,
     )
     logger.info(f"[Result] 返回 {len(records)} 条记录（query={user_query[:40]}...）")
     return records

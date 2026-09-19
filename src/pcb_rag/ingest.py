@@ -3197,41 +3197,66 @@ def _diff_documents(documents: list, manifest: dict) -> tuple:
 
 
 def _delete_chunks_by_doc_node_id(vector_store, doc_node_id: str) -> int:
-    """按 doc_node_id 删除该文档的所有 chunk（用于变更覆盖与文档删除）。"""
+    """按 doc_node_id 删除该文档的所有 chunk（用于变更覆盖与文档删除）。
+
+    ``MilvusVectorStore.client`` 是**同步**的 ``MilvusClient``（异步版是 ``.aclient``）。
+    早期实现对同步 ``client.delete()`` 的返回值做了 ``await``，触发
+    ``TypeError: object dict can't be used in 'await' expression`` 并被兜底 ``except`` 吞掉，
+    结果是“删除”从未真正执行过。这里直接走同步接口。
+    """
+    if not doc_node_id:
+        return 0
     try:
         client = getattr(vector_store, "client", None)
         if client is None:
             return 0
-
-        async def _do_delete():
-            return await client.delete(
-                collection_name=COLLECTION,
-                filter=f'doc_node_id == "{doc_node_id}"',
-            )
-
-        try:
-            asyncio.get_running_loop()
-            has_running_loop = True
-        except RuntimeError:
-            has_running_loop = False
-
-        if has_running_loop:
-            result = asyncio.get_event_loop().run_until_complete(_do_delete())
-        else:
-            loop = asyncio.new_event_loop()
-            try:
-                asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(_do_delete())
-            finally:
-                asyncio.set_event_loop(None)
-                loop.close()
-
+        # 防御：doc_node_id 是 md5 hex，不应含引号；仍做一次转义避免过滤表达式注入
+        safe_id = str(doc_node_id).replace('"', '\\"')
+        result = client.delete(
+            collection_name=COLLECTION,
+            filter=f'doc_node_id == "{safe_id}"',
+        )
         if isinstance(result, dict):
             return int(result.get("delete_count", 0) or 0)
+        # 旧版 pymilvus 可能返回 list[pk]
+        if isinstance(result, (list, tuple)):
+            return len(result)
         return 0
     except Exception as e:
         print(f"⚠️  删除文档 chunk 失败 ({doc_node_id[:8]}...): {e}")
         return 0
+
+
+def _ensure_doc_node_id(nodes: list, documents: list) -> list:
+    """保证每个 chunk 的 metadata 都带 ``doc_node_id``。
+
+    Parent-Child 切块会自己写入该字段；结构感知 / 默认 SentenceSplitter 等模式不会。
+    增量入库依赖该字段做「按文档删除」，缺失时变更 / 删除文档的旧 chunk 永远清不掉。
+    """
+    by_doc_id = {}
+    for d in documents:
+        did = getattr(d, "id_", None)
+        if did:
+            by_doc_id[str(did)] = _doc_node_id_of(d)
+
+    patched = 0
+    for n in nodes:
+        meta = getattr(n, "metadata", None)
+        if meta is None:
+            continue
+        if meta.get("doc_node_id"):
+            continue
+        ref = getattr(n, "ref_doc_id", None)
+        if not ref:
+            src = getattr(n, "source_node", None)
+            ref = getattr(src, "node_id", None) if src is not None else None
+        target = by_doc_id.get(str(ref)) if ref else None
+        if target:
+            meta["doc_node_id"] = target
+            patched += 1
+    if patched:
+        print(f"🔖 已为 {patched} 个 chunk 补齐 doc_node_id（供增量删除使用）")
+    return nodes
 
 
 def _update_knowledge_graph(nodes: list, stale_doc_ids=None) -> None:
@@ -3430,6 +3455,9 @@ def main():
         # 使用配置的node_parser
         nodes = Settings.node_parser.get_nodes_from_documents(to_process, show_progress=True)
     
+    # 所有切块模式统一补齐 doc_node_id（增量删除、Contextual Retrieval 都依赖它）
+    nodes = _ensure_doc_node_id(nodes, to_process)
+
     # Contextual Retrieval：为每个 chunk 注入语境前缀，提升脱离上下文片段的召回
     nodes = apply_contextual_retrieval(nodes, to_process)
 
@@ -3444,17 +3472,21 @@ def main():
         min_len = min(chunk_lengths)
         print(f"📊 Chunk统计: 数量={len(chunk_lengths)}, 平均长度={avg_len:.0f}, 最小={min_len}, 最大={max_len}")
     
-    # 增量写入：只插入本次新增 / 变更文档的 chunk（相同 id 会被 upsert 覆盖）
+    # 增量写入的顺序必须是「先删旧、再插新」：
+    #   变更文档的 doc_node_id 前后不变，若先 insert 再按 doc_node_id 删除，
+    #   刚写入的新 chunk 会被一并删掉（等价于把该文档从库里抹掉）。
+    #   先删除只清掉旧数据；随后 insert 写入新版本，delete 与 insert 之间的
+    #   短暂窗口内该文档不可检索，对离线入库脚本可以接受。
+    if stale_doc_ids:
+        deleted_total = 0
+        for nid in dict.fromkeys(stale_doc_ids):  # 去重（PDF 多页共享同一 doc_node_id）
+            deleted_total += _delete_chunks_by_doc_node_id(vector_store, nid)
+        print(f"🗑️  已清理 {len(set(stale_doc_ids))} 个文档的残留 chunk（共 {deleted_total} 条）")
+
+    # 只插入本次新增 / 变更文档的 chunk
     index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
     if nodes:
         index.insert_nodes(nodes)
-
-    # 清理变更 / 已删除文档的残留 chunk
-    if stale_doc_ids:
-        deleted_total = 0
-        for nid in stale_doc_ids:
-            deleted_total += _delete_chunks_by_doc_node_id(vector_store, nid)
-        print(f"🗑️  已清理 {len(stale_doc_ids)} 个文档的残留 chunk（共 {deleted_total} 条）")
 
     # P1-2 GraphRAG：抽取实体关系并维护知识图谱（旁路产物，失败不影响入库）
     _update_knowledge_graph(nodes, stale_doc_ids)
