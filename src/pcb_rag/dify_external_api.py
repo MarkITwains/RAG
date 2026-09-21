@@ -177,6 +177,7 @@ from pcb_rag.observability import (
 # P2：访问控制（多租户 / 角色）
 from pcb_rag.security import (
     ACL_ENABLED,
+    build_acl_filters,
     current_principal,
     describe_acl,
     filter_nodes,
@@ -1021,7 +1022,12 @@ def verify_token(authorization: str = Header(None)):
 # ---------------------------------------------------------------------------
 # 8. 核心检索函数（完整复用 query.py 的优化管道）
 # ---------------------------------------------------------------------------
-def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.0) -> List[NodeWithScore]:
+def _retrieve_nodes(
+    user_query: str,
+    top_k: int = 5,
+    score_threshold: float = 0.0,
+    _no_business_filter: bool = False,
+) -> List[NodeWithScore]:
     """
     完整执行 PCB-RAG 检索管道，返回原始 NodeWithScore 列表（供 LLM 合成使用）。
 
@@ -1050,6 +1056,11 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
 
     # ── Step 1: 提取元数据过滤条件 ────────────────────────────────────────
     clean_q, filters = _extract_query_filters(user_query)
+    if _no_business_filter:
+        # 过滤误杀回退模式：只保留 ACL 权限过滤，业务过滤（eda=xxx 等）全部放弃。
+        # ACL 关闭时为 None = 不过滤。权限边界仍由末尾的 filter_nodes 兜底保证。
+        filters = build_acl_filters(current_principal()) if ACL_ENABLED else None
+        logger.info("[Filter] 回退模式：仅 ACL 过滤（业务过滤已放弃）")
     if filters:
         filter_strs = [f"{f.key}={f.value}" for f in getattr(filters, "filters", [])]
         logger.info(f"[Filter] {'; '.join(filter_strs)}")
@@ -1316,6 +1327,19 @@ def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.
         retrieved_nodes = _weighted_rrf_fuse_three_routes(
             routes, top_n=recall_k, rrf_k=FUSION_RRF_K,
         )
+
+        # ── 过滤误杀回退（2026-09-20 评测事故）────────────────────────────
+        # 业务过滤抽取（如把查询里的 "Allegro" 抽成 eda=allegro）可能把候选池
+        # 清零：答案所在的 chunk 往往没有该元数据字段（标准/规范类文档）。
+        # 实测 80 题中 13 题被 eda 过滤误杀，其中 8 题完全无召回，MRR 0.133 vs
+        # 无过滤题 0.487。此处降级为"无业务过滤整链重检一次"（保留 ACL），
+        # 把硬失败变成有损降级。递归由 _no_business_filter 标志保证只发生一次。
+        if not retrieved_nodes and filters is not None and not _no_business_filter:
+            logger.warning("[Filter] 过滤后候选为空 → 回退为无业务过滤整链重检一次")
+            return _retrieve_nodes(
+                user_query, top_k=top_k, score_threshold=score_threshold,
+                _no_business_filter=True,
+            )
 
         # Rerank 精排
         if rerank is not None:

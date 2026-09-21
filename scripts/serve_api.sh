@@ -16,4 +16,6 @@ if [ -f ".env" ]; then
   set +a
 fi
 
-uvicorn pcb_rag.dify_external_api:app --host 0.0.0.0 --port "${API_PORT:-8000}"
+# --loop asyncio：uvloop 与 query.py 的 nest_asyncio/run_until_complete 不兼容，
+  #   Linux + uvicorn[standard] 默认 uvloop 时启动即崩（2026-09-20 实测，见 TestRule.md）
+  uvicorn pcb_rag.dify_external_api:app --host 0.0.0.0 --port "${API_PORT:-8000}" --loop asyncio

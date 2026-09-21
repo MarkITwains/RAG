@@ -25,6 +25,8 @@ Rerank（后端分发在 ``query.py`` 的 ``_try_build_reranker`` 中完成）
 from __future__ import annotations
 
 import os
+import threading
+import time
 from typing import Any, List, Optional, Sequence
 
 # ---------------------------------------------------------------------------
@@ -108,6 +110,23 @@ RERANK_API_TIMEOUT = float(os.getenv("RERANK_API_TIMEOUT", "60"))
 
 _PLACEHOLDER_KEY = "sk-no-key-required"
 
+#: ``dimensions`` 参数的发送策略：auto / 1 / 0
+#:
+#: ``dimensions`` 是 OpenAI 自家 text-embedding-3* 用来降维的参数，其它模型和自建网关
+#: 多数不支持 —— 传了会被 400 拒绝，且报错信息通常与"维度"无关，很难定位。
+#: 默认 ``auto``：仅当模型名形如 ``text-embedding-3*`` 时才发送，
+#: 既保留 OpenAI 用户的降维能力，又不会把自定义网关的请求打挂。
+EMBED_SEND_DIMENSIONS = os.getenv("EMBED_SEND_DIMENSIONS", "auto").strip().lower()
+
+
+def _should_send_dimensions(model_name: str) -> bool:
+    """判断是否随请求发送 ``dimensions`` 参数（见 ``EMBED_SEND_DIMENSIONS``）。"""
+    if EMBED_SEND_DIMENSIONS in {"1", "true", "yes", "on"}:
+        return True
+    if EMBED_SEND_DIMENSIONS in {"0", "false", "no", "off"}:
+        return False
+    return model_name.lower().startswith("text-embedding-3")
+
 
 # ---------------------------------------------------------------------------
 # 2. LLM 工厂
@@ -185,13 +204,20 @@ def build_embed_model(model: Optional[str] = None, *, backend: Optional[str] = N
         if not model_name:
             raise RuntimeError("EMBED_BACKEND=api 需要配置 EMBED_MODEL")
 
+        # 注意两个参数的区别（踩过的坑）：
+        #   ``model``      —— llama-index 会拿它去构造 OpenAIEmbeddingModelType 枚举，
+        #                     **不在枚举里的模型名会直接抛 ValueError**
+        #                     （例如自建网关的 "nvidia/nemotron-3-embed-1b:free"，
+        #                       报错：is not a valid OpenAIEmbeddingModelType）
+        #   ``model_name`` —— 不上枚举校验，直接作为请求里的 model 发出去
+        # 因此自定义 / 网关模型 id 必须走 model_name；OpenAI 官方模型两者等价。
         kwargs: dict[str, Any] = {
-            "model": model_name,
+            "model_name": model_name,
             "api_base": EMBED_BASE_URL,
             "api_key": EMBED_API_KEY or _PLACEHOLDER_KEY,
             "embed_batch_size": EMBED_BATCH_SIZE,
         }
-        if EMBED_DIM > 0:
+        if EMBED_DIM > 0 and _should_send_dimensions(model_name):
             kwargs["dimensions"] = EMBED_DIM
         try:
             return OpenAIEmbedding(**kwargs)
@@ -226,6 +252,17 @@ def get_embedding_dim(embed_model: Any = None) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # 4. Rerank API 客户端
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Rerank API 客户端限速（2026-09-20 评测事故：SiliconFlow rerank 限 10 RPM，
+# 无 LLM 的消融行每题 3~5s → 12~20 RPM，61/80 次调用 429 且被上层吞掉，
+# 整行消融数据作废。此处客户端全局限速 + 429 重试，把"静默降级"变成"按配额节流"。
+# ---------------------------------------------------------------------------
+_RERANK_LOCK = threading.Lock()
+_RERANK_LAST_CALL = 0.0
+RERANK_MIN_INTERVAL = float(os.getenv("RERANK_MIN_INTERVAL", "6.2"))  # 秒，≈9.7 RPM
+RERANK_429_RETRIES = int(os.getenv("RERANK_429_RETRIES", "6"))
+
+
 class ApiReranker(BaseNodePostprocessor):
     """通过 HTTP ``/rerank`` 接口做精排。
 
@@ -259,9 +296,29 @@ class ApiReranker(BaseNodePostprocessor):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        resp = requests.post(self.api_url, json=payload, headers=headers, timeout=self.timeout)
-        resp.raise_for_status()
-        data = resp.json()
+        global _RERANK_LAST_CALL
+        last_err: Exception | None = None
+        data = None
+        for attempt in range(RERANK_429_RETRIES + 1):
+            with _RERANK_LOCK:
+                wait = _RERANK_LAST_CALL + RERANK_MIN_INTERVAL - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+                _RERANK_LAST_CALL = time.time()
+            resp = requests.post(self.api_url, json=payload, headers=headers, timeout=self.timeout)
+            if resp.status_code == 429:
+                ra = resp.headers.get("Retry-After", "")
+                backoff = float(ra) if ra else min(60.0, 2.0 ** attempt)
+                print(f"[Rerank] 429 限流，重试 {attempt + 1}/{RERANK_429_RETRIES + 1}，"
+                      f"等待 {backoff:.1f}s", flush=True)
+                time.sleep(backoff)
+                last_err = RuntimeError(f"429 (attempt {attempt + 1})")
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        if data is None:
+            raise RuntimeError(f"Rerank API 重试耗尽: {last_err}")
 
         results = data.get("results")
         if results is None and isinstance(data.get("output"), dict):

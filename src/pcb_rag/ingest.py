@@ -1160,54 +1160,110 @@ class HierarchicalStructureSplitter:
             print(f"  [语义检测] 失败: {e}")
             return False, None
     
+    @staticmethod
+    def _hard_split(sentence: str, max_size: int) -> List[str]:
+        """把超过 ``max_size`` 的"句子"强制切段。
+
+        背景：``_split_by_length`` 按"句子"组装，遇到**没有任何句末标点的超长段**
+        （如 PDF 抽取出的 XML 片段 / 连排图注，实测有单"句"1901 字）时，旧实现会把
+        整句塞进一个 chunk，导致 chunk 远超配置的 child 上限（实测 max=1901 > 800）。
+        这里在窗口内找最后一个**句内标点**（，、；：等）作为切点，尽量少破坏可读性；
+        找不到或切点太靠前时才按长度硬切。
+        """
+        if len(sentence) <= max_size:
+            return [sentence]
+        parts: List[str] = []
+        i = 0
+        while i < len(sentence):
+            if len(sentence) - i <= max_size:
+                parts.append(sentence[i:])
+                break
+            window = sentence[i:i + max_size]
+            cut = max(window.rfind(p) for p in "，、；：,;:")
+            if cut < max_size // 2:  # 切点太靠前会留下过短块，直接硬切
+                cut = max_size - 1
+            parts.append(sentence[i:i + cut + 1])
+            i += cut + 1
+        return parts
+
+    @staticmethod
+    def _overlap_tail(chunk: str, overlap: int) -> str:
+        """取块尾 ``overlap`` 字作为下一块的开头。
+
+        旧实现取末 overlap 字后又 ``rfind('。')`` **向前截断**：末 80 字里几乎必含
+        句号，实际残留往往只剩几个字 —— 配置写 80、实际近 0（实测相邻块命中率 1.1%）。
+        现改为**向后补齐**：从"末 overlap 字"往前扩到上一个句首，保证
+        实际重叠 ∈ [overlap, 2·overlap)，且新块从句子边界开始。
+        """
+        if overlap <= 0 or len(chunk) <= overlap:
+            return chunk
+        start = len(chunk) - overlap
+        # 向前找句边界补齐（中英文句号都认，与句子切分正则一致）；
+        # 补齐距离限制在一个 overlap 内，避免携带整个长句
+        b = max(chunk.rfind("。", 0, start), chunk.rfind(".", 0, start))
+        if b != -1 and (start - (b + 1)) <= overlap:
+            start = b + 1
+        return chunk[start:]
+
     def _split_by_length(self, text: str, max_size: int, min_size: int, overlap: int) -> List[str]:
-        """按长度切分（带 overlap）"""
+        """按长度切分（句对齐 + 真实 overlap + 超长句兜底）。
+
+        三个保证（对应 tests/test_chunk_split.py 的断言）：
+        1. 相邻块 overlap 真实存在：下一块以前一块末 ``overlap`` 字开头
+           （句边界对齐后 ∈ [overlap, 2·overlap)），不再被句号截没；
+        2. 所有块 ≤ ``max_size``：单"句"超限时先在句内标点处硬切；
+           组装后仍有超限块（如短尾并入前块）再兜底二切；
+        3. 除兜底二切外，块按句子边界组装，不在句中间断开。
+        """
         if len(text) <= max_size:
             return [text]
-        
-        chunks = []
-        
-        # 按句子切分以保持完整性
-        sentences = re.split(r'(?<=[。！？.!?])', text)
-        
-        current_chunk = ""
-        
-        for sent in sentences:
-            if not sent.strip():
+
+        # 超长"句"先在句内标点处切段，保证任何 piece ≤ max_size
+        pieces: List[str] = []
+        for sent in re.split(r'(?<=[。！？.!?])', text):
+            sent = sent.strip()
+            if not sent:
                 continue
-            
-            if len(current_chunk) + len(sent) <= max_size:
-                current_chunk += sent
+            if len(sent) > max_size:
+                pieces.extend(self._hard_split(sent, max_size))
             else:
-                if current_chunk and len(current_chunk) >= min_size:
-                    chunks.append(current_chunk.strip())
-                    
-                    # 添加 overlap
-                    if overlap > 0:
-                        overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
-                        # 找到句子边界
-                        boundary = overlap_text.rfind('。')
-                        if boundary == -1:
-                            boundary = overlap_text.rfind('.')
-                        if boundary > 0:
-                            overlap_text = overlap_text[boundary+1:]
-                        current_chunk = overlap_text + sent
-                    else:
-                        current_chunk = sent
+                pieces.append(sent)
+
+        chunks: List[str] = []
+        current = ""
+        for piece in pieces:
+            if current and len(current) + len(piece) <= max_size:
+                current += piece
+                continue
+            if current and len(current) >= min_size:
+                chunks.append(current)
+                carry = self._overlap_tail(current, overlap) if overlap > 0 else ""
+                # 只有 carry + piece 仍不超限时才带 overlap，否则放弃该次重叠
+                if carry and len(carry) + len(piece) <= max_size:
+                    current = carry + piece
                 else:
-                    current_chunk += sent
-        
-        # 添加最后一个 chunk
-        if current_chunk:
-            if len(current_chunk) >= min_size:
-                chunks.append(current_chunk.strip())
-            elif chunks:
-                # 太短则合并到前一个
-                chunks[-1] += current_chunk
+                    current = piece
             else:
-                chunks.append(current_chunk.strip())
-        
-        return chunks
+                # 首块，或当前块太短（< min_size）：继续攒（可能略超限，兜底二切会处理）
+                current += piece
+
+        if current:
+            if chunks and len(current) < min_size:
+                chunks[-1] += current  # 太短则并入前一个
+            else:
+                chunks.append(current)
+
+        # 兜底：组装后仍超限的块（短尾并入 / carry 组合）二次硬切
+        out: List[str] = []
+        for c in chunks:
+            c = c.strip()
+            if not c:
+                continue
+            if len(c) > max_size:
+                out.extend(self._hard_split(c, max_size))
+            else:
+                out.append(c)
+        return out
     
     def _split_by_semantic(self, text: str, similarity_scores: List[float] = None) -> List[str]:
         """使用语义切分"""
@@ -1399,10 +1455,18 @@ class AttentionSemanticSplitter:
             return
         
         if self.use_api_embed:
-            # 使用 OpenAI 兼容 API 端点
+            # 注意：走 API 时**不能**把 self.model_name 当模型 id —— 它是 ATTENTION_MODEL，
+            # 默认值是 Ollama 的 "qwen3-embedding:8b-q8_0"。发给 OpenAI 兼容网关会被 400
+            # 拒绝（"Model qwen3-embedding does not exist"），而且每个 batch 都会重试：
+            # 既白烧网关配额，又静默退化成"按长度切分"（语义切块失效但日志只轻描淡写）。
+            # API 后端一律使用配置好的 EMBED_MODEL。
             try:
-                print(f"[SemanticSplitter] 使用 API embedding 模型: {self.model_name}")
-                self._ollama_embed = build_embed_model(self.model_name)
+                embed_model = build_embed_model()
+                print(
+                    f"[SemanticSplitter] 使用 API embedding 模型: "
+                    f"{getattr(embed_model, 'model_name', '(未命名)')}"
+                )
+                self._ollama_embed = embed_model
                 print(f"[SemanticSplitter] API embedding 初始化完成")
             except Exception as e:
                 print(f"[SemanticSplitter] API embedding 初始化失败: {e}")
@@ -1457,23 +1521,29 @@ class AttentionSemanticSplitter:
         if (self.use_ollama or self.use_api_embed) and self._ollama_embed is not None:
             # 使用 Ollama / API 获取嵌入
             try:
-                embeddings = []
-                # 显示进度（每 10 个打印一次）
+                # 必须走批接口。早先是 for text in texts: get_text_embedding(text)，
+                # 等于"每个句子一次 HTTP 请求"—— 一篇 3 万字的文档就是几百次请求，
+                # 既打爆网关限流，也让语义切块成为整个入库流程的瓶颈。
                 show_progress = len(texts) > 20
-                for i, text in enumerate(texts):
-                    if show_progress and i % 10 == 0:
-                        print(f"  嵌入进度: {i}/{len(texts)}", end='\r')
-                    emb = self._ollama_embed.get_text_embedding(text)
-                    embeddings.append(emb)
-                if show_progress:
-                    print(f"  嵌入完成: {len(texts)}/{len(texts)}")
+                if hasattr(self._ollama_embed, "get_text_embedding_batch"):
+                    embeddings = self._ollama_embed.get_text_embedding_batch(
+                        list(texts), show_progress=show_progress
+                    )
+                else:  # pragma: no cover - 兜底：实现不支持批接口时退回逐条
+                    embeddings = []
+                    for i, text in enumerate(texts):
+                        if show_progress and i % 10 == 0:
+                            print(f"  嵌入进度: {i}/{len(texts)}", end='\r')
+                        embeddings.append(self._ollama_embed.get_text_embedding(text))
+                    if show_progress:
+                        print(f"  嵌入完成: {len(texts)}/{len(texts)}")
                 arr = np.array(embeddings)
                 # L2 归一化，避免余弦相似度数值不稳定
                 norms = np.linalg.norm(arr, axis=1, keepdims=True)
                 norms = np.where(norms < 1e-8, 1.0, norms)
                 return arr / norms
             except Exception as e:
-                print(f"[SemanticSplitter] Ollama 嵌入失败: {e}")
+                print(f"[SemanticSplitter] 嵌入失败: {e}")
                 return np.array([])
         elif self._model is not None:
             # 使用 Hugging Face Transformers

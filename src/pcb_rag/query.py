@@ -180,6 +180,7 @@ from pcb_rag.observability import (
 from pcb_rag.security import (
     ACL_ENABLED,
     build_acl_filters,
+    current_principal,
     describe_acl,
     filter_nodes,
     merge_filters,
@@ -1410,7 +1411,7 @@ def hybrid_query_enhance(query: str, llm=None, prefer_hyde: bool = True) -> tupl
 # 这里保留原名字作为薄封装：dify_external_api / evaluate_recall / tests 都在按
 # 旧名字导入，改名会造成无谓的破坏；同时确保"仓库里只有一份 RRF"。
 def _node_id_key(node: NodeWithScore) -> str:
-    return node_id_key(node)
+    return fusion.node_id_key(node)
 
 
 def _weighted_rrf_fuse_three_routes(

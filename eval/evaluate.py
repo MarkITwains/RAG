@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -234,7 +235,15 @@ def run(
           f"rerank={'on' if use_rerank else 'off'}, mode={'retrieval' if retrieval_only else 'full'}")
 
     engine = EvalEngine(recall_k=recall_k, top_k=top_k, use_rerank=use_rerank)
-    judge = build_llm()
+    # 异源 judge：通过 JUDGE_MODEL / JUDGE_BACKEND 注入与答题模型不同的判卷模型
+    # （如 JUDGE_MODEL=glm-5-3-260814 JUDGE_BACKEND=api）。留空则与答题同模型（不推荐）。
+    judge = build_llm(
+        os.getenv("JUDGE_MODEL") or None,
+        backend=os.getenv("JUDGE_BACKEND") or None,
+    )
+    judge_model = getattr(judge, "model", "unknown")
+    print(f"[Eval] Judge: {judge_model}"
+          f"（答题: {getattr(engine.llm, 'model', 'unknown')}）")
 
     from pcb_rag.query import generate_answer_with_citation
 
@@ -303,6 +312,8 @@ def run(
             "elapsed_seconds": round(elapsed, 1),
             # 判卷可用性：数字只有在 judge 正常工作时才有意义，因此把状态写进报告
             "judge": {
+                "model": judge_model,
+                "answer_model": getattr(engine.llm, "model", "unknown"),
                 "failures": summary.get("judge_failures", 0),
                 "failure_rate": summary.get("judge_failure_rate", 0.0),
                 "failure_rate_threshold": JUDGE_FAILURE_RATE_THRESHOLD,
