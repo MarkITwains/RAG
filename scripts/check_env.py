@@ -18,14 +18,12 @@ from pathlib import Path
 
 
 def load_env(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    src_dir = str(path.parent / "src")
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    from pcb_rag.env_loader import load_project_env
+
+    load_project_env(path)
 
 
 def check_import(module: str) -> bool:

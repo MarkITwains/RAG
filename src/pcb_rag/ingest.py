@@ -26,7 +26,13 @@ def _bootstrap_local_venv() -> None:
     if src_dir.is_dir() and str(src_dir) not in sys.path:
         sys.path.insert(0, str(src_dir))
 
-    if not venv_dir.is_dir():
+    # 坏链接或无权访问时 is_dir() 会抛 OSError（Windows 上 .venv 指向另一个
+    # 平台的路径时，stat 返回 WinError 1920）。这里只需要判断"能否用本地
+    # venv"，取不到就当作没有 —— 不应让整个模块导入失败。
+    try:
+        if not venv_dir.is_dir():
+            return
+    except OSError:
         return
 
     version = f"python{sys.version_info.major}.{sys.version_info.minor}"
@@ -91,7 +97,6 @@ def _sanitize_proxy_env_for_httpx() -> None:
 # 先加载仓库根目录的 .env（直接 `python -m pcb_rag.ingest` 时也能读到配置），
 # 再执行代理规范化：这样 .env 里写的 HTTP_PROXY / ALL_PROXY 也会被一并处理
 from pcb_rag.env_loader import load_project_env
-
 load_project_env()
 
 _sanitize_proxy_env_for_httpx()
@@ -104,6 +109,7 @@ from llama_index.vector_stores.milvus import MilvusVectorStore
 
 # 统一模型客户端工厂：LLM / Embedding 支持 local（Ollama）与 api 双后端
 from pcb_rag import incremental
+from pcb_rag.chunk_quality import assess_chunk_quality
 from pcb_rag.api_clients import (
     EMBED_BACKEND,
     LLM_BACKEND,
@@ -159,6 +165,16 @@ CHILD_OVERLAP = int(os.getenv("CHILD_OVERLAP", "80"))            # Child 间重�
 # 语义切分触发条件
 SEMANTIC_SPLIT_THRESHOLD = int(os.getenv("SEMANTIC_SPLIT_THRESHOLD", "1600"))  # Parent 长度超过此值才考虑语义切分（CHILD_MAX_SIZE × 2）
 SEMANTIC_VARIANCE_THRESHOLD = float(os.getenv("SEMANTIC_VARIANCE_THRESHOLD", "0.15"))  # 相似度波动超过此值触发语义切分
+
+# ========== Chunk 质量评估 ==========
+# 切块器只负责"按结构切开"，不判断切开后有没有检索价值。PCB 规范文档里
+# 存在大量裸标签罗列块（<default> <port> ...），语义空洞但会占用向量库与
+# BM25 的统计量。这里在入库时给低价值块打标记：
+#   off  = 不评估
+#   flag = 只在 metadata 写 low_value / chunk_quality（默认，可回滚）
+#   drop = 直接丢弃（块数会减少，prev/next 链出现空洞，慎用）
+CHUNK_QUALITY_MODE = os.getenv("CHUNK_QUALITY_MODE", "flag").strip().lower()
+
 
 # 结构化切块参数（structure模式 - 旧版）
 STRUCTURE_MAX_CHUNK_SIZE = int(os.getenv("STRUCTURE_MAX_CHUNK_SIZE", "2000"))  # 最大chunk大小（字符）
@@ -2065,18 +2081,82 @@ _EDA_ALIASES: list[tuple[str, str]] = [
 
 
 def _infer_source_type(rel_posix: str) -> str:
-    if "/标准/国际标准/" in rel_posix:
+    """推断文档来源类型：优先目录层级，其次文件名。
+
+    语料常以平铺方式放在 ``DATA_DIR`` 下（例如
+    ``clear_docs/GBT2036-1994印制电路术语.txt``），此时路径里不存在
+    「标准/国家标准」这类层级。原实现只认目录，会把全部文档归为
+    ``unknown`` —— 后果不是少一个标签，而是 ``source_type`` 过滤条件
+    全部落空、``by_source_type`` 分组统计失真。
+
+    文件名里的标准号前缀（GB / IPC / SJ / ISO）与 EDA 工具名足以区分，
+    因此补一层兜底；目录层级仍然优先，显式分类不被文件名覆盖。
+    """
+
+    path = (rel_posix or "").replace("\\", "/")
+
+    # 0) 归一化目录名：语料目录常带排序前缀（如 ``01_国家标准``、``03_工程语料``），
+    #    只对已知分类目录剥前缀，避免误伤 ``01_PCB基础概念与分类.txt`` 这类
+    #    文件名（rel_norm 末尾带斜杠，宽松的 lookahead 会把文件名也当成目录）。
+    path = re.sub(
+        r"(?<=/)\d+_(?=(?:国家标准|国际标准|行业标准|标准|教材与专著|教材|"
+        r"工程语料|文献|PCB设计|PCB资料|其他)/)",
+        "",
+        path,
+    )
+
+    # 1) 目录层级优先：有显式分类目录时以目录为准
+    if "/标准/国际标准/" in path:
         return "standard_international"
-    if "/标准/国家标准/" in rel_posix:
+    if "/标准/国家标准/" in path:
         return "standard_national"
-    if "/标准/" in rel_posix:
+    if "/国家标准/" in path:
+        return "standard_national"
+    if "/国际标准/" in path:
+        return "standard_international"
+    if "/行业标准/" in path:
+        return "standard_industry"
+    if "/标准/" in path:
         return "standard"
-    if "/文献/" in rel_posix:
+    if "/工程语料/" in path:
+        return "engineering"
+    if "/文献/" in path:
         return "literature"
-    if "/PCB设计/" in rel_posix:
+    if "/PCB设计/" in path:
         return "pcb_design"
-    if "/PCB资料/" in rel_posix:
+    if "/PCB资料/" in path:
         return "pcb_material"
+
+    # 2) 文件名兜底
+    #
+    # 注意 rstrip("/")：调用方传入的 rel_norm 形如 "/dir/file.txt/"，末尾带斜杠，
+    # 直接 rsplit("/")[-1] 会取到空串，兜底逻辑静默失效。
+    #
+    # 标准号在路径段首匹配而不是只看 basename：GB/T、SJ/T 这类写法本身含斜杠，
+    # 一旦出现在路径里（如 "/GB/T 4677/x.txt"）或文件名被截断，只看 basename
+    # 就会漏掉。用 (?:^|/) 锚定段首，避免 "GBK"/"IPCX" 之类的子串误命中。
+    probe = path.rstrip("/")
+    upper_path = probe.upper()
+    basename = probe.rsplit("/", 1)[-1].upper()
+
+    if re.search(r"(?:^|/)GB[/T\s]*\d", upper_path):
+        return "standard_national"
+    if re.search(r"(?:^|/)IPC[-\s]?[A-Z]*\d", upper_path):
+        return "standard_international"
+    if re.search(r"(?:^|/)SJ[/T\s]*\d", upper_path):
+        return "standard_industry"
+    if re.search(r"(?:^|/)ISO[-\s]?\d", upper_path):
+        return "standard_international"
+
+    if re.search(r"ALTIUM|CADENCE|ALLEGRO|PADS|MENTOR|PROTEL|POWERPCB", basename):
+        return "pcb_design"
+    if re.search(r"材料|层压|覆铜|基材|板材", basename):
+        return "pcb_material"
+    if re.search(r"教程|设计|LAYOUT|布线|仿真", basename, re.IGNORECASE):
+        return "pcb_design"
+    if re.search(r"测试|试验|检验|检测", basename):
+        return "standard"
+
     return "unknown"
 
 
@@ -2331,17 +2411,29 @@ def enhance_chunk_metadata(chunk_text: str, chunk_meta: dict, doc_text: str, fil
         增强后的元数据字典
     """
     enhanced_meta = dict(chunk_meta)  # 复制原有元数据
-    
-    # 1. 添加文档类型
+
+    # 1. 来源类型 / 文档类型
+    #
+    # 这两个字段服务于不同维度，都要保证有值：
+    #   source_type —— 粗粒度来源（standard_national / pcb_design / ...），
+    #                  供元数据过滤与评测分组使用；
+    #   doc_type    —— 细粒度文体（national_standard / design_guide / ...），
+    #                  供语境前缀与检索意图判断使用。
+    # 历史上只有 doc_type 被写入，且 _infer_source_type 依赖目录层级，
+    # 平铺语料下会退化为 unknown，因此这里统一兜底。
+    current_source_type = str(enhanced_meta.get("source_type") or "").strip().lower()
+    if current_source_type in {"", "unknown", "none"}:
+        enhanced_meta["source_type"] = _infer_source_type(file_path)
+
     if "doc_type" not in enhanced_meta:
         enhanced_meta["doc_type"] = classify_document_type(doc_text[:5000], file_path)
-    
+
     # 2. 提取章节信息
     section_info = extract_section_info(chunk_text)
-    if section_info["section"] and "section" not in enhanced_meta:
+    if section_info["section"] and not enhanced_meta.get("section"):
         enhanced_meta["section"] = section_info["section"]
     if section_info["subsection"]:
-        enhanced_meta["subsection"] = section_info["subsection"]
+        enhanced_meta.setdefault("subsection", section_info["subsection"])
     
     # 3. 添加结构特征标记
     enhanced_meta["has_table"] = section_info["has_table"]
@@ -2366,6 +2458,37 @@ def enhance_chunk_metadata(chunk_text: str, chunk_meta: dict, doc_text: str, fil
     enhanced_meta["line_count"] = chunk_text.count('\n') + 1
     
     return enhanced_meta
+
+
+def _apply_chunk_quality(meta: dict, text: str) -> bool:
+    """评估 chunk 质量并标记；返回 False 表示该块应被丢弃。
+
+    只对低价值块写字段（``chunk_quality`` / ``low_value`` / ``quality_flags``），
+    正常块不加键 —— 这些键会一并进入 Milvus metadata 与 BM25 词法语料，
+    给每个块都塞三个无意义字段会白白增加索引体积。
+
+    ``drop`` 模式会减少块数，``prev_id`` / ``next_id`` 链随之出现空洞
+    （邻居查不到就少扩展一条，不会报错）。默认 ``flag`` 只打标记，
+    是否降权交给检索侧决定 —— 误删一条条款的代价远高于多留一条低价值候选。
+    """
+    if CHUNK_QUALITY_MODE not in {"flag", "drop"}:
+        return True
+    try:
+        result = assess_chunk_quality(text)
+    except Exception:
+        return True
+
+    if not result["is_low_value"]:
+        return True
+
+    if CHUNK_QUALITY_MODE == "drop":
+        return False
+
+    meta["chunk_quality"] = result["score"]
+    meta["low_value"] = True
+    meta["quality_flags"] = ",".join(result["flags"])
+    return True
+
 
 
 # =============================================================================
@@ -2420,7 +2543,24 @@ def build_contextual_prefix(chunk_text: str, chunk_meta: dict, doc_meta: dict) -
         or ""
     )
     if section:
-        parts.append(str(section).strip())
+        section = str(section).strip()
+        # 正文首行通常就是本节标题，若再放进前缀，等于同一句文本被嵌入两遍。
+        # 实测语料中 52.8% 的块存在这种重复：前缀「· 8.2.5.3 语句组成」+
+        # 正文首行「8.2.5.3 语句组成」。占用的虽只有十几个字符，但它同时进了
+        # 向量与 BM25 统计量（同一个标题词被计两次频次），属于纯噪声。
+        # 这里只丢掉与正文首行重合的**末级**标题，父级路径仍然保留。
+        levels = [x.strip() for x in re.split(r"\s*(?:>|＞|·|/)\s*", section) if x.strip()]
+        body_head = ""
+        for line in (chunk_text or "").splitlines():
+            if line.strip():
+                body_head = re.sub(r"\s+", "", line)
+                break
+        if levels and body_head:
+            last = re.sub(r"\s+", "", levels[-1])
+            if last and (last in body_head or body_head in last):
+                levels = levels[:-1]
+        if levels:
+            parts.append(" > ".join(levels))
 
     doc_type = chunk_meta.get("doc_type") or ""
     if doc_type and doc_type != "general":
@@ -2884,6 +3024,9 @@ def _structure_aware_parse(documents) -> list:
                 doc_text=text,
                 file_path=file_path
             )
+            # 低价值块（裸标签罗列等）：flag 模式打标记，drop 模式跳过
+            if not _apply_chunk_quality(enhanced_meta, chunk_text):
+                continue
             
             node = TextNode(
                 text=chunk_text,
@@ -2997,7 +3140,15 @@ def _parent_child_parse(documents) -> list:
             parent_id = chunk_node_ids[parent_first_child] if idx != parent_first_child else ''
 
             # 构建完整元数据
+            #
+            # 必须以 doc 级元数据打底：source_type / source_path / vendor / eda
+            # 这些字段在文档加载阶段（_infer_metadata）才产生，切块器产出的
+            # chunk_meta 只带 parent_* / child_* 等位置信息。此前这里写成
+            # `{**chunk_meta, ...}` 且未并入 doc_metadata，导致 parent_child
+            # 模式下所有 chunk 的 source_type 落到 schema 默认值 unknown ——
+            # 按类型过滤全部失效、引用无法定位章节、评测分组统计失真。
             merged_meta = {
+                **doc_metadata,
                 **chunk_meta,
                 # 邻接关系
                 'prev_id': prev_id or '',
@@ -3013,6 +3164,16 @@ def _parent_child_parse(documents) -> list:
                 # 全局位置
                 'total_chunks_in_doc': len(chunks),
             }
+
+            # 章节字段归一：下游（build_context_with_sources / 引用溯源）
+            # 依次取 parent_title → chunk_section → section，这里统一补一份，
+            # 避免不同切块器的字段命名差异导致章节信息丢失。
+            if not merged_meta.get('section'):
+                merged_meta['section'] = (
+                    merged_meta.get('parent_title')
+                    or merged_meta.get('chunk_section')
+                    or ''
+                )
             
             # 增强元数据
             enhanced_meta = enhance_chunk_metadata(
@@ -3021,6 +3182,9 @@ def _parent_child_parse(documents) -> list:
                 doc_text=text,
                 file_path=file_path
             )
+            # 低价值块（裸标签罗列等）：flag 模式打标记，drop 模式跳过
+            if not _apply_chunk_quality(enhanced_meta, chunk_text):
+                continue
             
             node = TextNode(
                 text=chunk_text,
@@ -3180,6 +3344,9 @@ def _attention_semantic_parse(documents) -> list:
                 doc_text=text,
                 file_path=file_path
             )
+            # 低价值块（裸标签罗列等）：flag 模式打标记，drop 模式跳过
+            if not _apply_chunk_quality(enhanced_meta, chunk_text):
+                continue
             
             node = TextNode(
                 text=chunk_text,
@@ -3503,6 +3670,12 @@ def main():
         finally:
             asyncio.set_event_loop(None)
             loop.close()
+
+    if EMBED_BACKEND == "api":
+        from pcb_rag.api_clients import get_embedding_profile
+        from pcb_rag.embedding_contract import ensure_ingest_embedding_profile
+
+        ensure_ingest_embedding_profile(vector_store.client, COLLECTION, get_embedding_profile(embed_dim))
 
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 

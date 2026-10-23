@@ -2,6 +2,8 @@
 
 本项目提供一键环境脚本，目标是在 Windows Git Bash、Linux 或 macOS 终端中完成依赖安装和运行环境准备。
 
+本机 WSL 使用外部模型 API 的启动命令、代理与数据目录见 [WSL 纯 API 运行说明](WSL_API.md)。
+
 ## 前置依赖
 
 请先安装：

@@ -101,6 +101,16 @@ GRAPH_MAX_ENTITIES_PER_QUERY = int(os.getenv("GRAPH_MAX_ENTITIES_PER_QUERY", "8"
 GRAPH_MAX_NEIGHBORS = int(os.getenv("GRAPH_MAX_NEIGHBORS", "24"))
 GRAPH_EVIDENCE_CHARS = int(os.getenv("GRAPH_EVIDENCE_CHARS", "240"))
 
+# ---- 节点语义化（对齐 LightRAG 的实体描述与跨块归并）----
+# 单个实体描述的字符上限。描述会进图文件、并在检索时直接进上下文，
+# 太长会把 top_k 名额挤掉，太短则失去"命中实体即拿到一句解释"的价值。
+GRAPH_NODE_DESC_CHARS = int(os.getenv("GRAPH_NODE_DESC_CHARS", "240"))
+# 单条实体/关系描述的字符上限（LLM 抽取时的输出约束）
+GRAPH_LLM_DESC_CHARS = int(os.getenv("GRAPH_LLM_DESC_CHARS", "120"))
+# gleaning 轮数：首轮抽取后把已有结果回灌，再问一轮"还有遗漏吗"。
+# 0 = 关闭（省一次 LLM 调用）；1 = 常见配置，召回提升明显而成本可控。
+GRAPH_LLM_GLEANING = int(os.getenv("GRAPH_LLM_GLEANING", "1"))
+
 # 社区摘要
 GRAPH_COMMUNITY_ENABLED = _env_bool("GRAPH_COMMUNITY_ENABLED", False)
 GRAPH_COMMUNITY_MIN_SIZE = int(os.getenv("GRAPH_COMMUNITY_MIN_SIZE", "3"))
@@ -169,12 +179,105 @@ def _entity_type(name: str) -> str:
     return "concept"
 
 
+# LLM 输出的类型标签 → 内部类型名。
+# 提示词里给的是带示例的英文标签（Standard / Process / ...），模型也可能直接
+# 回中文或小写变体，这里统一映射，避免同一类实体在图里碎成多种 type —— type
+# 参与图谱统计与检索时的类型偏置，碎掉就失去意义。
+_ENTITY_TYPE_ALIASES: Dict[str, str] = {
+    "standard": "standard",
+    "标准": "standard",
+    "specification": "standard",
+    "material": "material",
+    "材料": "material",
+    "process": "process",
+    "工艺": "process",
+    "procedure": "process",
+    "structure": "structure",
+    "结构": "structure",
+    "layer": "structure",
+    "parameter": "parameter",
+    "参数": "parameter",
+    "metric": "parameter",
+    "equipment": "equipment",
+    "设备": "equipment",
+    "tool": "equipment",
+    "software": "software",
+    "eda": "software",
+    "软件": "software",
+    "method": "method",
+    "测试方法": "method",
+    "test": "method",
+    "defect": "defect",
+    "缺陷": "defect",
+    "failure": "defect",
+    "component": "component",
+    "元件": "component",
+    "器件": "component",
+    "concept": "concept",
+    "概念": "concept",
+    "other": "concept",
+    "其他": "concept",
+}
+
+
+def _normalize_entity_type(raw: str) -> str:
+    """把模型给的类型标签归一到内部类型名；无法识别时返回空串。"""
+
+    key = _WS_RE.sub(" ", str(raw or "")).strip().lower()
+    if not key:
+        return ""
+    if key in _ENTITY_TYPE_ALIASES:
+        return _ENTITY_TYPE_ALIASES[key]
+    # 允许 "Process Step" 这类短语：取首个可识别的词
+    for token in re.split(r"[\s/、,，]+", key):
+        if token in _ENTITY_TYPE_ALIASES:
+            return _ENTITY_TYPE_ALIASES[token]
+    return ""
+
+
+def _merge_node_desc(node: "GraphNode", desc: str) -> None:
+    """把新描述并入节点摘要，去重并按上限截断。
+
+    为什么不用简单拼接：同一实体在几十个 chunk 里出现时，拼接会迅速膨胀成
+    一篇长文，既撑大图文件又挤占检索时的上下文名额。这里只保留「未被已有
+    摘要覆盖」的新表述，超出上限即停止累加 —— 摘要是用来判断相关性的，
+    不是证据全集（证据在边的 ``e`` 字段与 chunk 原文里）。
+    """
+
+    text = _WS_RE.sub(" ", str(desc or "")).strip()
+    if not text:
+        return
+
+    # 已经包含该表述（或与之高度重叠）就不再追加
+    if text in node.desc:
+        return
+    if node.desc and node.desc in text:
+        # 新描述覆盖了旧摘要，直接用更完整的版本
+        node.desc = text[:GRAPH_NODE_DESC_CHARS]
+        return
+
+    if not node.desc:
+        node.desc = text[:GRAPH_NODE_DESC_CHARS]
+        return
+
+    remain = GRAPH_NODE_DESC_CHARS - len(node.desc) - 3
+    if remain < 12:
+        return
+    node.desc = node.desc + "；" + text[:remain]
+
+
+
 # ---------------------------------------------------------------------------
 # 3. 三元组与图
 # ---------------------------------------------------------------------------
 @dataclass
 class Triple:
-    """一条实体关系：``head -[relation]-> tail``，附带来源证据。"""
+    """一条实体关系：``head -[relation]-> tail``，附带来源证据。
+
+    ``head_type`` / ``head_desc`` 等语义字段为可选：规则抽取不产出它们，
+    LLM 抽取会填。它们的作用是让图节点带上「这是什么」的说明 —— 检索命中
+    一个实体时，除了邻接关系还能拿到一段可直接进上下文的描述。
+    """
 
     head: str
     relation: str
@@ -184,6 +287,11 @@ class Triple:
     source_path: str = ""
     evidence: str = ""
     weight: float = 1.0
+    head_type: str = ""
+    tail_type: str = ""
+    head_desc: str = ""
+    tail_desc: str = ""
+    relation_desc: str = ""
 
     def key(self) -> Tuple[str, str, str]:
         return (self.head, self.relation, self.tail)
@@ -196,12 +304,15 @@ class GraphNode:
     name: str
     type: str = "concept"
     count: int = 0
+    desc: str = ""
     chunk_ids: List[str] = field(default_factory=list)
     doc_ids: List[str] = field(default_factory=list)
     aliases: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {"t": self.type, "n": self.count}
+        if self.desc:
+            data["s"] = self.desc[:GRAPH_NODE_DESC_CHARS]
         if self.chunk_ids:
             data["c"] = self.chunk_ids[:20]
         if self.doc_ids:
@@ -239,12 +350,27 @@ class KnowledgeGraph:
         evidence = _WS_RE.sub(" ", (triple.evidence or "").strip())[:GRAPH_EVIDENCE_CHARS]
 
         with self._lock:
-            for name in (head, tail):
+            for name, ent_type, ent_desc in (
+                (head, triple.head_type, triple.head_desc),
+                (tail, triple.tail_type, triple.tail_desc),
+            ):
                 node = self.nodes.get(name)
                 if node is None:
-                    node = GraphNode(name=name, type=_entity_type(name))
+                    node = GraphNode(
+                        name=name,
+                        type=_normalize_entity_type(ent_type) or _entity_type(name),
+                    )
                     self.nodes[name] = node
+                elif ent_type:
+                    # 规则抽取先建出的节点 type 常是 concept；LLM 后续给出类型时补上。
+                    # 已有明确类型则不覆盖 —— 先到先得的类型更接近规则模式匹配结果。
+                    resolved = _normalize_entity_type(ent_type)
+                    if resolved and node.type in {"concept", ""}:
+                        node.type = resolved
+
                 node.count += 1
+                if ent_desc:
+                    _merge_node_desc(node, ent_desc)
                 if triple.chunk_id and triple.chunk_id not in node.chunk_ids and len(node.chunk_ids) < 20:
                     node.chunk_ids.append(triple.chunk_id)
                 if triple.doc_id and triple.doc_id not in node.doc_ids and len(node.doc_ids) < 10:
@@ -262,9 +388,20 @@ class KnowledgeGraph:
                     "d": [],
                     "e": evidence,
                     "s": triple.source_path or "",
+                    "rd": "",
                 }
                 self.edges[key] = edge
             edge["w"] = float(edge.get("w", 0.0)) + float(triple.weight or 1.0)
+
+            # 关系描述：与实体描述同样做去重累加，供检索时直接作为"这条边说明了什么"
+            if triple.relation_desc:
+                rel_desc = _WS_RE.sub(" ", triple.relation_desc).strip()
+                if rel_desc and rel_desc not in edge.get("rd", ""):
+                    if not edge.get("rd"):
+                        edge["rd"] = rel_desc[: GRAPH_LLM_DESC_CHARS]
+                    elif len(edge["rd"]) + len(rel_desc) + 3 <= GRAPH_NODE_DESC_CHARS:
+                        edge["rd"] = edge["rd"] + "；" + rel_desc
+
             if triple.chunk_id and triple.chunk_id not in edge["c"] and len(edge["c"]) < 12:
                 edge["c"].append(triple.chunk_id)
             if triple.doc_id and triple.doc_id not in edge["d"] and len(edge["d"]) < 8:
@@ -290,6 +427,8 @@ class KnowledgeGraph:
         if other is None:
             return
         for edge in other.edges.values():
+            h_node = other.nodes.get(edge.get("h"))
+            t_node = other.nodes.get(edge.get("t"))
             self.add_triple(
                 Triple(
                     head=edge["h"],
@@ -300,6 +439,13 @@ class KnowledgeGraph:
                     source_path=edge.get("s", ""),
                     evidence=edge.get("e", ""),
                     weight=float(edge.get("w", 1.0)),
+                    # 描述与类型不随边存储，需从节点回填，否则增量合并会丢掉
+                    # 上一轮 LLM 抽取产出的语义信息，只剩邻接关系。
+                    head_type=getattr(h_node, "type", "") if h_node else "",
+                    head_desc=getattr(h_node, "desc", "") if h_node else "",
+                    tail_type=getattr(t_node, "type", "") if t_node else "",
+                    tail_desc=getattr(t_node, "desc", "") if t_node else "",
+                    relation_desc=edge.get("rd", ""),
                 )
             )
         for name, node in other.nodes.items():
@@ -526,6 +672,7 @@ class KnowledgeGraph:
                 name=name,
                 type=str(raw.get("t") or "concept"),
                 count=int(raw.get("n") or 0),
+                desc=str(raw.get("s") or ""),
                 chunk_ids=list(raw.get("c") or []),
                 doc_ids=list(raw.get("d") or []),
                 aliases=list(raw.get("a") or []),
@@ -547,6 +694,7 @@ class KnowledgeGraph:
                 "d": list(edge.get("d") or []),
                 "e": str(edge.get("e") or ""),
                 "s": str(edge.get("s") or ""),
+                "rd": str(edge.get("rd") or ""),
             }
             graph.adjacency[head].add(tail)
             graph.adjacency[tail].add(head)
@@ -664,31 +812,95 @@ def extract_triples_rule(
     return triples
 
 
+# 实体类型表：给模型一个封闭的类型集合，避免同一类实体在图里碎成多种标签。
+# 类型参与图谱统计与检索时的类型偏置，也决定 _normalize_entity_type 的映射目标。
+_TRIPLE_TYPE_TABLE = """- Standard：标准、规范、条款（GB/T 4677-2002、IPC-2581C）
+- Material：材料与基材（FR-4、PI、覆铜板、铜箔）
+- Process：工艺步骤（沉金、镀金、蚀刻、层压、阻焊）
+- Structure：结构层次（四层板、盲埋孔、阻抗线、焊盘）
+- Parameter：可量化参数（镀层厚度、线宽、阻抗值、剥离强度）
+- Equipment：设备与工装（飞针测试机、曝光机）
+- Software：EDA 工具（Altium Designer、Cadence Allegro）
+- Method：测试与检验方法（AOI、热冲击试验、可焊性试验）
+- Defect：缺陷与失效（分层、起泡、开路、短路）
+- Component：元件与器件（BGA、连接器、过孔）
+- Concept：术语与抽象概念（信号完整性、EMI）
+"""
+
+_TRIPLE_JSON_SCHEMA = (
+    '{"head": "实体名", "head_type": "Standard", "head_desc": "该实体是什么，40字内", '
+    '"relation": "关系", "relation_desc": "这条关系说明了什么，40字内", '
+    '"tail": "实体名", "tail_type": "Material", "tail_desc": "该实体是什么，40字内"}'
+)
+
+
 def _build_triple_prompt(text: str) -> str:
     """构造三元组抽取提示词。
 
     直接拼接而不使用 ``str.format``：提示词里的 JSON 示例含有花括号，
     用 format 会与之冲突（需要成对转义，极易出错）。
+
+    相比只抽 ``head/relation/tail`` 的旧版，这里额外要求实体类型与一句描述 ——
+    这是 LightRAG 图谱质量的主要来源：命中一个实体时，除了邻接关系还能拿到
+    「它是什么」的说明，可直接进上下文而不必回读原文。
     """
 
     return (
-        "你是 PCB 制造业知识工程师。请从下面的技术文档片段中，抽取实体关系三元组。\n\n"
+        "你是 PCB 制造业知识工程师。请从下面的技术文档片段中抽取实体关系三元组。\n\n"
         "要求：\n"
-        "1. 只抽取原文明确表述的内容，绝对不要臆造或补充常识；\n"
-        "2. head / tail 是 PCB 领域实体（标准号、材料、工艺、结构、参数、测试方法、缺陷等），"
-        "relation 用简短动词短语，例如：应符合、包含、采用、要求、限值、适用于、测试方法为；\n"
-        "3. 每条三元组必须能在原文中找到依据；\n"
-        f"4. 最多输出 {GRAPH_MAX_TRIPLES_PER_CHUNK} 条，没有则输出空数组；\n"
-        '5. 只输出 JSON 数组，形如 [{"head": "实体", "relation": "关系", "tail": "实体"}]，'
-        "不要输出解释文字或 Markdown 代码块。\n\n"
+        "1. 只抽取原文明确表述的内容，绝不臆造或补充常识；\n"
+        "2. head / tail 必须是原文出现的实体（标准号、材料、工艺、结构、参数、"
+        "测试方法、缺陷、EDA 工具等）；relation 用简短动词短语，例如：应符合、包含、"
+        "采用、要求、限值、适用于、测试方法为；\n"
+        "3. 每条三元组必须能在原文中找到依据；一句话涉及多个实体时拆成多条二元关系；\n"
+        "4. head_desc / tail_desc 用一句第三人称说明该实体「是什么」，只依据原文，"
+        f"不超过 40 字；relation_desc 用一句说明这条关系「说了什么」，不超过 40 字；\n"
+        f"5. 实体类型只能从下列取值中选一个，无法归类用 Concept：\n{_TRIPLE_TYPE_TABLE}"
+        f"6. 最多输出 {GRAPH_MAX_TRIPLES_PER_CHUNK} 条，没有则输出空数组 []；\n"
+        "7. 只输出 JSON 数组，不要输出解释文字或 Markdown 代码块，格式：\n"
+        f"[{_TRIPLE_JSON_SCHEMA}]\n\n"
         f"片段：\n{text}"
     )
+
+
+def _build_gleaning_prompt(text: str, existing: List[Dict[str, str]]) -> str:
+    """gleaning 提示词：回灌已抽取结果，要求补全遗漏。
+
+    参照 LightRAG 的 gleaning 做法 —— 首轮抽取常漏掉「次要但有用」的关系
+    （例如参数与测试方法之间的约束），把结果回灌再问一轮，模型更容易意识到
+    「这些类型的边还没有被抽到」，召回提升明显，代价只是多一次调用。
+    """
+
+    lines = []
+    for item in existing[:40]:
+        head = item.get("head", "")
+        relation = item.get("relation", "")
+        tail = item.get("tail", "")
+        if head and relation and tail:
+            lines.append(f"- {head} --[{relation}]--> {tail}")
+    rendered = "\n".join(lines) if lines else "（无）"
+
+    return (
+        "你正在为 PCB 技术文档构建知识图谱。上一轮已从片段中抽取了下列三元组：\n\n"
+        f"{rendered}\n\n"
+        "请重新检查原文片段，**只补充上一轮遗漏的**实体关系。"
+        "注意容易漏掉的类型：参数限值、测试方法、适用条件、材料与工艺的对应关系。\n"
+        "不要重复上面已列出的三元组。\n\n"
+        f"若确实没有遗漏，输出空数组 []。\n"
+        "只输出 JSON 数组，不要输出解释文字或 Markdown 代码块。\n\n"
+        f"片段：\n{text}"
+    )
+
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
 
 def _parse_triple_json(raw: str) -> List[Dict[str, str]]:
-    """从模型输出中稳健地解析三元组数组。"""
+    """从模型输出中稳健地解析三元组数组。
+
+    兼容中英文键名与缺失的可选字段：旧提示词只产出 head/relation/tail，
+    新提示词多出类型与描述。缺描述时留空，不阻断抽取。
+    """
 
     if not raw:
         return []
@@ -706,15 +918,34 @@ def _parse_triple_json(raw: str) -> List[Dict[str, str]]:
     if not isinstance(payload, list):
         return []
 
+    def _pick(item: Dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            val = item.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
+
     triples: List[Dict[str, str]] = []
     for item in payload:
         if not isinstance(item, dict):
             continue
-        head = str(item.get("head") or item.get("头实体") or "").strip()
-        relation = str(item.get("relation") or item.get("关系") or "").strip()
-        tail = str(item.get("tail") or item.get("尾实体") or "").strip()
-        if head and relation and tail:
-            triples.append({"head": head, "relation": relation, "tail": tail})
+        head = _pick(item, "head", "头实体", "source_entity")
+        relation = _pick(item, "relation", "关系", "relationship")
+        tail = _pick(item, "tail", "尾实体", "target_entity")
+        if not (head and relation and tail):
+            continue
+        triples.append(
+            {
+                "head": head,
+                "relation": relation,
+                "tail": tail,
+                "head_type": _pick(item, "head_type", "source_type", "头实体类型"),
+                "head_desc": _pick(item, "head_desc", "source_desc", "头实体描述")[:GRAPH_LLM_DESC_CHARS],
+                "relation_desc": _pick(item, "relation_desc", "relationship_desc", "关系描述")[:GRAPH_LLM_DESC_CHARS],
+                "tail_type": _pick(item, "tail_type", "target_type", "尾实体类型"),
+                "tail_desc": _pick(item, "tail_desc", "target_desc", "尾实体描述")[:GRAPH_LLM_DESC_CHARS],
+            }
+        )
     return triples
 
 
@@ -726,7 +957,11 @@ def extract_triples_llm(
     doc_id: str = "",
     source_path: str = "",
 ) -> List[Triple]:
-    """LLM 抽取：调用模型输出三元组 JSON（失败时返回空列表，由上层决定是否回退规则）。"""
+    """LLM 抽取：调用模型输出三元组 JSON（失败时返回空列表，由上层决定是否回退规则）。
+
+    ``GRAPH_LLM_GLEANING > 0`` 时在首轮之后追加一轮补全：把已抽取的关系回灌，
+    要求模型只补遗漏项。两轮结果按键三元组去重后合并。
+    """
 
     if llm is None or not text or not text.strip():
         return []
@@ -738,6 +973,29 @@ def extract_triples_llm(
         return []
 
     raw = str(getattr(response, "text", response))
+    records = _parse_triple_json(raw)
+
+    # gleaning：补一轮遗漏
+    if records and GRAPH_LLM_GLEANING > 0:
+        seen = {(r["head"], r["relation"], r["tail"]) for r in records}
+        for _ in range(GRAPH_LLM_GLEANING):
+            try:
+                more_raw = str(
+                    getattr(llm.complete(_build_gleaning_prompt(snippet, records)), "text", "")
+                )
+            except Exception:
+                break
+            added = 0
+            for item in _parse_triple_json(more_raw):
+                key = (item["head"], item["relation"], item["tail"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(item)
+                added += 1
+            if added == 0:
+                break
+
     evidence = _WS_RE.sub(" ", snippet)[:GRAPH_EVIDENCE_CHARS]
     triples = [
         Triple(
@@ -749,10 +1007,18 @@ def extract_triples_llm(
             source_path=source_path,
             evidence=evidence,
             weight=1.5,
+            head_type=item.get("head_type", ""),
+            tail_type=item.get("tail_type", ""),
+            head_desc=item.get("head_desc", ""),
+            tail_desc=item.get("tail_desc", ""),
+            relation_desc=item.get("relation_desc", ""),
         )
-        for item in _parse_triple_json(raw)
+        for item in records
     ]
-    return triples[:GRAPH_MAX_TRIPLES_PER_CHUNK]
+    # gleaning 的补充量不占用首轮配额 —— 否则补出来的边会被上限直接截掉，
+    # 白付一次调用。上限放宽到两倍，仍受总条数约束避免单块产出失控。
+    cap = GRAPH_MAX_TRIPLES_PER_CHUNK * (2 if GRAPH_LLM_GLEANING > 0 else 1)
+    return triples[:cap]
 
 
 def extract_triples(
@@ -1228,6 +1494,66 @@ class GraphRetriever:
         return results
 
 
+def build_neighborhood_text(
+    graph: KnowledgeGraph,
+    anchor: str,
+    *,
+    max_edges: int = 8,
+    max_lines: int = 12,
+) -> str:
+    """构造某实体的邻域证据文本（纯字符串，不依赖 llama-index）。
+
+    文本构成：
+      ``[知识图谱·邻域] 「锚点」：锚点描述``
+      ``相关事实：`` 每条边一行，关系描述以括号附在句末；邻接实体首次出现时
+      追加一行缩进的"是什么"说明。
+      ``原文依据：`` 最多两条原文句子。
+
+    关系描述与实体描述的来源见 :meth:`KnowledgeGraph.add_triple` 与
+    :func:`_merge_node_desc`。没有描述的图（规则抽取）产出的文本与旧版一致，
+    即多出来的只是"有则附加"的信息，不会因为缺描述而丢结构。
+    """
+
+    edges = graph.edges_of(anchor) if graph is not None else []
+    if not edges:
+        return ""
+
+    lines: List[str] = []
+    evidence: List[str] = []
+    described: set = set()
+
+    for edge in edges[:max_edges]:
+        rel_desc = str(edge.get("rd") or "").strip()
+        if rel_desc:
+            lines.append(f"{edge['h']} --{edge['r']}--> {edge['t']}（{rel_desc}）")
+        else:
+            lines.append(f"{edge['h']} --{edge['r']}--> {edge['t']}")
+
+        if edge.get("e"):
+            evidence.append(str(edge["e"]))
+
+        other = edge["t"] if edge["h"] == anchor else edge["h"]
+        other_node = graph.nodes.get(other)
+        desc = str(getattr(other_node, "desc", "") or "").strip()
+        if desc and other not in described and len(lines) < max_lines:
+            described.add(other)
+            lines.append(f"  · {other}：{desc[:80]}")
+
+    if not lines:
+        return ""
+
+    anchor_node = graph.nodes.get(anchor)
+    anchor_desc = str(getattr(anchor_node, "desc", "") or "").strip()
+    head = f"[知识图谱·邻域] 「{anchor}」"
+    if anchor_desc:
+        head += f"：{anchor_desc[:100]}"
+
+    text = head + "\n相关事实：\n" + "\n".join(lines)
+    if evidence:
+        text += "\n原文依据：" + " / ".join(evidence[:2])
+    return text
+
+
 def expand_nodes_with_graph(
     nodes: Optional[Sequence[Any]],
     graph: Optional[KnowledgeGraph],
@@ -1261,20 +1587,9 @@ def expand_nodes_with_graph(
 
     additions: List[Any] = []
     for anchor in anchors[:4]:
-        edges = graph.edges_of(anchor)
-        if not edges:
+        text = build_neighborhood_text(graph, anchor)
+        if not text:
             continue
-        lines: List[str] = []
-        evidence: List[str] = []
-        for edge in edges[:8]:
-            lines.append(f"{edge['h']} --{edge['r']}--> {edge['t']}")
-            if edge.get("e"):
-                evidence.append(str(edge["e"]))
-        if not lines:
-            continue
-        text = f"[知识图谱·邻域] 「{anchor}」的相关事实：\n" + "\n".join(lines)
-        if evidence:
-            text += "\n原文依据：" + " / ".join(evidence[:2])
 
         try:
             from llama_index.core.schema import NodeWithScore, TextNode

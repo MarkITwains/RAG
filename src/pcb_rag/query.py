@@ -34,7 +34,13 @@ def _bootstrap_local_venv() -> None:
     if src_dir.is_dir() and str(src_dir) not in sys.path:
         sys.path.insert(0, str(src_dir))
 
-    if not venv_dir.is_dir():
+    # 坏链接或无权访问时 is_dir() 会抛 OSError（Windows 上 .venv 指向另一个
+    # 平台的路径时，stat 返回 WinError 1920）。这里只需要判断"能否用本地
+    # venv"，取不到就当作没有 —— 不应让整个模块导入失败。
+    try:
+        if not venv_dir.is_dir():
+            return
+    except OSError:
         return
 
     version = f"python{sys.version_info.major}.{sys.version_info.minor}"
@@ -221,6 +227,13 @@ CHUNK_GROUP_BY_DOC = os.getenv("CHUNK_GROUP_BY_DOC", "1") not in {"0", "false", 
 LEXICAL_METADATA_KEYS: list[str] = [
     "source_type",
     "source_path",
+    # 章节与文体：BM25 路此前完全没有这两类字段，导致命中的 chunk 无法
+    # 按章节分组、引用只能退化到文件名。向量路有、词法路没有，同一个
+    # chunk 经不同路召回后元数据不一致，融合时排序与展示都会失真。
+    "doc_type",
+    "parent_title",
+    "chunk_section",
+    "section",
     "vendor",
     "eda",
     "layer_count",
@@ -231,7 +244,7 @@ LEXICAL_METADATA_KEYS: list[str] = [
 # Rerank: 先高召回，再用 cross-encoder 精排，减少“看起来相关但其实不对”的段落
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "1") not in {"0", "false", "False"}
 RERANK_MODEL = os.getenv("RERANK_MODEL", "Qwen/Qwen3-Reranker-4B")
-RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "200"))  # Top200 精排
+RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "10"))  # 精排返回条数；API 输入另受候选上限约束
 # rerank 后端：
 # - api: HTTP rerank 接口（Jina / 硅基流动 / DashScope 等，推荐，无需本地显存）
 # - sbert: SentenceTransformerRerank (cross-encoder)
@@ -394,6 +407,37 @@ HYDE_MAX_LENGTH = int(os.getenv("HYDE_MAX_LENGTH", "300"))
 HYDE_ROUTE_WEIGHT = float(os.getenv("HYDE_ROUTE_WEIGHT", "0.85"))
 # 三路 RRF 融合参数（k 越小越倾向 top 排名，k=40 对 PCB 领域更佳）
 FUSION_RRF_K = int(os.getenv("FUSION_RRF_K", "40"))
+
+# 融合策略：配额保底 + RRF 补齐
+#
+# 纯加权 RRF 假设各路 rank 都部分有效。某一路系统性失效时，它的高位结果仍会
+# 拿到 w/(k+rank)，把另一路的真实信号挤出榜单（实测 BM25 单路 0.4891 > 融合 0.4811）。
+# 配额制先给每路分配保底名额（轮转取数），剩余再按 RRF 分补齐 —— 与 LightRAG
+# hybrid 模式 round-robin 的"名额隔离"同构，同时保留分数区分度。
+FUSION_QUOTA_ENABLED = os.getenv("FUSION_QUOTA_ENABLED", "1") not in {"0", "false", "False"}
+# 每路保底条数（未显式配置 FUSION_QUOTAS 时生效）
+FUSION_MIN_PER_ROUTE = int(os.getenv("FUSION_MIN_PER_ROUTE", "1"))
+# 显式配额，按 routes 顺序，逗号分隔；留空则按 FUSION_MIN_PER_ROUTE 均分
+FUSION_QUOTAS_RAW = os.getenv("FUSION_QUOTAS", "").strip()
+
+
+def _parse_fusion_quotas(n_routes: int) -> Optional[list[int]]:
+    """解析 FUSION_QUOTAS；数量与路数不匹配时退回 None（改用均分配额）。
+
+    按位置绑定而非按路名，是因为调用点的 routes 顺序稳定（主检索固定为
+    ``向量 / HyDE / BM25``，两路模式为 ``向量 / BM25``）。故意不做"补零/截断"：
+    顺序一旦错位，静默补零会让某一路彻底失去保底，比直接退回均分更危险。
+    """
+    if not FUSION_QUOTAS_RAW:
+        return None
+    try:
+        quotas = [int(x) for x in FUSION_QUOTAS_RAW.split(",") if x.strip() != ""]
+    except ValueError:
+        return None
+    if len(quotas) != n_routes:
+        return None
+    return quotas
+
 # HyDE few-shot 开关
 HYDE_FEWSHOT_ENABLED = os.getenv("HYDE_FEWSHOT_ENABLED", "1") not in {"0", "false", "False"}
 # 是否启用 Query2Doc 查询增强
@@ -435,7 +479,7 @@ def _try_build_reranker():
             return reranker
         except Exception as e:
             print(f"[RERANK] API 精排初始化失败: {e}")
-            return None
+            raise RuntimeError("Required API reranker failed to initialize; refusing silent fallback") from e
 
     if RERANK_BACKEND in {"hf", "qwen3reranker"} or "qwen3-reranker" in HF_RERANK_MODEL.lower():
         model_id = HF_RERANK_MODEL
@@ -1419,12 +1463,24 @@ def _weighted_rrf_fuse_three_routes(
     top_n: int,
     rrf_k: int = fusion.DEFAULT_RRF_K,
 ) -> list[NodeWithScore]:
-    """加权三路 RRF 融合（实现见 :func:`pcb_rag.fusion.weighted_rrf_fuse`）。
+    """加权三路 RRF 融合（实现见 :mod:`pcb_rag.fusion`）。
 
     ``rrf_k`` 的默认值保持 60 只是为了和 :mod:`pcb_rag.fusion` 一致；
     线上两处调用点（query.py 主流程 / dify）都显式传 ``FUSION_RRF_K``（默认 40），
     因此 CLI 与 API 的实际取值是 40，签名默认值不参与线上路径。
+
+    ``FUSION_QUOTA_ENABLED=1``（默认）时走配额制：先按 ``FUSION_MIN_PER_ROUTE``
+    给每路保底名额并轮转取数，剩余名额按加权 RRF 分补齐。关闭后退回纯 RRF，
+    两条路径返回的 ``score`` 同为加权 RRF 分，可直接横向对比。
     """
+    if FUSION_QUOTA_ENABLED:
+        return fusion.quota_rrf_fuse(
+            routes,
+            top_n=top_n,
+            rrf_k=rrf_k,
+            min_per_route=FUSION_MIN_PER_ROUTE,
+            quotas=_parse_fusion_quotas(len(routes)),
+        )
     return fusion.weighted_rrf_fuse(routes, top_n=top_n, rrf_k=rrf_k)
 
 
@@ -1578,6 +1634,9 @@ RAG_PROMPT_TEMPLATE = """你是 PCB 电路板领域的技术专家。请根据�
 2. 如果文档中没有相关信息，明确说明"根据提供的文档无法回答"
 3. 回答要准确、专业、简洁
 4. 参考文档带有编号 [1] [2]，引用某条信息时请在对应句子末尾标注同样的角标，例如：[1][2]
+5. 参考文档分为「事实摘要」与「原文证据」两部分，编号一一对应。
+   事实摘要给出该条证据的定位信息与关键参数，用于快速判断相关性；
+   回答具体技术要求、数值、步骤时，以「原文证据」为准
 
 参考文档：
 {context}
@@ -1588,10 +1647,51 @@ RAG_PROMPT_TEMPLATE = """你是 PCB 电路板领域的技术专家。请根据�
 
 # 环境变量控制引用功能
 CITATION_ENABLED = os.getenv("CITATION_ENABLED", "1") not in {"0", "false", "False"}
-# 用于生成答案的最大文档数
+# 用于生成答案的最大文档数（仅在关闭预算模式时作为硬上限）
 RAG_TOP_DOCS = int(os.getenv("RAG_TOP_DOCS", "5"))
-# 每个文档内容的最大字符数
+# 每个文档内容的最大字符数（仅在关闭预算模式时生效）
 RAG_DOC_MAX_CHARS = int(os.getenv("RAG_DOC_MAX_CHARS", "1000"))
+
+# 上下文 token 预算
+#
+# 原实现是「固定 5 条 × 每条 1000 字符」，上限 5000 字符。但语料 chunk 的
+# p90 长度已达 868 字符、max 976 —— 单块几乎吃满单槽且被截断，5 个槽位实际
+# 只能容纳 4.5 个完整块，聚合类问题必然证据不足。
+#
+# 改为按 token 预算逐条填充：短块能多放，长块自动少放，总量与模型窗口匹配。
+# 设为 0 时退回旧的固定条数逻辑（便于对比与回滚）。
+RAG_CONTEXT_MAX_TOKENS = int(os.getenv("RAG_CONTEXT_MAX_TOKENS", "6000"))
+# 事实摘要段占预算比例（其余留给原文证据与引用表）
+RAG_FACTS_BUDGET_RATIO = float(os.getenv("RAG_FACTS_BUDGET_RATIO", "0.22"))
+# 单条证据的最小 token 配额：低于此值说明预算已耗尽，停止填充
+RAG_MIN_CHUNK_TOKENS = int(os.getenv("RAG_MIN_CHUNK_TOKENS", "120"))
+# 中文 token 估算系数（字/token）。qwen 系中文约 1.5~1.7，取 1.5 偏保守
+RAG_CHARS_PER_TOKEN = float(os.getenv("RAG_CHARS_PER_TOKEN", "1.5"))
+# 低信息密度块（入库时 CHUNK_QUALITY_MODE=flag 标记的 low_value）是否降权到末尾
+RAG_DEMOTE_LOW_VALUE = os.getenv("RAG_DEMOTE_LOW_VALUE", "1") not in {"0", "false", "False"}
+
+# 预算分配与三段式组装已下沉到 pcb_rag/context_budget.py（纯逻辑、可单测）。
+# 这里只保留配置与适配层：把 NodeWithScore 规范化成 context_budget 期望的字典。
+from pcb_rag.context_budget import (  # noqa: E402  (需在其配置项之后导入)
+    dedupe_by_key as _cb_dedupe_by_key,
+    estimate_tokens as _cb_estimate_tokens,
+    fit_evidence as _cb_fit_evidence,
+    plan_budget as _cb_plan_budget,
+    render_sections as _cb_render_sections,
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """粗估 token 数（实现见 :func:`pcb_rag.context_budget.estimate_tokens`）。"""
+    return _cb_estimate_tokens(text, RAG_CHARS_PER_TOKEN)
+
+
+def _extract_fact_sentences(text: str, limit: int = 2, max_chars: int = 220) -> str:
+    """抽取事实句（实现见 :func:`pcb_rag.context_budget.extract_fact_sentences`）。"""
+    from pcb_rag.context_budget import extract_fact_sentences
+
+    return extract_fact_sentences(text, limit=limit, max_chars=max_chars)
+
 
 # =============================================================================
 # Self-RAG (自反思 RAG) 配置
@@ -1752,17 +1852,165 @@ def extract_citations(answer: str, retrieved_docs: list) -> list[dict]:
     return citations
 
 
+def _doc_dedupe(retrieved_docs: list) -> list:
+    """按 node id 去重，保留首次出现（分数最高）的那条（实现见 context_budget）。"""
+    return _cb_dedupe_by_key(
+        retrieved_docs or [],
+        lambda item: getattr(
+            item.node if hasattr(item, "node") else item, "id_", None
+        ),
+    )
+
+
+def build_context_with_budget(
+    retrieved_docs: list,
+    max_total_tokens: int = None,
+) -> tuple[str, list[dict]]:
+    """按 token 预算构建三段式上下文（事实摘要 / 原文证据 / 引用来源）。
+
+    与旧实现（固定 max_docs × max_chars）的差别：
+
+    1. **预算是总量而非条数**。逐条填充直到 token 预算耗尽，短块能多放、
+       长块自动少放，不会被"5 条"这个与内容无关的数字卡住。
+    2. **三段分离**。事实摘要给出定位与关键参数（含数值、标准号、规范性
+       措辞的句子），原文证据给完整上下文。模型可以先扫事实段判断相关性，
+       再回到原文核对细节，减少"读了很多字却没读到关键句"的情况。
+    3. **引用表独立预留**。引用编号与证据编号一一对应，避免截断时错位。
+
+    预算分配与拼装的纯逻辑在 :mod:`pcb_rag.context_budget`，这里只做
+    ``NodeWithScore`` → 字典的规范化。
+
+    Args:
+        retrieved_docs: NodeWithScore 列表（已排序，分数高的在前）
+        max_total_tokens: 总预算；None 时取 RAG_CONTEXT_MAX_TOKENS
+
+    Returns:
+        (context_text, sources_info)。预算 <= 0 或无可用证据时返回 ("", [])。
+    """
+    budget = int(
+        max_total_tokens if max_total_tokens is not None else RAG_CONTEXT_MAX_TOKENS
+    )
+    if budget <= 0:
+        return "", []
+
+    docs = _doc_dedupe(retrieved_docs or [])
+    if not docs:
+        return "", []
+
+    # 低信息密度块（裸标签罗列等）排到末尾：预算充足时仍会保留它们，
+    # 预算紧张时它们最先被挤掉。不做硬过滤 —— 判定是启发式的，
+    # 误删一条条款的代价高于多留一段低价值文本。
+    if RAG_DEMOTE_LOW_VALUE:
+        docs = sorted(
+            docs,
+            key=lambda item: 1
+            if (getattr(getattr(item, "node", item), "metadata", None) or {}).get("low_value")
+            else 0,
+        )
+
+    plan = _cb_plan_budget(
+        budget,
+        facts_ratio=RAG_FACTS_BUDGET_RATIO,
+        min_chunk_tokens=RAG_MIN_CHUNK_TOKENS,
+    )
+
+    def _text_of(item) -> str:
+        node = item.node if hasattr(item, "node") else item
+        try:
+            # NONE 而非 EMBED：metadata 的定位信息已经拼在标题行（来源 · 章节），
+            # 再用 EMBED 模式会把 source_path / doc_node_id / prev_id 等键值
+            # 一并塞进正文。它们既占预算，也是模型读不懂的技术字段。
+            return node.get_content(metadata_mode=MetadataMode.NONE)
+        except Exception:
+            return str(node)
+
+    fitted = _cb_fit_evidence(
+        docs,
+        _text_of,
+        plan["chunks"],
+        min_chunk_tokens=RAG_MIN_CHUNK_TOKENS,
+        chars_per_token=RAG_CHARS_PER_TOKEN,
+    )
+    if not fitted:
+        return "", []
+
+    entries: list[dict] = []
+    for row in fitted:
+        item = row["item"]
+        node = item.node if hasattr(item, "node") else item
+        metadata = getattr(node, "metadata", None) or {}
+
+        source_path = metadata.get("source_path", "未知来源")
+        source_name = (
+            Path(source_path).stem
+            if source_path and source_path != "未知来源"
+            else source_path
+        )
+        section = (
+            metadata.get("parent_title")
+            or metadata.get("chunk_section")
+            or metadata.get("section")
+            or ""
+        )
+        chunk_id = getattr(node, "id_", None) or metadata.get("chunk_id", "")
+        page = metadata.get("page_label") or metadata.get("page") or ""
+
+        entries.append(
+            {
+                "node": node,
+                "text": row["text"],
+                "tokens": row["tokens"],
+                "truncated": row["truncated"],
+                "source_path": source_path,
+                "source_name": source_name,
+                "section": section,
+                "page": str(page) if page else "",
+                "metadata": metadata,
+                "score": getattr(item, "score", 0.0) or 0.0,
+                "chunk_id": str(chunk_id) if chunk_id else "",
+            }
+        )
+
+    context = _cb_render_sections(entries, plan["facts"])
+
+    sources_info = [
+        {
+            "index": idx,
+            "source_path": entry["source_path"],
+            "source_name": entry["source_name"],
+            "section": entry["section"],
+            "chunk_id": entry["chunk_id"],
+            "page": entry["page"],
+            "score": entry["score"],
+            "char_count": len(entry["text"]),
+            "tokens": entry["tokens"],
+            "truncated": entry["truncated"],
+            "snippet": entry["text"][:200],
+        }
+        for idx, entry in enumerate(entries, 1)
+    ]
+
+    return context, sources_info
+
+
 def build_context_with_sources(retrieved_docs: list, max_docs: int = None, max_chars: int = None) -> tuple[str, list[dict]]:
     """构建带来源标注的上下文。
     
     Args:
         retrieved_docs: 检索到的文档列表
-        max_docs: 最大文档数（默认使用 RAG_TOP_DOCS）
-        max_chars: 每个文档最大字符数（默认使用 RAG_DOC_MAX_CHARS）
+        max_docs: 最大文档数（显式传入时走旧的固定截断逻辑）
+        max_chars: 每个文档最大字符数（显式传入时走旧的固定截断逻辑）
         
     Returns:
         (格式化的上下文文本, 来源信息列表)
+
+    默认（两个参数都为 None）走 :func:`build_context_with_budget` 的 token 预算
+    与三段式结构。显式传参则保留旧的「固定条数 × 固定字符」语义 —— 评测脚本与
+    测试依赖这一行为做可控对比，不宜被默认值悄悄改变。
     """
+    if max_docs is None and max_chars is None and RAG_CONTEXT_MAX_TOKENS > 0:
+        return build_context_with_budget(retrieved_docs)
+
     max_docs = max_docs or RAG_TOP_DOCS
     max_chars = max_chars or RAG_DOC_MAX_CHARS
     
@@ -4000,8 +4248,39 @@ class LocalBM25Retriever(BaseRetriever):
         return results
 
 
+def _milvus_field_names(vector_store: MilvusVectorStore) -> set[str]:
+    """读取集合的真实字段名，用于裁剪 ``output_fields``。
+
+    Milvus 对不存在的 output_field 直接报错（不是返回空），而
+    ``LEXICAL_METADATA_KEYS`` 是候选清单 —— 不同版本/不同入库路径建出的
+    集合字段集合并不一致（例如父块入库后才会有 ``parent_title``）。
+    这里取交集，既让新字段在支持的集合上生效，又不让旧集合导出直接失败。
+    """
+    try:
+        info = vector_store.client.describe_collection(COLLECTION)
+    except Exception:
+        return set()
+
+    fields = info.get("fields") if isinstance(info, dict) else None
+    if not isinstance(fields, list):
+        return set()
+
+    names: set[str] = set()
+    for field in fields:
+        if isinstance(field, dict):
+            name = field.get("name")
+        else:
+            name = getattr(field, "name", None)
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
 def _iter_milvus_rows(vector_store: MilvusVectorStore) -> Iterable[dict]:
-    output_fields = ["id", "doc_id", "text", *LEXICAL_METADATA_KEYS]
+    available = _milvus_field_names(vector_store)
+    wanted = ["id", "doc_id", "text", *LEXICAL_METADATA_KEYS]
+    output_fields = [k for k in wanted if not available or k in available]
+
     it = vector_store.client.query_iterator(
         collection_name=COLLECTION,
         batch_size=LEXICAL_EXPORT_BATCH,
@@ -4198,6 +4477,12 @@ def build_index(llm_model: str):
             loop.close()
 
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    if EMBED_BACKEND == "api":
+        from pcb_rag.api_clients import get_embedding_profile
+        from pcb_rag.embedding_contract import validate_embedding_profile
+
+        collection_info = vector_store.client.describe_collection(COLLECTION)
+        validate_embedding_profile(collection_info.get("description", ""), get_embedding_profile(embed_dim))
     return VectorStoreIndex.from_vector_store(vector_store=vector_store, storage_context=storage_context)
 
 # ---------------------------------------------------------------------------
@@ -4494,7 +4779,10 @@ def main():
             print(f"[查询扩展] {expanded_q}")
 
         # HyDE / Query2Doc 查询增强（针对短查询）
-        hyde_q = expanded_q  # 用于向量检索的增强查询
+        #
+        # 分工与 API 侧一致：扩展串只喂 BM25，向量检索与 HyDE 以原问题为输入。
+        # HyDE 的语义是"为这个问题生成假设答案"，输入同义词表会让假设答案偏离。
+        hyde_q = clean_q  # 用于向量检索的增强查询
         q2doc_q = expanded_q  # 用于 BM25 检索的增强查询
         
         should_enhance_query = QUERY_ENHANCE_ALL or _is_short_query(clean_q)
@@ -4504,10 +4792,10 @@ def main():
                     print(f"[HyDE] 启用查询增强，生成假设文档...")
                 else:
                     print(f"[HyDE] 检测到短查询，生成假设文档...")
-                hyde_q = hyde_expand_query(expanded_q)
-                if hyde_q != expanded_q:
+                hyde_q = hyde_expand_query(clean_q)
+                if hyde_q != clean_q:
                     # 只显示假设文档的前100字符
-                    hyde_preview = hyde_q.replace(expanded_q, "").strip()[:100]
+                    hyde_preview = hyde_q.replace(clean_q, "").strip()[:100]
                     print(f"[HyDE] 假设文档: {hyde_preview}...")
             
             if QUERY2DOC_ENABLED:
@@ -4573,7 +4861,7 @@ def main():
                     print(f"[Rerank] 标准精排，top_n={RERANK_TOP_N}")
                     retrieved_nodes = rerank._postprocess_nodes(
                         retrieved_nodes,
-                        query_bundle=QueryBundle(query_str=expanded_q),
+                        query_bundle=QueryBundle(query_str=clean_q),
                     )
 
                 # GraphRAG：图检索融合 + 邻域事实扩展
@@ -4583,7 +4871,7 @@ def main():
                 for postprocessor in _aux_postprocessors():
                     retrieved_nodes = postprocessor._postprocess_nodes(
                         retrieved_nodes,
-                        query_bundle=QueryBundle(query_str=expanded_q),
+                        query_bundle=QueryBundle(query_str=clean_q),
                     )
 
                 # 层次化 Chunk 扩展：带上相关上下文

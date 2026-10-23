@@ -29,6 +29,8 @@ PCB-RAG 面向 PCB 设计规范、工艺资料与工程经验文档，覆盖从�
 - [目录结构](#目录结构)
 - [快速开始](#快速开始)
 - [检索链路](#检索链路)
+- [Web 界面](#web-界面)
+- [作为元件接入自研 Agent](#作为元件接入自研-agent)
 - [Dify 外部知识库 API](#dify-外部知识库-api)
 - [配置说明](#配置说明)
 - [评测](#评测)
@@ -124,10 +126,17 @@ flowchart LR
 ├── src/pcb_rag/                  # 核心源码包
 │   ├── api_clients.py            # LLM / Embedding / Rerank 双后端工厂
 │   ├── cache.py                  # 语义缓存（精确匹配 + 向量相似）
+│   ├── chunk_quality.py          # chunk 信息密度评估（低价值块标记）
+│   ├── context_budget.py         # 上下文 token 预算与三段式组装
+│   ├── engine.py                 # Agent 元件：结构化检索 / 问答 / 工具定义
+│   ├── fusion.py                 # 加权 RRF 与配额制融合（纯逻辑）
+│   ├── graph_rag.py              # 实体关系图：抽取、存储、图检索
 │   ├── ingest.py                 # 文档预处理、切块与入库
 │   ├── query.py                  # 检索链路与交互式问答
 │   ├── preprocess_docs.py        # 编码修复与乱码清理
+│   ├── webui/index.html          # Web 问答界面（单文件，零构建）
 │   └── dify_external_api.py      # Dify 外部知识库 API 服务
+├── examples/                     # 作为元件接入 agent 的示例与说明
 ├── tests/                        # 单元测试（缓存 / 评测指标 / 文档预处理）
 ├── eval/                         # 评测体系（黄金集 + 四指标）
 │   ├── build_golden_dataset.py   # 数据集构建
@@ -262,6 +271,73 @@ Altium Designer 中如何处理高速差分线等长？
 | 上下文压缩 | 近似去重 → 抽取式压缩（优先保留含数值 / 标准号的句子）→ 字符预算裁剪 |
 | 答案合成 | 基于 RAG Prompt 生成答案并标注引用来源 |
 
+## Web 界面
+
+服务启动后直接访问根路径即可使用：
+
+```text
+http://localhost:8000/
+```
+
+界面为单文件静态页（`src/pcb_rag/webui/index.html`），零构建、零前端依赖，由
+FastAPI 直接托管，离线部署同样可用。
+
+| 能力 | 说明 |
+| --- | --- |
+| 流式问答 | 走 `/api/ask/stream`，检索完成即先出证据列表，答案逐段推送 |
+| 证据溯源 | 右侧列出命中的原文片段、所属章节、检索得分与 token 数，点击可展开 |
+| 角标定位 | 答案中的 `[n]` 可点击，滚动并高亮对应证据卡 |
+| 检索参数 | 召回条数、相似度阈值可直接调，无需改配置 |
+| 多轮对话 | 最近 6 轮问答随请求带上，服务端做历史感知的查询改写 |
+| 状态指示 | 顶栏显示索引 / 词法索引 / 精排的就绪状态，数据来自 `/health` |
+
+鉴权沿用服务端的 Bearer Token：首次提问若收到 401，界面会提示从右上角「设置」
+填入 `DIFY_API_TOKEN`，Token 存在浏览器 localStorage，不上传任何第三方。
+
+> 页面本身不含配置与密钥，公开可访问是安全的；数据一律经带鉴权的 API 取。
+
+## 作为元件接入自研 Agent
+
+除开箱即用的 Web 界面与 HTTP 服务外，检索能力可以作为一个元件直接嵌入自研
+agent，不需要经过 HTTP：
+
+```python
+from pcb_rag.engine import KnowledgeBase
+
+kb = KnowledgeBase()
+kb.ensure_ready()                                  # 首次调用耗时数十秒
+
+hit = kb.retrieve("4 层板阻抗控制关注什么", top_k=8)
+for ev in hit.evidence:
+    print(ev.source_name, ev.section, ev.score)    # 结构化对象，不是拼好的字符串
+
+if hit.degraded:                                   # 链路降级要显式处理
+    print("降级：", hit.degraded)
+```
+
+| 能力 | 接口 |
+| --- | --- |
+| 检索证据（不生成） | `retrieve()` / `aretrieve()` |
+| 检索 + 生成答案 | `answer()` / `aanswer(history=[...])` |
+| 图谱邻域 | `graph_neighbors()` |
+| 组件状态 | `health()` |
+| Function calling | `tool_specs()` / `call_tool()` / `acall_tool()` |
+
+设计上刻意做了三个取舍：**返回逐条证据而不是拼接好的上下文**（否则"信息是否充分"
+的判断被锁死在元件里，agent 失去再检索的机会）；**降级状态显式暴露**（静默降级
+会让 agent 把"某条路没跑起来"误读成"知识库没有"）；**不保存会话状态**（历史由
+agent 传入，元件不在背后攒一份不一致的上下文）。
+
+元件与 HTTP 服务共用同一套检索实现和同一个索引实例，两种形态可并行使用。
+
+详见 [examples/README.md](examples/README.md)，可运行示例：
+
+```bash
+python examples/agent_toolkit_demo.py --mode direct --query "4 层板阻抗控制关注什么"
+python examples/agent_toolkit_demo.py --mode tools    # 打印 function calling 定义
+python examples/agent_toolkit_demo.py --mode react    # 文本协议的 agent 循环
+```
+
 ## Dify 外部知识库 API
 
 ```bash
@@ -329,7 +405,13 @@ bash scripts/serve_api.sh
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `RECALL_TOP_K` | `200`（API 进程 `setdefault` 亦为 `200`） | 初始召回数量 |
-| `RERANK_TOP_N` | `200`（**API 进程强制 `setdefault` 为 `10`**） | 送入精排并保留的候选数量 |
+| `RERANK_TOP_N` | `10`（CLI / API 一致） | 重排返回条数，API 请求也使用这个值；不决定输入量 |
+| `RERANK_MAX_CANDIDATES` | `50` | 真正送入重排 API 的候选上限，独立于初始召回 200 条 |
+| `RERANK_MAX_DOCUMENT_CHARS` | `1200` | 每条重排正文的字符上限；不发送文件路径、ID 等技术元数据 |
+| `RERANK_MIN_INTERVAL` | `0` | 主动限速间隔；0 关闭，非零时跨进程共享 |
+| `RERANK_TOKEN_BUDGET` | `0` | 0 不限制累计 token；用量记录和未知用量估计仍保留 |
+| `RERANK_REQUEST_BUDGET` | `0` | 0 不限制累计请求次数；正数时包含重试 |
+| `RERANK_429_BACKOFF_SECONDS` | `60` | 仅收到服务端 429 且无 Retry-After 时退避；不是主动限速 |
 | `CHUNK_EXPAND_MAX_EXTRA` | `5` | 上下文扩展可额外返回的条数 |
 | `HYDE_ENABLED` | `1` | 是否启用 HyDE 查询增强 |
 | `QUERY_UNDERSTANDING_MODE` | `hybrid` | 查询理解模式：`rule` / `llm` / `hybrid` |
@@ -338,6 +420,22 @@ bash scripts/serve_api.sh
 | `STEPBACK_ROUTE_WEIGHT` | `0.7` | Step-back 召回路线在 RRF 中的权重系数 |
 | `CONTEXTUAL_RETRIEVAL_MODE` | `rule` | chunk 语境前缀：`off` / `rule` / `llm` |
 | `CITATION_ENABLED` | `1` | 是否在答案中标注引用来源 |
+| `RAG_CONTEXT_MAX_TOKENS` | `6000` | 上下文 token 预算；按 token 逐条填充，替代固定条数。`0` 退回旧逻辑 |
+| `RAG_FACTS_BUDGET_RATIO` | `0.22` | 事实摘要段占预算比例，其余留给原文证据与引用表 |
+| `RAG_MIN_CHUNK_TOKENS` | `120` | 单条证据最小配额，低于此值停止填充 |
+| `RAG_DEMOTE_LOW_VALUE` | `1` | 入库标记的低价值块是否降权到末尾（只调顺序，不硬过滤） |
+
+### 融合与 chunk 质量
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `FUSION_QUOTA_ENABLED` | `1` | 配额保底 + RRF 补齐。`0` 退回纯加权 RRF |
+| `FUSION_MIN_PER_ROUTE` | `1` | 每路保底条数（未配 `FUSION_QUOTAS` 时生效） |
+| `FUSION_QUOTAS` | 空 | 显式配额，按 routes 顺序；数量不匹配则退回均分 |
+| `CHUNK_QUALITY_MODE` | `flag` | `off` 不评估 / `flag` 只打标记 / `drop` 丢弃低价值块 |
+| `GRAPH_LLM_GLEANING` | `1` | 图抽取的 gleaning 轮数（回灌已抽结果补漏） |
+| `GRAPH_LLM_DESC_CHARS` | `120` | 单条实体 / 关系描述字符上限 |
+| `GRAPH_NODE_DESC_CHARS` | `240` | 实体描述跨块合并后的总上限 |
 
 ### 缓存
 
@@ -509,12 +607,13 @@ Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确�
 
 | # | 现象 | 根因 | 当前状态 |
 | --- | --- | --- | --- |
+| 0 | 全部 r2 消融结论建立在失效的向量索引上 | `nvidia/nemotron-3-embed-1b` 的 query/passage 契约错误，旧集合两侧编码方式相同；`r2_01` 的 MRR 0.0690 与 embedding 报告 `before` 逐位一致 | **已修索引，待重跑**。配对实验显示 MRR@20 0.069→0.394、Hit@200 0.40→0.938。重跑前不得据旧结论删减组件 |
 | 1 | 评测脚本与评测报告未入库 | `eval/reports/`、`eval/*.json(l)` 被 `.gitignore` 排除（数据集含语料原文，不宜公开）；`eval/evaluate_recall.py` 亦未纳入版本控制 | **未修（唯一需要人工决策的一条）**：脱敏后提交脚本 + 报告摘要，或在 README 给出「数据集规模 / 该集指标 / 脚本版本」对照表。在提交之前，README 里的所有 MRR / Hit@K / NDCG 数字都无法被第三方复现 |
 | 2 | 指标绝对值不可跨数据集比较 | 仓库内多版数据集互不重合（`eval_dataset.json` / `eval_dataset_146.json`）；真值由 chunk 反推问题生成，chunk 按定义相关 | 只用于**同数据集内**的配置对比；换集必须重跑基线。生成侧偏差方向明确：共享词汇使 Hit/Recall 系统性**高估** |
 | 3 | LLM 出题 / 判卷与生成同源 | `build_golden_dataset.py`、`evaluate.py`、`metrics.py` 都用 `build_llm()` | 部分修：`evaluate_recall.py` 支持 `SOFT_JUDGE_*` 指向另一厂商模型；生成侧 judge 仍同源，**需人工抽检 20~30 条校准并报告 judge 与人评一致率** |
 | 4 | 每请求一个 `ThreadPoolExecutor` | `dify_external_api` 在同步端点里按请求开池（`min(n_workers, 8)`），叠加 anyio 线程池与全局 HyDE 线程池 | 未修（检索是 IO 密集，正解是 `asyncio + httpx.AsyncClient`）。当前并发受 anyio 的 40 线程与 HyDE 的 2 worker 约束，不是无界增长 |
 | 5 | SSE 断开后已提交的 HyDE 调用仍会跑完 | 线程池任务无法取消（`Future.cancel()` 只能取消未开始的任务） | 未修；短期可加"同 query 结果缓存"与队列上限，长期改 asyncio 任务 + `wait_for` |
-| 6 | 分路贡献无 ablation | 只有整体开关对比，没有关掉单路的对照实验 | `fusion.route_contribution()` 已提供"这条只靠哪一路进来"的归因工具；完整 ablation 表待补 |
+| 6 | 分路贡献无 ablation | 只有整体开关对比，没有关掉单路的对照实验 | 部分修：`fusion.route_contribution()` 提供"这条只靠哪一路进来"的归因；`quota_rrf_fuse` 补了"单路失效不挤占另一路"的回归测试。完整 ablation 表待新基线重跑补齐 |
 | 7 | 父块扩展语义弱于"分层检索" | 默认 `parent_child` 模式下父块文本未单独入库，`parent_id` 指向同父块的首个子块 | 部分修：父级扩展已真实生效（此前是 no-op）。真正的"子块检索 + 父块替换"需要把父块也写入向量库并加 `node_level` 过滤 |
 | 8 | O(n²) 的其它潜在热点 | 已修 `_parent_child_parse` 的邻居查找（此前 1e4 chunk 约 30~60s）；其它循环未逐一审计 | 未完全修 |
 
@@ -543,7 +642,8 @@ Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确�
 | 口径 | CLI / eval | API 进程 |
 | --- | --- | --- |
 | `RECALL_TOP_K` | 200（`FUSION_RRF_K`=40） | 200 |
-| `RERANK_TOP_N` | 200 | **10**（`dify_external_api` 顶部 `setdefault`） |
+| `RERANK_TOP_N` | 10 | 10 |
+| API 实际重排输入上限 | 50 | 50 |
 | 实际喂给 LLM | `RAG_TOP_DOCS`=5 | 5 |
 | `--soft-match` 默认 | `none`（`0.78` 是 **embed 模式**的阈值，非命中判定默认） | — |
 | `--rrf-k` / `--recall-k` 默认 | 60 / 40 | 40 / 200 |

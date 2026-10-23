@@ -20,10 +20,8 @@ services:
 
   minio:
     container_name: milvus-minio
-    # NOTE: MinIO 已从 Docker Hub 下架镜像 —— 拉取 minio/minio 会返回
-    # "pull access denied ... repository does not exist"，直接用官方 quay.io 仓库。
-    # tag 与原配置保持一致（2024-12-18 版仍带 Web 控制台，后续版本已移除）。
-    image: quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z
+    # MinIO 原仓库已不可匿名拉取；使用 Milvus 项目维护的同版本镜像。
+    image: milvusdb/minio:RELEASE.2024-12-18T13-15-44Z
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin

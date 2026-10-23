@@ -29,6 +29,7 @@ dev = [
 test_llama = [
     "llama-index-core>=0.11",
     "llama-index-vector-stores-milvus>=0.2",
+    "llama-index-embeddings-openai>=0.3",
 ]
 
 [tool.setuptools]
@@ -36,6 +37,10 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Web 界面是单文件静态页，必须显式声明，否则 pip install 后 404。
+[tool.setuptools.package-data]
+pcb_rag = ["webui/*.html"]
 
 # ---------------------------------------------------------------------------
 # Ruff —— 静态检查（对应 Go 项目的 golangci-lint）

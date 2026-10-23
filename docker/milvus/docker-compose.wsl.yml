@@ -1,0 +1,14 @@
+# WSL runtime: keep data on the Linux filesystem and bind published ports locally.
+services:
+  etcd:
+    restart: unless-stopped
+  minio:
+    restart: unless-stopped
+    ports: !override
+      - "127.0.0.1:${MILVUS_MINIO_CONSOLE_PORT:-19001}:9001"
+      - "127.0.0.1:${MILVUS_MINIO_API_PORT:-19000}:9000"
+  standalone:
+    restart: unless-stopped
+    ports: !override
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:9091:9091"

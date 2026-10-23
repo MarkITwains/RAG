@@ -57,7 +57,7 @@ from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -920,6 +920,34 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ---------------------------------------------------------------------------
+# Web 界面
+#
+# 单文件静态页，不含任何配置或密钥：页面本身公开可访问是安全的，数据一律经
+# 带鉴权的 API 取。用户首次提问若收到 401，页面会提示填入 Bearer Token。
+# ---------------------------------------------------------------------------
+_WEBUI_DIR = Path(__file__).resolve().parent / "webui"
+_WEBUI_INDEX = _WEBUI_DIR / "index.html"
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/ui", include_in_schema=False)
+def web_ui():
+    """返回 Web 问答界面。"""
+    if not _WEBUI_INDEX.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Web 界面文件缺失：src/pcb_rag/webui/index.html",
+        )
+    return FileResponse(_WEBUI_INDEX, media_type="text/html")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    """浏览器默认会请求 favicon，返回 204 避免日志里出现无意义的 404。"""
+    return Response(status_code=204)
+
+
 # CORS 中间件
 #
 # 默认不开通配。威胁模型：本服务是 Bearer 认证、不使用 cookie，浏览器不会自动
@@ -1097,15 +1125,24 @@ def _retrieve_nodes(
             if step_back_q:
                 logger.info(f"[StepBack] 上位问题: {step_back_q}")
 
-    # ── Step 3: 查询扩展（同义词替换）────────────────────────────────────
+    # ── Step 3: 查询扩展（同义词）────────────────────────────────────────
+    #
+    # 扩展串**只喂 BM25**，不喂向量检索与精排。
+    #
+    # 理由：BM25 是词袋模型，追加同义词等价于扩展 OR 查询，通常提升词汇匹配
+    # 召回；dense 检索把整串编码成单个向量，拼上同义词会让向量偏离原问题意图；
+    # cross-encoder 做 query-doc 逐词交互，长 query 会稀释关键短语的权重。
+    # 早先三者共用同一个拼接串，等于让扩展的副作用同时作用在三个环节上。
     expanded_q = _expand_query(clean_q)
     if expanded_q != clean_q:
-        logger.info(f"[QueryExpand] {expanded_q[:80]}")
+        logger.info(f"[QueryExpand] BM25 专用扩展: {expanded_q[:80]}")
 
     # ── Step 4: HyDE / Query2Doc 查询增强 ────────────────────────────────
     #    Fusion 模式下 HyDE 将在 Step 5 中与检索并行执行，此处跳过
-    hyde_q   = expanded_q
-    q2doc_q  = expanded_q
+    #    HyDE 的输入用原问题：它的语义是"为这个问题生成假设答案"，
+    #    输入一张同义词表会让假设答案偏离原问题。
+    hyde_q   = clean_q
+    q2doc_q  = clean_q
     should_enhance = QUERY_ENHANCE_ALL or _is_short_query(clean_q)
     _use_parallel_fusion = (bm25_index is not None and not MULTIPATH_ENABLED)
 
@@ -1113,16 +1150,16 @@ def _retrieve_nodes(
         # 仅 MultiPath / 纯向量模式：同步预计算 HyDE / Query2Doc
         if HYDE_ENABLED:
             try:
-                hyde_q = hyde_expand_query(expanded_q)
+                hyde_q = hyde_expand_query(clean_q)
             except Exception as e:
                 logger.warning(f"[HyDE] 生成失败: {e}")
-                hyde_q = expanded_q
+                hyde_q = clean_q
         if QUERY2DOC_ENABLED:
             try:
-                q2doc_q = query2doc_expand(expanded_q)
+                q2doc_q = query2doc_expand(clean_q)
             except Exception as e:
                 logger.warning(f"[Query2Doc] 失败: {e}")
-                q2doc_q = expanded_q
+                q2doc_q = clean_q
 
     t_prep = time.time()
     logger.info(f"[Timing] 预处理: {t_prep - t_start:.2f}s")
@@ -1174,7 +1211,7 @@ def _retrieve_nodes(
             logger.info(f"[Rerank] 精排中，top_n={RERANK_TOP_N}...")
             retrieved_nodes = rerank._postprocess_nodes(
                 retrieved_nodes,
-                query_bundle=QueryBundle(query_str=expanded_q),
+                query_bundle=QueryBundle(query_str=clean_q),
             )
             _score_kind = "rerank"
         elif colbert_reranker is not None and COLBERT_RERANK_ENABLED:
@@ -1194,12 +1231,14 @@ def _retrieve_nodes(
         hyde_weight = vec_weight * float(HYDE_ROUTE_WEIGHT)
 
         # 多扩展查询变体（规则生成，<0.01s）
+        #
+        # 向量路以原问题为种子，BM25 路以扩展串为种子 —— 见 Step 3 的分工说明。
         target_nq = strategy["num_queries"] if strategy else FUSION_NUM_QUERIES
         if MULTI_EXPAND_ENABLED:
-            raw_queries = _build_multi_expand_queries(expanded_q, num_queries=target_nq)
+            raw_queries = _build_multi_expand_queries(clean_q, num_queries=target_nq)
             bm25_queries = _build_multi_expand_queries(expanded_q, num_queries=target_nq)
         else:
-            raw_queries = [expanded_q]
+            raw_queries = [clean_q]
             bm25_queries = [expanded_q]
 
         # 查询分解出的子问题并入多路召回
@@ -1226,8 +1265,8 @@ def _retrieve_nodes(
         #   主检索 pool 仅跑向量+BM25，完成后非阻塞 check HyDE
         hyde_futs: list = []
         if should_enhance and HYDE_ENABLED:
-            hyde_futs.append(_HYDE_EXECUTOR.submit(hyde_expand_query, expanded_q))  # 路1: 事实型
-            hyde_futs.append(_HYDE_EXECUTOR.submit(_hyde_expand_v2, expanded_q))    # 路2: 规范型
+            hyde_futs.append(_HYDE_EXECUTOR.submit(hyde_expand_query, clean_q))  # 路1: 事实型
+            hyde_futs.append(_HYDE_EXECUTOR.submit(_hyde_expand_v2, clean_q))    # 路2: 规范型
 
         # 主检索 pool：向量 + BM25（与 HyDE LLM 完全并行）
         n_workers = len(raw_queries) + len(bm25_queries)
@@ -1347,7 +1386,7 @@ def _retrieve_nodes(
             logger.info(f"[Rerank] 精排 {len(retrieved_nodes)} 候选...")
             retrieved_nodes = rerank._postprocess_nodes(
                 retrieved_nodes,
-                query_bundle=QueryBundle(query_str=expanded_q),
+                query_bundle=QueryBundle(query_str=clean_q),
             )
             logger.info(f"[Timing] 精排: {time.time() - t_pre_rerank:.2f}s "
                        f"→ {len(retrieved_nodes)} nodes")
@@ -1364,7 +1403,7 @@ def _retrieve_nodes(
         if rerank is not None:
             retrieved_nodes = rerank._postprocess_nodes(
                 retrieved_nodes,
-                query_bundle=QueryBundle(query_str=expanded_q),
+                query_bundle=QueryBundle(query_str=clean_q),
             )
             _score_kind = "rerank"
         else:
@@ -2090,12 +2129,18 @@ def ask_rag_stream(
                 "sources",
                 {
                     "sources": [info.get("source_path", "") for info in sources_info],
+                    # snippet / score / tokens 是给 Web UI 用的：只给文件名的话，
+                    # 用户无法判断"这条证据到底说了什么、有多可信"，只能盲信答案。
                     "citations": [
                         {
                             "index": info.get("index"),
                             "source_name": info.get("source_name", ""),
                             "section": info.get("section", ""),
                             "chunk_id": info.get("chunk_id", ""),
+                            "snippet": info.get("snippet", ""),
+                            "score": info.get("score", 0.0),
+                            "tokens": info.get("tokens", 0),
+                            "truncated": info.get("truncated", False),
                         }
                         for info in sources_info
                     ],

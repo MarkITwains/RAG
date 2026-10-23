@@ -1,0 +1,818 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PCB-RAG · 知识库问答</title>
+<style>
+:root{
+  --bg:#ffffff;
+  --surface:#fafaf9;
+  --surface-2:#f3f3f1;
+  --line:rgba(0,0,0,.09);
+  --line-2:rgba(0,0,0,.16);
+  --text:#1a1a18;
+  --text-2:#63635e;
+  --text-3:#97978e;
+  --action:#0066cc;
+  --action-soft:rgba(0,102,204,.07);
+  --danger:#b42318;
+  --ok:#0a7a48;
+  --warn:#9a6700;
+  --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font-family:var(--sans);font-size:15px;line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+  display:flex;flex-direction:column;
+}
+
+/* ---------- 顶栏 ---------- */
+.topbar{
+  height:56px;flex:0 0 56px;
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 24px;border-bottom:1px solid var(--line);
+}
+.brand{display:flex;align-items:baseline;gap:10px;min-width:0}
+.brand .name{font-size:15px;font-weight:500;letter-spacing:-.01em}
+.brand .sub{font-size:12px;color:var(--text-3);letter-spacing:.02em}
+.brand .mark{
+  width:7px;height:7px;background:var(--action);border-radius:1px;
+  display:inline-block;margin-right:2px;transform:translateY(-1px);
+}
+.topbar-right{display:flex;align-items:center;gap:6px}
+.status{
+  display:flex;align-items:center;gap:6px;
+  font-size:12px;color:var(--text-2);margin-right:6px;
+  font-variant-numeric:tabular-nums;cursor:pointer;
+}
+.status:hover .label{color:var(--text)}
+.status .dot{
+  width:6px;height:6px;border-radius:50%;background:var(--text-3);
+}
+.status.ok .dot{background:var(--ok)}
+.status.err .dot{background:var(--danger)}
+.status.warn .dot{background:var(--warn)}
+
+button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;transition:background .12s,border-color .12s,color .12s}
+.ghost{
+  background:transparent;border:1px solid transparent;color:var(--text-2);
+  padding:5px 10px;
+}
+.ghost:hover{background:var(--surface-2);color:var(--text)}
+.ghost:disabled{opacity:.4;cursor:not-allowed}
+.primary{
+  background:var(--action);border:1px solid var(--action);color:#fff;
+  padding:8px 18px;font-weight:500;
+}
+.primary:hover{background:#0057ad;border-color:#0057ad}
+.primary:disabled{background:var(--surface-2);border-color:var(--line);color:var(--text-3);cursor:not-allowed}
+
+/* ---------- 主体 ---------- */
+.layout{flex:1;display:grid;grid-template-columns:minmax(0,1fr) 372px;min-height:0}
+.thread{overflow-y:auto;scroll-behavior:smooth}
+.thread-inner{max-width:780px;margin:0 auto;padding:44px 32px 72px}
+
+/* 空状态 */
+.empty{padding:12vh 0 0}
+.empty h1{
+  font-size:26px;font-weight:500;letter-spacing:-.02em;
+  margin:0 0 10px;line-height:1.35;
+}
+.empty p{color:var(--text-2);font-size:14px;margin:0 0 36px;max-width:52ch}
+.starters{display:flex;flex-direction:column;gap:1px;border-top:1px solid var(--line)}
+.starter{
+  text-align:left;background:none;border:0;border-bottom:1px solid var(--line);
+  padding:15px 2px;color:var(--text);font-size:14px;
+  display:flex;align-items:center;gap:14px;
+  transition:background .12s;
+}
+.starter:hover{background:var(--surface)}
+.starter .idx{
+  font-family:var(--mono);font-size:11px;color:var(--text-3);
+  flex:0 0 22px;letter-spacing:.04em;
+}
+.starter .arrow{
+  margin-left:auto;color:var(--text-2);font-size:13px;
+  transition:color .12s,transform .12s;
+}
+.starter:hover .arrow{color:var(--action);transform:translateX(3px)}
+
+/* 消息 */
+.turn{padding:0 0 40px;margin:0 0 8px}
+.turn + .turn{border-top:1px solid var(--line);padding-top:36px}
+.q{display:flex;gap:12px;margin-bottom:22px}
+.q .bullet{
+  flex:0 0 auto;font-family:var(--mono);font-size:12px;color:var(--action);
+  padding-top:4px;
+}
+.q .text{font-size:17px;font-weight:500;line-height:1.5;letter-spacing:-.01em}
+.q .rewrite{
+  font-size:12px;color:var(--text-3);margin-top:6px;font-weight:400;
+  font-family:var(--mono);
+}
+.a{font-size:15px;line-height:1.78;color:var(--text);word-break:break-word}
+.a p{margin:0 0 14px}
+.a p:last-child{margin-bottom:0}
+.a h3{font-size:15px;font-weight:500;margin:24px 0 10px}
+.a h4{font-size:14px;font-weight:500;margin:20px 0 8px;color:var(--text-2)}
+.a ul,.a ol{margin:0 0 14px;padding-left:22px}
+.a li{margin:0 0 6px}
+.a code{
+  font-family:var(--mono);font-size:12.5px;
+  background:var(--surface-2);padding:1px 5px;border-radius:3px;
+}
+.a pre{
+  background:var(--surface);border:1px solid var(--line);border-radius:8px;
+  padding:14px 16px;overflow-x:auto;margin:0 0 14px;
+}
+.a pre code{background:none;padding:0;font-size:12.5px;line-height:1.6}
+.a strong{font-weight:500}
+.a .refs{margin-top:20px;padding-top:14px;border-top:1px solid var(--line);font-size:12.5px;color:var(--text-2)}
+.a .refs b{font-weight:500;color:var(--text)}
+
+/* 引用角标 */
+.cite{
+  display:inline-block;font-family:var(--mono);font-size:10.5px;
+  line-height:1;padding:2px 4px;margin:0 1px;
+  border:1px solid rgba(0,102,204,.35);border-radius:3px;
+  color:var(--action);cursor:pointer;vertical-align:2px;
+  background:var(--action-soft);
+  transition:background .12s,border-color .12s;
+}
+.cite:hover,.cite.active{background:var(--action);border-color:var(--action);color:#fff}
+
+/* 生成中的光标 */
+.caret{
+  display:inline-block;width:2px;height:15px;background:var(--action);
+  vertical-align:-2px;margin-left:1px;
+  animation:blink 1.1s steps(2,start) infinite;
+}
+@keyframes blink{to{visibility:hidden}}
+@media (prefers-reduced-motion:reduce){.caret{animation:none}}
+
+/* 错误 */
+.err-box{
+  border:1px solid rgba(180,35,24,.25);background:rgba(180,35,24,.04);
+  border-radius:8px;padding:12px 14px;font-size:13.5px;color:var(--danger);
+}
+.err-box .hint{color:var(--text-2);font-size:12.5px;margin-top:6px}
+
+/* ---------- 右侧证据面板 ---------- */
+.panel{
+  border-left:1px solid var(--line);display:flex;flex-direction:column;
+  min-height:0;background:var(--surface);
+}
+.panel-head{
+  height:44px;flex:0 0 44px;display:flex;align-items:center;gap:8px;
+  padding:0 20px;border-bottom:1px solid var(--line);
+}
+.panel-head h2{font-size:12.5px;font-weight:500;margin:0;color:var(--text-2);letter-spacing:.02em}
+.panel-head .count{
+  font-family:var(--mono);font-size:11px;color:var(--text-3);
+  margin-left:auto;
+}
+.panel-body{flex:1;overflow-y:auto;padding:14px 16px 32px}
+.panel-empty{
+  font-size:12.5px;color:var(--text-2);line-height:1.7;padding:8px 4px;
+}
+.src{
+  background:var(--bg);border:1px solid var(--line);border-radius:8px;
+  margin-bottom:8px;overflow:hidden;transition:border-color .12s;
+}
+.src:hover{border-color:var(--line-2)}
+.src.active{border-color:var(--action)}
+.src-head{
+  display:flex;align-items:flex-start;gap:8px;padding:11px 12px;cursor:pointer;
+}
+.src-idx{
+  font-family:var(--mono);font-size:10.5px;color:var(--text-3);
+  border:1px solid var(--line-2);border-radius:3px;
+  padding:1px 4px;flex:0 0 auto;margin-top:1px;
+}
+.src-main{min-width:0;flex:1}
+.src-name{
+  font-size:12.5px;font-weight:500;color:var(--text);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.src-meta{
+  font-family:var(--mono);font-size:10.5px;color:var(--text-3);
+  margin-top:3px;display:flex;gap:8px;flex-wrap:wrap;
+}
+.src-body{
+  display:none;padding:0 12px 12px;font-size:12.5px;color:var(--text-2);
+  line-height:1.72;border-top:1px solid var(--line);margin-top:0;padding-top:11px;
+}
+.src.open .src-body{display:block}
+.src-caret{
+  flex:0 0 auto;width:6px;height:6px;margin-top:6px;
+  border-right:1px solid var(--text-3);border-bottom:1px solid var(--text-3);
+  transform:rotate(45deg);transition:transform .15s,border-color .12s;
+}
+.src.open .src-caret{transform:rotate(-135deg);margin-top:9px}
+.src:hover .src-caret{border-color:var(--text-2)}
+.src-sec{
+  font-size:12px;color:var(--text-2);margin-bottom:8px;
+  padding-left:8px;border-left:2px solid var(--line-2);
+}
+
+/* ---------- 输入区 ---------- */
+.composer{flex:0 0 auto;border-top:1px solid var(--line);background:var(--bg)}
+.composer-inner{
+  max-width:780px;margin:0 auto;padding:16px 32px 0;
+  display:flex;gap:10px;align-items:flex-end;
+}
+#input{
+  flex:1;resize:none;border:1px solid var(--line-2);border-radius:10px;
+  padding:12px 14px;font-family:inherit;font-size:14.5px;line-height:1.6;
+  color:var(--text);background:var(--bg);outline:none;
+  max-height:180px;min-height:46px;
+  transition:border-color .12s;
+}
+#input:focus{border-color:var(--action)}
+#input::placeholder{color:var(--text-3)}
+.composer-inner .primary{height:46px;padding:0 20px}
+.composer-meta{
+  max-width:780px;margin:0 auto;padding:8px 32px 14px;
+  display:flex;align-items:center;gap:18px;
+  font-size:11.5px;color:var(--text-3);font-family:var(--mono);
+}
+.composer-meta label{display:flex;align-items:center;gap:6px}
+.composer-meta input[type=number]{
+  width:52px;border:1px solid var(--line);border-radius:4px;
+  padding:2px 5px;font-family:var(--mono);font-size:11.5px;
+  color:var(--text-2);background:var(--bg);
+}
+.composer-meta .kbd{margin-left:auto;font-size:11px}
+
+/* ---------- 设置弹层 ---------- */
+.sheet{
+  position:absolute;top:56px;right:16px;width:340px;z-index:50;
+  background:var(--bg);border:1px solid var(--line-2);border-radius:10px;
+  padding:18px;display:none;
+}
+.sheet.open{display:block}
+.sheet h3{font-size:13px;font-weight:500;margin:0 0 4px}
+.sheet .desc{font-size:12px;color:var(--text-3);margin:0 0 14px;line-height:1.6}
+.sheet label{display:block;font-size:12px;color:var(--text-2);margin-bottom:5px}
+.sheet input{
+  width:100%;border:1px solid var(--line-2);border-radius:6px;
+  padding:8px 10px;font-family:var(--mono);font-size:12px;
+  color:var(--text);outline:none;
+}
+.sheet input:focus{border-color:var(--action)}
+.sheet .row{display:flex;gap:8px;margin-top:14px}
+.sheet .row button{flex:1}
+.sheet .note{font-size:11.5px;color:var(--text-3);margin:10px 0 0;line-height:1.6}
+
+/* ---------- 窄屏 ---------- */
+@media (max-width:900px){
+  .layout{grid-template-columns:1fr}
+  .panel{display:none}
+  .thread-inner{padding:28px 20px 48px}
+  .composer-inner{padding:12px 16px 0}
+  .composer-meta{padding:8px 16px 12px;gap:12px}
+  .brand .sub{display:none}
+  .empty{padding-top:6vh}
+}
+@media (max-width:560px){
+  .status .label{display:none}
+  .composer-meta .kbd{display:none}
+  .topbar{padding:0 16px}
+  .thread-inner{padding:22px 16px 40px}
+  .q .text{font-size:16px}
+  .a{font-size:14.5px}
+  .empty h1{font-size:22px}
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark"></span>
+    <span class="name">PCB-RAG</span>
+    <span class="sub">印制电路知识库</span>
+  </div>
+  <div class="topbar-right">
+    <div class="status" id="status"><span class="dot"></span><span class="label">检查中</span></div>
+    <button class="ghost" id="btnSettings">设置</button>
+    <button class="ghost" id="btnNew">新对话</button>
+  </div>
+</header>
+
+<div class="sheet" id="sheet">
+  <h3>接口凭据</h3>
+  <p class="desc">服务端以 Bearer Token 鉴权，填一次即存于本机浏览器。</p>
+  <label for="tokenInput">API Token</label>
+  <input id="tokenInput" type="password" placeholder="DIFY_API_TOKEN" autocomplete="off">
+  <div class="row">
+    <button class="ghost" id="btnClearToken">清除</button>
+    <button class="primary" id="btnSaveToken">保存</button>
+  </div>
+  <p class="note">若服务端未启用鉴权，留空即可。</p>
+</div>
+
+<main class="layout">
+  <section class="thread" id="thread">
+    <div class="thread-inner" id="threadInner"></div>
+  </section>
+  <aside class="panel">
+    <div class="panel-head">
+      <h2>证据来源</h2>
+      <span class="count" id="srcCount">0</span>
+    </div>
+    <div class="panel-body" id="panelBody">
+      <p class="panel-empty">提问后，这里会列出模型实际依据的原文片段、所属章节与检索得分。点击答案里的角标可定位到对应条目。</p>
+    </div>
+  </aside>
+</main>
+
+<footer class="composer">
+  <div class="composer-inner">
+    <textarea id="input" rows="1" placeholder="询问 PCB 设计规范、工艺参数或 EDA 工具操作…"></textarea>
+    <button class="primary" id="send">提问</button>
+  </div>
+  <div class="composer-meta">
+    <label>召回 <input type="number" id="topK" value="10" min="1" max="50"></label>
+    <label>阈值 <input type="number" id="threshold" value="0" min="0" max="1" step="0.05"></label>
+    <span class="kbd">Enter 发送 · Shift+Enter 换行</span>
+  </div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+
+  var TOKEN_KEY = "pcb_rag_token";
+  var state = {
+    token: localStorage.getItem(TOKEN_KEY) || "",
+    history: [],
+    turns: [],
+    sources: [],
+    busy: false,
+    ctrl: null
+  };
+
+  var el = {
+    thread: document.getElementById("thread"),
+    inner: document.getElementById("threadInner"),
+    panelBody: document.getElementById("panelBody"),
+    srcCount: document.getElementById("srcCount"),
+    input: document.getElementById("input"),
+    send: document.getElementById("send"),
+    status: document.getElementById("status"),
+    sheet: document.getElementById("sheet"),
+    tokenInput: document.getElementById("tokenInput"),
+    topK: document.getElementById("topK"),
+    threshold: document.getElementById("threshold")
+  };
+
+  /* ---------- 工具 ---------- */
+  function esc(s){
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function fmtScore(v){
+    var n = Number(v);
+    if (!isFinite(n) || n <= 0) return "—";
+    return n >= 1 ? n.toFixed(2) : n.toFixed(3);
+  }
+
+  /* ---------- 轻量 Markdown ----------
+     不引入外部库：离线部署时 CDN 不可用，而 RAG 答案的语法范围有限。
+     顺序：转义 → 提取代码块 → 粗体/标题/列表 → 段落 → 还原 → 角标。 */
+  function md(src){
+    var text = esc(src || "");
+    var blocks = [];
+
+    text = text.replace(/```[a-zA-Z0-9_-]*\n?([\s\S]*?)```/g, function(_, code){
+      blocks.push('<pre><code>' + code.replace(/\n$/, "") + '</code></pre>');
+      return "\u0000B" + (blocks.length - 1) + "\u0000";
+    });
+
+    var inline = [];
+    text = text.replace(/`([^`\n]+)`/g, function(_, code){
+      inline.push('<code>' + code + '</code>');
+      return "\u0000I" + (inline.length - 1) + "\u0000";
+    });
+
+    text = text.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    text = text.replace(/^####\s+(.+)$/gm, "<h4>$1</h4>");
+    text = text.replace(/^###\s+(.+)$/gm, "<h3>$1</h3>");
+    text = text.replace(/^##\s+(.+)$/gm, "<h3>$1</h3>");
+
+    // 列表：连续的 "- " / "* " 行合并为一个 <ul>
+    text = text.replace(/(?:^[-*]\s+.+(?:\n|$))+/gm, function(chunk){
+      var items = chunk.trim().split(/\n/).map(function(line){
+        return "<li>" + line.replace(/^[-*]\s+/, "") + "</li>";
+      }).join("");
+      return "<ul>" + items + "</ul>\n";
+    });
+    text = text.replace(/(?:^\d+\.\s+.+(?:\n|$))+/gm, function(chunk){
+      var items = chunk.trim().split(/\n/).map(function(line){
+        return "<li>" + line.replace(/^\d+\.\s+/, "") + "</li>";
+      }).join("");
+      return "<ol>" + items + "</ol>\n";
+    });
+
+    // 段落：空行分段，跳过已是块级标签的行
+    var out = [];
+    text.split(/\n{2,}/).forEach(function(part){
+      var p = part.trim();
+      if (!p) return;
+      if (/^<(h3|h4|ul|ol|pre|blockquote)/.test(p)) { out.push(p); return; }
+      out.push("<p>" + p.replace(/\n/g, "<br>") + "</p>");
+    });
+    text = out.join("\n");
+
+    text = text.replace(/\u0000I(\d+)\u0000/g, function(_, i){ return inline[Number(i)]; });
+    text = text.replace(/\u0000B(\d+)\u0000/g, function(_, i){ return blocks[Number(i)]; });
+
+    // 引用角标：[1] [1][2] [1,2]
+    text = text.replace(/\[(\d+(?:\s*,\s*\d+)*)\]/g, function(_, nums){
+      return nums.split(",").map(function(n){
+        var k = n.trim();
+        return '<sup class="cite" data-idx="' + k + '">' + k + "</sup>";
+      }).join("");
+    });
+
+    return text;
+  }
+
+  /* ---------- 状态 ---------- */
+  function setStatus(kind, label){
+    el.status.className = "status" + (kind ? " " + kind : "");
+    el.status.querySelector(".label").textContent = label;
+  }
+
+  function checkHealth(){
+    fetch("/health", { cache: "no-store" })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.index_ready && d.bm25_ready) {
+          setStatus("ok", "索引就绪" + (d.rerank_ready ? " · 精排" : ""));
+        } else if (d.index_ready) {
+          setStatus("warn", "词法索引缺失");
+        } else {
+          setStatus("warn", "索引未就绪");
+        }
+      })
+      .catch(function(){ setStatus("err", "服务不可达"); });
+  }
+
+  /* ---------- 渲染 ---------- */
+  function renderEmpty(){
+    var qs = [
+      "4 层板的阻抗控制需要关注哪些参数？",
+      "Altium Designer 中高速差分线等长怎么处理？",
+      "沉金与喷锡工艺分别适用于什么场景？",
+      "PCB 翘曲度的验收标准是多少？"
+    ];
+    el.inner.innerHTML =
+      '<div class="empty">' +
+        '<h1>向 PCB 知识库提问</h1>' +
+        '<p>答案仅依据已入库的标准、设计与工艺文档生成，并标注可追溯的原文片段。' +
+        '若文档中没有依据，系统会直接说明而不猜测。</p>' +
+        '<div class="starters">' + qs.map(starter).join("") + "</div>" +
+      "</div>";
+  }
+
+  function starter(q, i){
+    return '<button class="starter" data-q="' + esc(q) + '">' +
+      '<span class="idx">' + String(i + 1).padStart(2, "0") + "</span>" +
+      '<span>' + esc(q) + "</span>" +
+      '<span class="arrow">→</span></button>';
+  }
+
+  function addTurn(question, rewritten){
+    var wrap = document.createElement("div");
+    wrap.className = "turn";
+    var head = document.createElement("div");
+    head.className = "q";
+    head.innerHTML =
+      '<span class="bullet">›</span>' +
+      '<div><div class="text">' + esc(question) + "</div>" +
+      (rewritten ? '<div class="rewrite">检索改写：' + esc(rewritten) + "</div>" : "") +
+      "</div>";
+    var body = document.createElement("div");
+    body.className = "a";
+    wrap.appendChild(head);
+    wrap.appendChild(body);
+    el.inner.appendChild(wrap);
+    return { root: wrap, body: body, answer: "" };
+  }
+
+  function renderSources(list){
+    state.sources = list || [];
+    el.srcCount.textContent = String(state.sources.length);
+
+    if (!state.sources.length) {
+      el.panelBody.innerHTML =
+        '<p class="panel-empty">本次检索没有命中任何片段。</p>';
+      return;
+    }
+
+    el.panelBody.innerHTML = state.sources.map(function(s){
+      var meta = [];
+      if (s.score) meta.push("score " + fmtScore(s.score));
+      if (s.tokens) meta.push(s.tokens + " tok");
+      if (s.chunk_id) meta.push(s.chunk_id.slice(0, 8));
+      if (s.truncated) meta.push("已截断");
+
+      return '<div class="src" data-idx="' + esc(s.index) + '">' +
+        '<div class="src-head">' +
+          '<span class="src-idx">' + esc(s.index) + "</span>" +
+          '<div class="src-main">' +
+            '<div class="src-name">' + esc(s.source_name || "未知文档") + "</div>" +
+            '<div class="src-meta">' + meta.map(esc).join("<span>·</span>") + "</div>" +
+          "</div>" +
+          '<span class="src-caret"></span>' +
+        "</div>" +
+        '<div class="src-body">' +
+          (s.section ? '<div class="src-sec">' + esc(s.section) + "</div>" : "") +
+          esc(s.snippet || "（无摘要）") +
+        "</div>" +
+      "</div>";
+    }).join("");
+  }
+
+  function focusSource(idx){
+    var card = el.panelBody.querySelector('.src[data-idx="' + idx + '"]');
+    if (!card) return;
+    Array.prototype.forEach.call(el.panelBody.querySelectorAll(".src.active"), function(n){
+      n.classList.remove("active");
+    });
+    card.classList.add("active", "open");
+    card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+
+  function scrollToBottom(force){
+    var near = el.thread.scrollHeight - el.thread.scrollTop - el.thread.clientHeight < 160;
+    if (force || near) el.thread.scrollTop = el.thread.scrollHeight;
+  }
+
+  /* ---------- SSE ---------- */
+  function parseBlock(raw){
+    var ev = "message", data = "";
+    raw.split(/\n/).forEach(function(line){
+      if (line.indexOf("event:") === 0) ev = line.slice(6).trim();
+      else if (line.indexOf("data:") === 0) data += line.slice(5).trim();
+    });
+    if (!data) return null;
+    try { return { event: ev, data: JSON.parse(data) }; }
+    catch (e) { return null; }
+  }
+
+  async function ask(question){
+    if (state.busy) return;
+    var q = question.trim();
+    if (!q) return;
+
+    state.busy = true;
+    el.send.disabled = true;
+    el.send.textContent = "检索中";
+    if (state.turns.length === 0) el.inner.innerHTML = "";
+
+    var turn = addTurn(q);
+    state.turns.push({ q: q, a: "" });
+    scrollToBottom(true);
+    renderSources([]);
+
+    var controller = new AbortController();
+    state.ctrl = controller;
+
+    var payload = {
+      query: q,
+      top_k: Number(el.topK.value) || 10,
+      score_threshold_enabled: Number(el.threshold.value) > 0,
+      score_threshold: Number(el.threshold.value) || 0,
+      chat_history: state.history.slice(-6)
+    };
+
+    var headers = { "Content-Type": "application/json" };
+    if (state.token) headers["Authorization"] = "Bearer " + state.token;
+
+    try {
+      var res = await fetch("/api/ask/stream", {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+
+      if (res.status === 401 || res.status === 403) {
+        throw new Error("AUTH");
+      }
+      if (!res.ok || !res.body) {
+        var detail = "";
+        try { detail = (await res.json()).detail || ""; } catch (e) {}
+        throw new Error(detail || ("HTTP " + res.status));
+      }
+
+      el.send.textContent = "生成中";
+
+      var reader = res.body.getReader();
+      var decoder = new TextDecoder("utf-8");
+      var buf = "";
+      var caret = document.createElement("span");
+      caret.className = "caret";
+      turn.body.appendChild(caret);
+
+      var firstToken = true;
+      while (true) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buf += decoder.decode(chunk.value, { stream: true });
+
+        var cut;
+        while ((cut = buf.indexOf("\n\n")) >= 0) {
+          var block = buf.slice(0, cut);
+          buf = buf.slice(cut + 2);
+          var msg = parseBlock(block);
+          if (!msg) continue;
+
+          if (msg.event === "sources") {
+            if (msg.data.rewritten_query) {
+              var rw = turn.root.querySelector(".q");
+              var line = document.createElement("div");
+              line.className = "rewrite";
+              line.textContent = "检索改写：" + msg.data.rewritten_query;
+              rw.querySelector("div").appendChild(line);
+            }
+            renderSources(msg.data.citations || []);
+          } else if (msg.event === "token") {
+            if (firstToken) {
+              firstToken = false;
+              caret.remove();
+              turn.body.innerHTML = '<span class="stream"></span>';
+            }
+            turn.answer += msg.data.text || "";
+            turn.body.querySelector(".stream").innerHTML = md(turn.answer);
+            scrollToBottom(false);
+          } else if (msg.event === "citations") {
+            // 引用溯源明细已在 sources 事件里给出，此处不重复渲染
+          } else if (msg.event === "error") {
+            throw new Error(msg.data.message || "生成失败");
+          } else if (msg.event === "done") {
+            // 交给 finally 统一收尾
+          }
+        }
+      }
+
+      caret.remove();
+      if (!turn.answer) {
+        turn.body.innerHTML = '<p style="color:var(--text-3)">未生成内容。</p>';
+      }
+
+      state.history.push({ role: "user", content: q });
+      state.history.push({ role: "assistant", content: turn.answer });
+      state.turns[state.turns.length - 1].a = turn.answer;
+      scrollToBottom(false);
+
+    } catch (err) {
+      var message = err && err.message ? err.message : String(err);
+      var hint = "";
+      if (message === "AUTH") {
+        hint = "服务端启用了鉴权。点右上角「设置」填入 API Token 后重试。";
+        message = "鉴权失败（401）";
+        openSheet();
+      } else if (err && err.name === "AbortError") {
+        message = "已取消";
+      }
+      turn.body.innerHTML =
+        '<div class="err-box">' + esc(message) +
+        (hint ? '<div class="hint">' + esc(hint) + "</div>" : "") +
+        "</div>";
+    } finally {
+      state.busy = false;
+      state.ctrl = null;
+      el.send.disabled = false;
+      el.send.textContent = "提问";
+      el.input.focus();
+    }
+  }
+
+  /* ---------- 交互 ---------- */
+  function openSheet(){
+    el.tokenInput.value = state.token;
+    el.sheet.classList.add("open");
+    el.tokenInput.focus();
+  }
+
+  function closeSheet(){ el.sheet.classList.remove("open"); }
+
+  el.send.addEventListener("click", function(){
+    var q = el.input.value;
+    el.input.value = "";
+    el.input.style.height = "auto";
+    ask(q);
+  });
+
+  el.input.addEventListener("keydown", function(e){
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      el.send.click();
+    }
+  });
+
+  el.input.addEventListener("input", function(){
+    el.input.style.height = "auto";
+    el.input.style.height = Math.min(el.input.scrollHeight, 180) + "px";
+  });
+
+  el.inner.addEventListener("click", function(e){
+    var starter = e.target.closest(".starter");
+    if (starter) {
+      ask(starter.getAttribute("data-q"));
+      return;
+    }
+    var cite = e.target.closest(".cite");
+    if (cite) {
+      Array.prototype.forEach.call(el.inner.querySelectorAll(".cite.active"), function(n){
+        n.classList.remove("active");
+      });
+      cite.classList.add("active");
+      focusSource(cite.getAttribute("data-idx"));
+    }
+  });
+
+  el.panelBody.addEventListener("click", function(e){
+    var card = e.target.closest(".src");
+    if (!card) return;
+    card.classList.toggle("open");
+  });
+
+  document.getElementById("btnNew").addEventListener("click", function(){
+    if (state.ctrl) state.ctrl.abort();
+    state.history = [];
+    state.turns = [];
+    el.inner.innerHTML = "";
+    renderEmpty();
+    renderSources([]);
+    el.input.focus();
+  });
+
+  document.getElementById("btnSettings").addEventListener("click", function(e){
+    e.stopPropagation();
+    if (el.sheet.classList.contains("open")) closeSheet(); else openSheet();
+  });
+
+  document.getElementById("btnSaveToken").addEventListener("click", function(){
+    state.token = el.tokenInput.value.trim();
+    if (state.token) localStorage.setItem(TOKEN_KEY, state.token);
+    else localStorage.removeItem(TOKEN_KEY);
+    closeSheet();
+    checkHealth();
+  });
+
+  document.getElementById("btnClearToken").addEventListener("click", function(){
+    state.token = "";
+    el.tokenInput.value = "";
+    localStorage.removeItem(TOKEN_KEY);
+  });
+
+  document.addEventListener("click", function(e){
+    if (el.sheet.classList.contains("open") &&
+        !el.sheet.contains(e.target) &&
+        e.target.id !== "btnSettings") {
+      closeSheet();
+    }
+  });
+
+  document.addEventListener("keydown", function(e){
+    if (e.key === "Escape") closeSheet();
+  });
+
+  // 窄屏下长 placeholder 会换行并被 min-height 裁掉，按宽度切换文案
+  function syncPlaceholder(){
+    el.input.placeholder = window.innerWidth < 560
+      ? "询问 PCB 规范或工艺参数…"
+      : "询问 PCB 设计规范、工艺参数或 EDA 工具操作…";
+  }
+  window.addEventListener("resize", syncPlaceholder);
+  syncPlaceholder();
+
+  /* ---------- 启动 ---------- */
+  renderEmpty();
+
+  // 未配置凭据时不探测健康状态：/health 虽公开，但无法据此判断当前 token
+  // 是否有效，先给一个明确的指引比显示"索引就绪"却一提问就 401 更好。
+  if (state.token) {
+    checkHealth();
+  } else {
+    setStatus("warn", "未配置凭据");
+  }
+
+  el.status.addEventListener("click", openSheet);
+  el.input.focus();
+})();
+</script>
+</body>
+</html>

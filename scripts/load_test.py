@@ -14,8 +14,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import statistics
+import os
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -37,10 +38,14 @@ def main() -> int:
     ap.add_argument("--total", type=int, default=60)
     ap.add_argument("--dataset", default=str(ROOT / "eval/datasets/regression_v1.json"))
     ap.add_argument("--sample", type=int, default=30, help="从冻结集抽 N 题（固定种子）")
-    ap.add_argument("--token", default="")
+    ap.add_argument("--token", default=os.getenv("DIFY_API_TOKEN", ""))
+    ap.add_argument("--warmup", type=int, default=1)
+    ap.add_argument("--reset-metrics", action="store_true")
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--out", default="")
     args = ap.parse_args()
+    if args.concurrency < 1 or args.total < 1 or args.sample < 1:
+        ap.error("concurrency, total, and sample must be positive")
 
     rows = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
     random.Random(42).shuffle(rows)
@@ -49,23 +54,38 @@ def main() -> int:
     headers = {"Authorization": f"Bearer {args.token}", "Content-Type": "application/json"}
     if args.endpoint == "retrieval":
         url = f"{args.base_url}/retrieval"
-        payloads = [{
-            "knowledge_id": "pcb_kb",
-            "query": q,
-            "retrieval_setting": {"top_k": args.top_k, "score_threshold": 0.0,
-                                  "score_threshold_enabled": False},
-        } for q in queries]
+        payloads = [
+            {
+                "knowledge_id": "pcb_kb",
+                "query": q,
+                "retrieval_setting": {"top_k": args.top_k, "score_threshold": 0.0, "score_threshold_enabled": False},
+            }
+            for q in queries
+        ]
     else:
         url = f"{args.base_url}/api/ask"
-        payloads = [{"query": q} for q in queries]
+        payloads = [{"query": q, "top_k": args.top_k} for q in queries]
 
     # 预检：第一发 422 之类直接把响应体打出来，避免整场白跑
-    pre = requests.post(url, json=payloads[0], headers=headers, timeout=300)
-    if pre.status_code != 200:
-        print(f"[FATAL] 预检失败 HTTP {pre.status_code}: {pre.text[:300]}")
-        return 2
+    for payload in payloads[: args.warmup]:
+        pre = requests.post(url, json=payload, headers=headers, timeout=300)
+        if pre.status_code != 200:
+            print(f"[FATAL] 预检失败 HTTP {pre.status_code}: {pre.text[:300]}")
+            return 2
+    if args.reset_metrics:
+        reset = requests.post(f"{args.base_url}/_experiment/reset", headers=headers, timeout=10)
+        reset.raise_for_status()
 
     results: list[tuple[float, object]] = []
+    details: list[dict] = []
+    lock = threading.Lock()
+    checkpoint = Path(args.out).with_suffix(".jsonl") if args.out else None
+    if checkpoint:
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        if checkpoint.exists():
+            raise RuntimeError(
+                "Load-test checkpoint exists; use a new output name to preserve a continuous measurement"
+            )
     t_start = time.time()
 
     def one(i: int) -> None:
@@ -73,9 +93,41 @@ def main() -> int:
         t0 = time.time()
         try:
             r = requests.post(url, json=p, headers=headers, timeout=300)
-            results.append((time.time() - t0, r.status_code))
+            elapsed = time.time() - t0
+            status = r.status_code
+            try:
+                response = r.json()
+            except Exception:
+                response = {}
+            item = {
+                "request_index": i,
+                "query_index": i % len(payloads),
+                "query": p["query"],
+                "latency_s": elapsed,
+                "status": status,
+                "trace_id": r.headers.get("X-Trace-Id"),
+                "answer_chars": len(response.get("answer", "")),
+                "records": len(response.get("records", [])),
+            }
         except Exception as e:  # noqa: BLE001 —— 压测必须把错误当数据点
-            results.append((time.time() - t0, f"ERR:{type(e).__name__}"))
+            elapsed = time.time() - t0
+            status = f"ERR:{type(e).__name__}"
+            item = {
+                "request_index": i,
+                "query_index": i % len(payloads),
+                "query": p["query"],
+                "latency_s": elapsed,
+                "status": status,
+            }
+        with lock:
+            results.append((elapsed, status))
+            details.append(item)
+            if checkpoint:
+                with checkpoint.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    stream.flush()
+            if len(results) % 10 == 0:
+                print(f"[load {len(results)}/{args.total}]", flush=True)
 
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
         list(ex.map(one, range(args.total)))
@@ -105,7 +157,15 @@ def main() -> int:
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(
-            json.dumps({"summary": summary, "latencies": dts}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "summary": summary,
+                    "latencies": dts,
+                    "requests": sorted(details, key=lambda row: row["request_index"]),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
     return 0 if ok == args.total else 1

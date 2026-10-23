@@ -101,6 +101,118 @@ def rank_of(nodes: Sequence[Any]) -> Dict[str, int]:
     return {node_id_key(n): i for i, n in enumerate(nodes, 1)}
 
 
+def quota_rrf_fuse(
+    routes: Sequence[Tuple[Sequence[Any], float]],
+    top_n: int,
+    rrf_k: int = DEFAULT_RRF_K,
+    min_per_route: int = 1,
+    quotas: Optional[Sequence[int]] = None,
+) -> List[Any]:
+    """保底配额 + 加权 RRF 补齐的融合。
+
+    为什么需要它
+    ------------
+    纯加权 RRF 有一个隐含前提：每一路的 rank 都大致反映相关性。一旦某一路
+    系统性失效（例如 embedding 契约错误导致余弦相似度与语义无关），它的高位
+    结果仍会拿到 ``w/(k+rank)`` 的分数，把另一路的真实信号挤出榜单。实测中
+    BM25 单路 MRR 0.4891、融合后 0.4811，正是这种"用噪声置换信号"的表现。
+
+    LightRAG 的 ``hybrid`` 模式用 round-robin 交替取数回避了这个问题：它不比较
+    跨路分数，失效路最多占掉自己那一半名额。本函数保留 RRF 的分数区分度，
+    同时引入同样的"名额隔离"：
+
+    1. 轮转填充保底配额：第 r 轮依次从各路取第 r 条，某路配额用尽即跳过。
+       效果是各路 rank1 先各占一个位置，再轮到 rank2 —— 与 round-robin 同构。
+    2. 剩余名额按加权 RRF 分数补齐，保留头部区分度。
+
+    Args:
+        routes: [(节点列表, 该路权重), ...]
+        top_n: 截断长度
+        rrf_k: RRF 平滑参数
+        min_per_route: 未显式给 quotas 时，每路的保底条数
+        quotas: 显式指定每路保底条数；长度须与 routes 一致
+
+    Returns:
+        融合后的节点列表，``score`` 为加权 RRF 分（与 weighted_rrf_fuse 同量纲，
+        便于两套策略直接对比）。
+    """
+
+    limit = max(0, int(top_n))
+    if limit == 0:
+        return []
+
+    # 1) 归一化输入：跳过无效权重
+    active: List[Tuple[List[Any], float, int]] = []
+    for idx, (nodes, weight) in enumerate(routes):
+        w = float(weight)
+        if w <= 0:
+            continue
+        if quotas is not None and idx < len(quotas):
+            quota = max(0, int(quotas[idx]))
+        else:
+            quota = max(0, int(min_per_route))
+        active.append((list(nodes), w, quota))
+
+    if not active:
+        return []
+
+    # 全量候选的加权 RRF 分，两阶段共用
+    scores: Dict[str, float] = {}
+    nodes_map: Dict[str, Any] = {}
+    for nodes, weight, _quota in active:
+        for rank, node in enumerate(nodes, 1):
+            key = node_id_key(node)
+            nodes_map.setdefault(key, node)
+            scores[key] = scores.get(key, 0.0) + weight / float(rrf_k + rank)
+
+    # 2) 轮转填充保底配额
+    picked: List[str] = []
+    seen: set = set()
+    used = [0] * len(active)
+    max_quota = max((q for _, _, q in active), default=0)
+    max_len = max((len(nodes) for nodes, _, _ in active), default=0)
+
+    for round_idx in range(max_len):
+        if len(picked) >= limit or all(u >= q for u, (_, _, q) in zip(used, active)):
+            break
+        for route_idx, (nodes, _weight, quota) in enumerate(active):
+            if len(picked) >= limit:
+                break
+            if used[route_idx] >= quota:
+                continue
+            if round_idx >= len(nodes):
+                continue
+            key = node_id_key(nodes[round_idx])
+            if key in seen:
+                continue
+            seen.add(key)
+            picked.append(key)
+            used[route_idx] += 1
+
+    # 3) 剩余名额按 RRF 分补齐
+    if len(picked) < limit:
+        rest = sorted(
+            (k for k in scores if k not in seen),
+            key=lambda k: -scores[k],
+        )
+        for key in rest:
+            if len(picked) >= limit:
+                break
+            picked.append(key)
+
+    out: List[Any] = []
+    for key in picked:
+        node = nodes_map.get(key)
+        if node is None:
+            continue
+        try:
+            node.score = float(scores.get(key, 0.0))
+        except Exception:
+            pass
+        out.append(node)
+    return out
+
+
 def route_contribution(
     routes: Sequence[Tuple[Sequence[Any], float]],
     rrf_k: int = DEFAULT_RRF_K,

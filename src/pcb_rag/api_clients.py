@@ -25,9 +25,13 @@ Rerank（后端分发在 ``query.py`` 的 ``_try_build_reranker`` 中完成）
 from __future__ import annotations
 
 import os
-import threading
+import logging
+import math
 import time
 from typing import Any, List, Optional, Sequence
+
+from pcb_rag.embedding_contract import embedding_profile, resolve_embedding_provider
+from pcb_rag.rerank_control import RerankControl, RerankStopped, extract_usage, provider_identity
 
 # ---------------------------------------------------------------------------
 # 0. 代理环境变量清理（必须在任何网络客户端 import 之前执行，幂等）
@@ -101,6 +105,8 @@ EMBED_API_KEY = os.getenv("EMBED_API_KEY", "").strip() or LLM_API_KEY
 EMBED_MODEL = os.getenv("EMBED_MODEL", "").strip()
 EMBED_DIM = int(os.getenv("EMBED_DIM", "0") or 0)
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16"))
+EMBED_API_PROVIDER = os.getenv("EMBED_API_PROVIDER", "auto").strip().lower()
+EMBED_TRUNCATE = os.getenv("EMBED_TRUNCATE", "END").strip().upper()
 
 # ---- Rerank API（OpenAI 兼容之外的 /rerank 接口） ----
 RERANK_API_URL = os.getenv("RERANK_API_URL", "").strip()
@@ -217,6 +223,19 @@ def build_embed_model(model: Optional[str] = None, *, backend: Optional[str] = N
             "api_key": EMBED_API_KEY or _PLACEHOLDER_KEY,
             "embed_batch_size": EMBED_BATCH_SIZE,
         }
+        provider = resolve_embedding_provider(EMBED_API_PROVIDER, EMBED_BASE_URL)
+        if provider == "nvidia":
+            from pcb_rag.nvidia_embeddings import NvidiaApiEmbedding
+
+            if EMBED_TRUNCATE not in {"END", "NONE", "START"}:
+                raise ValueError("EMBED_TRUNCATE must be END, START, or NONE")
+            return NvidiaApiEmbedding(
+                **kwargs,
+                truncate=EMBED_TRUNCATE,
+                expected_dimension=EMBED_DIM,
+                max_retries=3,
+                timeout=120.0,
+            )
         if EMBED_DIM > 0 and _should_send_dimensions(model_name):
             kwargs["dimensions"] = EMBED_DIM
         try:
@@ -233,6 +252,17 @@ def build_embed_model(model: Optional[str] = None, *, backend: Optional[str] = N
         model_name=model or OLLAMA_EMBED_MODEL,
         base_url=OLLAMA_BASE,
         ollama_additional_kwargs={"num_ctx": EMBED_NUM_CTX},
+    )
+
+
+def get_embedding_profile(dimension: Optional[int] = None) -> dict:
+    """Identity of the API vector space, without credentials."""
+    return embedding_profile(
+        provider=resolve_embedding_provider(EMBED_API_PROVIDER, EMBED_BASE_URL),
+        api_base=EMBED_BASE_URL,
+        model=EMBED_MODEL,
+        dimension=dimension if dimension is not None else EMBED_DIM,
+        truncate=EMBED_TRUNCATE,
     )
 
 
@@ -253,14 +283,14 @@ def get_embedding_dim(embed_model: Any = None) -> Optional[int]:
 # 4. Rerank API 客户端
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Rerank API 客户端限速（2026-09-20 评测事故：SiliconFlow rerank 限 10 RPM，
-# 无 LLM 的消融行每题 3~5s → 12~20 RPM，61/80 次调用 429 且被上层吞掉，
-# 整行消融数据作废。此处客户端全局限速 + 429 重试，把"静默降级"变成"按配额节流"。
+# Rerank input, usage and budget controls. Rate reservations are shared across
+# processes. A zero interval explicitly disables proactive throttling; provider
+# 429 responses remain visible and retries are bounded.
 # ---------------------------------------------------------------------------
-_RERANK_LOCK = threading.Lock()
-_RERANK_LAST_CALL = 0.0
-RERANK_MIN_INTERVAL = float(os.getenv("RERANK_MIN_INTERVAL", "6.2"))  # 秒，≈9.7 RPM
-RERANK_429_RETRIES = int(os.getenv("RERANK_429_RETRIES", "6"))
+RERANK_MIN_INTERVAL = max(0.0, float(os.getenv("RERANK_MIN_INTERVAL", "0")))
+RERANK_429_RETRIES = max(0, int(os.getenv("RERANK_429_RETRIES", "2")))
+RERANK_429_BACKOFF_SECONDS = max(0.0, float(os.getenv("RERANK_429_BACKOFF_SECONDS", "60")))
+_RERANK_LOGGER = logging.getLogger("pcb_rag.rerank")
 
 
 class ApiReranker(BaseNodePostprocessor):
@@ -274,20 +304,31 @@ class ApiReranker(BaseNodePostprocessor):
     api_url: str = Field(description="Rerank API endpoint")
     api_key: str = Field(default="", description="Bearer token")
     model: str = Field(default="", description="Rerank 模型名")
-    top_n: int = Field(default=10, description="保留的文档数")
+    top_n: int = Field(default=10, ge=1, description="保留的文档数")
     timeout: float = Field(default=60.0, description="请求超时（秒）")
+    max_candidates: int = Field(default=50, ge=1, description="实际送入 API 的候选上限")
+    max_document_chars: int = Field(default=1200, ge=1)
+    max_query_chars: int = Field(default=1000, ge=1)
 
     @classmethod
     def class_name(cls) -> str:
         return "ApiReranker"
 
-    def _request_scores(self, query: str, documents: Sequence[str]) -> List[float]:
+    def _request_scores(self, query: str, documents: Sequence[str]) -> List[Optional[float]]:
         import requests
 
+        if not documents:
+            return []
+        if len(documents) > self.max_candidates:
+            raise ValueError("Rerank candidates exceed the configured input cap")
+        query = query[:self.max_query_chars]
+        documents = [document[:self.max_document_chars] for document in documents]
+        wanted = min(self.top_n, len(documents))
         payload: dict[str, Any] = {
             "query": query,
-            "documents": list(documents),
-            "top_n": len(documents),
+            "documents": documents,
+            "top_n": wanted,
+            "return_documents": False,
         }
         if self.model:
             payload["model"] = self.model
@@ -296,75 +337,121 @@ class ApiReranker(BaseNodePostprocessor):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        global _RERANK_LAST_CALL
-        last_err: Exception | None = None
-        data = None
+        control = RerankControl.from_env()
+        provider = provider_identity(self.api_url, self.api_key)
+        phase = os.getenv("RERANK_PHASE", "production")
+        activity = os.getenv("RERANK_ACTIVITY", "request")
+
+        def record(ticket, **kwargs):
+            event = control.finish(ticket, **kwargs)
+            event.update(
+                model=self.model, phase=phase, activity=activity, candidates=len(documents), wire_top_n=wanted,
+                estimated_tokens=ticket.estimated_tokens,
+            )
+            _RERANK_LOGGER.info("[RerankUsage] %s", event, extra={"rerank_usage": event})
+
         for attempt in range(RERANK_429_RETRIES + 1):
-            with _RERANK_LOCK:
-                wait = _RERANK_LAST_CALL + RERANK_MIN_INTERVAL - time.time()
-                if wait > 0:
-                    time.sleep(wait)
-                _RERANK_LAST_CALL = time.time()
-            resp = requests.post(self.api_url, json=payload, headers=headers, timeout=self.timeout)
-            if resp.status_code == 429:
-                ra = resp.headers.get("Retry-After", "")
-                backoff = float(ra) if ra else min(60.0, 2.0 ** attempt)
-                print(f"[Rerank] 429 限流，重试 {attempt + 1}/{RERANK_429_RETRIES + 1}，"
-                      f"等待 {backoff:.1f}s", flush=True)
-                time.sleep(backoff)
-                last_err = RuntimeError(f"429 (attempt {attempt + 1})")
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            break
-        if data is None:
-            raise RuntimeError(f"Rerank API 重试耗尽: {last_err}")
-
-        results = data.get("results")
-        if results is None and isinstance(data.get("output"), dict):
-            results = data["output"].get("results")
-        if results is None and isinstance(data.get("data"), list):
-            results = data["data"]
-        if not isinstance(results, list):
-            raise RuntimeError(f"Rerank API 响应格式无法识别: {str(data)[:200]}")
-
-        scores = [0.0] * len(documents)
-        for item in results:
-            if not isinstance(item, dict):
-                continue
-            idx = item.get("index")
-            score = item.get("relevance_score", item.get("score"))
-            if idx is None or score is None:
-                continue
-            idx = int(idx)
-            if 0 <= idx < len(scores):
-                scores[idx] = float(score)
-        return scores
+            ticket = control.reserve(
+                provider=provider, model=self.model, query=query, documents=documents,
+                interval=RERANK_MIN_INTERVAL, phase=phase, activity=activity, top_n=wanted,
+            )
+            control.wait(ticket)
+            try:
+                resp = requests.post(self.api_url, json=payload, headers=headers, timeout=self.timeout, allow_redirects=False)
+            except requests.RequestException as exc:
+                record(ticket, status="transport_error", error_type=type(exc).__name__, stop_reason="transport_error_billing_unknown")
+                raise RerankStopped("Rerank transport failed; billing is unknown and automatic retries are disabled") from exc
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            tokens, source, usage = extract_usage(data)
+            message = str(data.get("message", data.get("error", "")))[:500]
+            if self.api_key:
+                message = message.replace(self.api_key, "[REDACTED]")
+            response_meta = {
+                "provider_request_id": str(data.get("id", ""))[:120],
+                "error_code": str(data.get("code", ""))[:80],
+                "error_message": message,
+                "retry_after": resp.headers.get("Retry-After"),
+                "rate_limit_headers": {
+                    key: str(value)[:256] for key, value in resp.headers.items()
+                    if key.lower().startswith("x-ratelimit-")
+                },
+            }
+            accounting = {
+                "actual_tokens": tokens, "usage_source": source, "usage": usage,
+                "http_status": resp.status_code, "response_meta": response_meta,
+            }
+            if not 200 <= resp.status_code < 300:
+                fatal = not (resp.status_code == 429 and attempt < RERANK_429_RETRIES)
+                record(ticket, status="http_error", stop_reason=f"http_{resp.status_code}" if fatal else None, **accounting)
+                if resp.status_code == 429 and attempt < RERANK_429_RETRIES:
+                    retry_after = resp.headers.get("Retry-After", "")
+                    try:
+                        backoff = max(0.0, min(60.0, float(retry_after))) if retry_after else min(60.0, RERANK_429_BACKOFF_SECONDS * 2.0 ** attempt)
+                    except ValueError:
+                        from email.utils import parsedate_to_datetime
+                        try:
+                            backoff = max(0.0, min(60.0, parsedate_to_datetime(retry_after).timestamp() - time.time()))
+                        except (ValueError, TypeError, OverflowError):
+                            backoff = min(60.0, RERANK_429_BACKOFF_SECONDS * 2.0 ** attempt)
+                    print(f"[Rerank] 429 限流，重试 {attempt + 1}/{RERANK_429_RETRIES}，等待 {backoff:.1f}s", flush=True)
+                    deadline = time.monotonic() + backoff
+                    while time.monotonic() < deadline:
+                        control.check()
+                        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+                    continue
+                if resp.status_code == 429:
+                    print(f"[Rerank] 429 限流，无剩余重试，Retry-After={resp.headers.get('Retry-After', '')}", flush=True)
+                raise RerankStopped(f"Rerank HTTP {resp.status_code}; circuit opened, no ranking fallback")
+            try:
+                results = data.get("results")
+                if results is None and isinstance(data.get("output"), dict):
+                    results = data["output"].get("results")
+                if results is None and isinstance(data.get("data"), list):
+                    results = data["data"]
+                if not isinstance(results, list) or len(results) < wanted:
+                    raise ValueError("Missing rerank scores")
+                scores: List[Optional[float]] = [None] * len(documents)
+                for item in results:
+                    idx = item.get("index")
+                    score = float(item.get("relevance_score", item.get("score")))
+                    if isinstance(idx, bool) or not isinstance(idx, int) or not 0 <= idx < len(scores):
+                        raise ValueError("Invalid rerank index")
+                    if scores[idx] is not None or not math.isfinite(score):
+                        raise ValueError("Duplicate index or nonfinite rerank score")
+                    scores[idx] = score
+            except (ValueError, TypeError, AttributeError) as exc:
+                record(ticket, status="protocol_error", error_type=type(exc).__name__, stop_reason="invalid_rerank_response", **accounting)
+                raise RerankStopped("Rerank response invalid; circuit opened, no ranking fallback") from exc
+            record(ticket, status="success", **accounting)
+            return scores
+        raise RerankStopped("Rerank retries exhausted")
 
     def _postprocess_nodes(
         self,
         nodes: Optional[List[NodeWithScore]] = None,
         query_bundle: Optional[QueryBundle] = None,
     ) -> List[NodeWithScore]:
-        nodes = nodes or []
+        nodes = list(nodes or [])[:self.max_candidates]
         if not nodes:
             return []
         if query_bundle is None:
             raise ValueError("Missing query bundle in extra info.")
 
         documents = [
-            n.node.get_content(metadata_mode=MetadataMode.EMBED) for n in nodes
+            n.node.get_content(metadata_mode=MetadataMode.NONE) for n in nodes
         ]
-
-        try:
-            scores = self._request_scores(query_bundle.query_str, documents)
-        except Exception as exc:  # 网络/接口异常时保底，避免整条链路失败
-            print(f"[Rerank] API 精排失败，回退原始排序: {exc}")
-            return sorted(nodes, key=lambda x: -(x.score or 0.0))[: self.top_n]
-
+        scores = self._request_scores(query_bundle.query_str, documents)
+        scored = []
         for node, score in zip(nodes, scores):
-            node.score = float(score)
-        return sorted(nodes, key=lambda x: -(x.score or 0.0))[: self.top_n]
+            if score is not None:
+                node.score = float(score)
+                scored.append(node)
+        return sorted(scored, key=lambda x: -x.score)[: self.top_n]
 
 
 def build_api_reranker(top_n: int) -> ApiReranker:
@@ -381,6 +468,9 @@ def build_api_reranker(top_n: int) -> ApiReranker:
         model=RERANK_API_MODEL,
         top_n=top_n,
         timeout=RERANK_API_TIMEOUT,
+        max_candidates=int(os.getenv("RERANK_MAX_CANDIDATES", "50")),
+        max_document_chars=int(os.getenv("RERANK_MAX_DOCUMENT_CHARS", "1200")),
+        max_query_chars=int(os.getenv("RERANK_MAX_QUERY_CHARS", "1000")),
     )
 
 
@@ -390,12 +480,16 @@ def build_api_reranker(top_n: int) -> ApiReranker:
 def describe_backends() -> dict:
     """返回当前后端配置摘要，便于启动日志与 ``/health`` 展示。"""
 
+    embed_provider = resolve_embedding_provider(EMBED_API_PROVIDER, EMBED_BASE_URL) if EMBED_BACKEND == "api" else "local"
     return {
         "llm_backend": LLM_BACKEND,
         "llm_model": LLM_MODEL if LLM_BACKEND == "api" else OLLAMA_LLM_MODEL,
         "llm_base_url": LLM_BASE_URL if LLM_BACKEND == "api" else OLLAMA_BASE,
         "llm_configured": bool(LLM_BASE_URL and LLM_MODEL) if LLM_BACKEND == "api" else bool(OLLAMA_BASE),
         "embed_backend": EMBED_BACKEND,
+        "embed_api_provider": embed_provider,
+        "embed_query_input_type": "query" if embed_provider == "nvidia" else None,
+        "embed_document_input_type": "passage" if embed_provider == "nvidia" else None,
         "embed_model": EMBED_MODEL if EMBED_BACKEND == "api" else OLLAMA_EMBED_MODEL,
         "embed_base_url": EMBED_BASE_URL if EMBED_BACKEND == "api" else OLLAMA_BASE,
         "embed_configured": bool(EMBED_BASE_URL and EMBED_MODEL) if EMBED_BACKEND == "api" else bool(OLLAMA_BASE),

@@ -82,7 +82,7 @@ def run_retrieval() -> list[dict]:
     dataset = er._load_dataset(DATASET)
     print(f"[G5] 有效题数: {len(dataset)}")
 
-    index = rag_query.build_index("eval")
+    index = rag_query.build_index(os.getenv("EVAL_LLM_MODEL", ""))
 
     # 与 evaluate_recall.py --mode fusion_hyde_rerank 的强制开关保持一致
     rag_query.HYDE_ENABLED = True

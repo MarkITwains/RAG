@@ -16,7 +16,7 @@
 # =============================================================================
 
 # ---- RAG 框架与向量库 ----
-llama-index
+llama-index-core
 llama-index-vector-stores-milvus
 llama-index-readers-file
 pymilvus
@@ -31,7 +31,7 @@ numpy
 chardet
 tqdm
 pypdf
-pymupdf
+pymupdf<2
 python-docx
 requests
 
