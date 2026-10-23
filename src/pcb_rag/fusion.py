@@ -169,7 +169,6 @@ def quota_rrf_fuse(
     picked: List[str] = []
     seen: set = set()
     used = [0] * len(active)
-    max_quota = max((q for _, _, q in active), default=0)
     max_len = max((len(nodes) for nodes, _, _ in active), default=0)
 
     for round_idx in range(max_len):

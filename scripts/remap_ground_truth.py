@@ -170,7 +170,8 @@ def main() -> int:
             added = False
             for src, items in sorted(by_src.items(), key=lambda kv: -len(kv[1])):
                 if i < len(items) and len(kept) < args.min_keep:
-                    kept.append(items[i]); added = True
+                    kept.append(items[i])
+                    added = True
             if not added:
                 break
             i += 1

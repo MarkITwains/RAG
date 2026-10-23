@@ -92,7 +92,8 @@ def _ask_json(llm, prompt: str) -> Optional[Any]:
     调用方必须显式处理 None，不能当成 0 分。
     """
     try:
-        response = llm.complete(prompt)
+        from pcb_rag.usage import model_complete
+        response = model_complete(llm, prompt)
         text = response.text if hasattr(response, "text") else str(response)
         return _extract_json(text)
     except Exception:

@@ -116,7 +116,10 @@ def test_factory_leaves_other_openai_compatible_providers_unchanged(monkeypatch)
     monkeypatch.setattr(api_clients, "EMBED_BASE_URL", "https://other.invalid/v1")
     monkeypatch.setattr(api_clients, "EMBED_MODEL", "other-embedding")
     monkeypatch.setattr(api_clients, "EMBED_API_PROVIDER", "auto")
-    assert type(api_clients.build_embed_model(backend="api")).__name__ == "OpenAIEmbedding"
+    from llama_index.embeddings.openai import OpenAIEmbedding
+
+    model = api_clients.build_embed_model(backend="api")
+    assert isinstance(model, OpenAIEmbedding) and not isinstance(model, NvidiaApiEmbedding)
 
 
 def test_self_hosted_nvidia_requires_explicit_provider():

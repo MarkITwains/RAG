@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 #: manifest 结构版本。v1 = path+size+mtime 指纹，v2 = 内容哈希。
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 
 
 def content_hash(path: Path) -> str:
@@ -66,6 +66,9 @@ def doc_node_id_of(doc: Any) -> str:
     注意：它由**绝对路径**参与计算，因此换目录会导致 node_id 变化 —— 旧 id 会被
     当作"已删除文档"清掉、新 id 重新入库。功能上自愈，代价是一次全量重嵌入。
     """
+    metadata = getattr(doc, "metadata", None) or {}
+    if metadata.get("doc_node_id"):
+        return str(metadata["doc_node_id"])
     doc_id = getattr(doc, "id_", None) or hashlib.md5(
         doc_source_of(doc).encode("utf-8"), usedforsecurity=False
     ).hexdigest()
@@ -82,7 +85,7 @@ def doc_fingerprint_of(doc: Any) -> str:
     return str(getattr(doc, "hash", "") or "")
 
 
-def diff_documents(documents: List[Any], manifest: Dict[str, Any]) -> Tuple[List[Any], List[str], Dict[str, dict]]:
+def diff_documents(documents: List[Any], manifest: Dict[str, Any], *, pipeline=None) -> Tuple[List[Any], List[str], Dict[str, dict]]:
     """比对文档与清单。
 
     Returns:
@@ -98,17 +101,25 @@ def diff_documents(documents: List[Any], manifest: Dict[str, Any]) -> Tuple[List
         src = doc_source_of(d)
         fingerprint = doc_fingerprint_of(d)
         current[node_id] = {"path": src, "hash": fingerprint}
+        if pipeline is not None:
+            from pcb_rag.revisions import fingerprint as digest
+            current[node_id].update(
+                pipeline=dict(pipeline), revision=digest([node_id, fingerprint, pipeline["chunks"], pipeline["vectors"]])[:24],
+                stages={name: {"fingerprint": value, "status": "pending"} for name, value in pipeline.items()},
+            )
 
         old = old_docs.get(node_id)
         if old is None:
             to_process.append(d)  # 新增
-        elif old.get("hash") != fingerprint:
+        elif old.get("hash") != fingerprint or (pipeline is not None and any(
+            old.get("pipeline", {}).get(stage) != pipeline[stage] for stage in ("chunks", "vectors")
+        )):
             stale_ids.append(node_id)  # 变更：需先删除旧 chunk
             to_process.append(d)
 
     # 清单中存在、但数据目录已移除的文档
     stale_ids.extend(nid for nid in old_docs if nid not in current)
-    return to_process, stale_ids, current
+    return to_process, list(dict.fromkeys(stale_ids)), current
 
 
 def snapshot_of(documents: List[Any]) -> Dict[str, dict]:
@@ -145,16 +156,15 @@ def needs_full_reprocess(manifest: Dict[str, Any]) -> bool:
         return True
 
 
-def save_manifest(path: str, docs_map: Dict[str, dict]) -> None:
+def save_manifest(path: str, docs_map: Dict[str, dict], *, pipeline=None, revision=None) -> None:
     """写回入库清单（原子替换：先写临时文件再 rename，避免半截文件）。"""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps({"version": MANIFEST_VERSION, "docs": docs_map}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    tmp.replace(p)
+    from pcb_rag.revisions import atomic_json
+    payload = {"version": MANIFEST_VERSION, "docs": docs_map}
+    if pipeline is not None:
+        payload["pipeline"] = pipeline
+    if revision is not None:
+        payload["revision"] = revision
+    atomic_json(Path(path), payload)
 
 
 def plan_ingest(
@@ -163,6 +173,7 @@ def plan_ingest(
     *,
     incremental: bool,
     overwrite: bool,
+    pipeline=None,
 ) -> Tuple[List[Any], List[str], Dict[str, dict], bool]:
     """决定"本次入库要处理哪些文档"。
 
@@ -175,6 +186,7 @@ def plan_ingest(
         (待处理文档, 待清理旧 chunk 的 doc_node_id, 新清单条目, 是否走了增量比对)
     """
     if overwrite or not incremental:
-        return list(documents), [], snapshot_of(documents), False
-    to_process, stale_ids, current = diff_documents(documents, manifest)
+        _, _, current = diff_documents(documents, {}, pipeline=pipeline)
+        return list(documents), [], current, False
+    to_process, stale_ids, current = diff_documents(documents, manifest, pipeline=pipeline)
     return to_process, stale_ids, current, True

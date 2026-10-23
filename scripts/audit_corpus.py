@@ -24,7 +24,7 @@ import json
 import os
 import re
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 
 DEFAULT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "data", "pcb_docs_clean")

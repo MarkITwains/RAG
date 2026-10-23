@@ -21,6 +21,8 @@
 
 PCB-RAG 面向 PCB 设计规范、工艺资料与工程经验文档，覆盖从文档预处理、结构切块入库，到混合检索、重排序、答案合成与对外服务的完整链路，可用于构建 PCB 领域的智能问答助手。
 
+2026-10-23 的共享检索内核、可恢复入库、图语义召回、引用预算及 WSL 验证记录见 [修复与验证报告](docs/LIGHTRAG_FIXES_WSL_20261023.md)。旧集合需要先迁移，才能使用新版父块、来源元数据与图索引。
+
 ## 目录
 
 - [项目亮点](#项目亮点)
@@ -51,9 +53,11 @@ PCB-RAG 面向 PCB 设计规范、工艺资料与工程经验文档，覆盖从�
 | **Agentic RAG** | 可选的迭代检索：检索 → 充分性判断 → 信息不足则改写查询重检，直到满足或达到迭代上限 |
 | **Contextual Retrieval** | 入库时为每个 chunk 注入「文档 · 章节 · 标准号」语境前缀，缓解切块导致的上下文丢失 |
 | **可切换精排** | 支持 API 精排（Jina / 硅基流动等）与本地精排（Qwen3-Reranker / cross-encoder / SBERT） |
-| **上下文扩展** | 命中的 chunk 自动并入相邻 chunk（`prev_id`/`next_id`）与父块锚点内容，缓解长文档上下文割裂 |
+| **上下文扩展** | 子块参与向量召回，按需读取快照中保存的完整父块与相邻证据；表格保留列头、单位和脚注 |
 | **Dify 集成** | 提供符合规范的 FastAPI 外部知识库接口，可直接接入 Dify 工作流或对话应用 |
-| **GraphRAG 图检索** | 入库时抽取「实体—关系—实体」三元组构成可遍历图谱，检索时做实体链接与邻域扩展，补足多跳与聚合类问题 |
+| **GraphRAG 图检索** | 实体描述、关系描述各有语义索引；图命中回查可授权原文，与向量/BM25 一起融合和精排 |
+| **发布与恢复** | 内容及处理配置生成阶段指纹；入库失败保留旧版本，完成校验后原子发布，支持图补建和新集合迁移 |
+| **统一证据与引用** | HTTP、SDK、CLI、评测共用检索管道；最终提示词、引用、返回原文与完整请求预算共用 EvidenceBundle |
 | **上下文压缩** | 近似去重 + 抽取式压缩 + 字符预算裁剪，在长召回链路上显著降低 token 消耗 |
 | **多租户权限** | 按租户 / 角色 / 组做检索级过滤（向量库表达式 + 内存兜底双层），并支持访问审计 |
 | **可观测性** | 结构化 tracing（JSONL）、计数器与延迟分位，`/metrics` 直接暴露 |
@@ -92,10 +96,10 @@ flowchart LR
     ACL --> EXP["查询扩展 + HyDE"]
     EXP --> DENSE["向量召回"]
     EXP --> SPARSE["BM25 词法召回"]
-    EXP --> GRAPH["图检索：实体链接 + 邻域"]
+    EXP --> GRAPH["图语义检索 → 授权原文"]
     DENSE --> FUSE["加权 RRF 融合"]
     SPARSE --> FUSE
-    GRAPH -.-> FUSE
+    GRAPH --> FUSE
     FUSE --> RERANK["Rerank 精排"]
     RERANK --> CTX["相邻 / 父级 Chunk 扩展"]
     CTX --> COMP["去重 + 上下文压缩"]
@@ -182,6 +186,14 @@ bash scripts/setup.sh
 | 6 | 按 `LLM_BACKEND` / `EMBED_BACKEND` 检查模型后端 |
 | 7 | 运行 `scripts/check_env.py` 完成环境自检 |
 
+WSL / Linux Python 3.12 可复用已验证的依赖版本：
+
+```bash
+python -m pip install -c requirements/constraints-wsl-py312.txt -e ".[runtime,ollama,dev]"
+```
+
+`runtime` 包含 API 模型适配、Milvus、HTTP 与文档读取依赖；`ollama` 包含本地服务客户端。使用本地 torch 精排时另装 `pip install -e ".[local_models]"`。该本地模型配置不在上述 WSL 版本快照内。依赖自检可用 `python scripts/check_env.py --dependencies-only`，不会请求模型或数据库。
+
 ### 2. 配置模型后端
 
 编辑 `.env` 选择后端，三者可自由混搭。
@@ -236,7 +248,18 @@ data/clear_docs/
 bash scripts/run_ingest.sh      # 等价：python -m pcb_rag.ingest
 ```
 
-> 默认增量写入（`INGEST_OVERWRITE=0`）；如需清空重建集合，设置 `INGEST_OVERWRITE=1`。
+默认按内容和处理阶段指纹增量写入。入库先准备新快照，验证向量、词法、图产物后再发布；删除或更新文档时旧版本仍可读取。`INGEST_OVERWRITE=1` 对非空集合会报错，全量重建应使用新集合。
+
+旧集合迁移默认仅预览，不写数据库：
+
+```bash
+python -m pcb_rag.migrate --target-collection pcb_kb_v2
+python -m pcb_rag.migrate --target-collection pcb_kb_v2 --execute
+```
+
+第二条命令构建独立集合并输出验证报告。需要检查旧评测真值时，加 `--mapping-from 旧词法缓存.jsonl --truth-ids 旧chunk编号数组.json`；必须匹配的 ID 无法唯一映射时验证失败。确认报告后，加 `--execute --publish` 切换同一状态文件的读取版本，已完成阶段会复用。后续 API 与入库继续使用相同 `KB_STATE_PATH`，入库 `COLLECTION` 设为发布后的集合。详见修复报告中的完整操作顺序。
+
+已有新版 chunk 快照时，`python -m pcb_rag.migrate --stage graph --execute` 可补建图；源文件和切块配置相同的情况下复用现有 chunk 与向量。该图命令完成后直接发布新 revision。
 
 ### 5. 运行问答
 
@@ -290,6 +313,8 @@ FastAPI 直接托管，离线部署同样可用。
 | 检索参数 | 召回条数、相似度阈值可直接调，无需改配置 |
 | 多轮对话 | 最近 6 轮问答随请求带上，服务端做历史感知的查询改写 |
 | 状态指示 | 顶栏显示索引 / 词法索引 / 精排的就绪状态，数据来自 `/health` |
+
+管理页位于 `/manage`：查看已发布/待发布版本、文档阶段状态、失败原因，重试未完成入库，并从图邻域查看来源。管理接口为 `/api/admin/status`、`/api/admin/documents`、`/api/admin/retry`；图来源接口为 `/api/graph/neighbors`。启用身份文件或 ACL 时，管理操作需要管理员身份；页面中的令牌仅保存在当前输入框内。
 
 鉴权沿用服务端的 Bearer Token：首次提问若收到 401，界面会提示从右上角「设置」
 填入 `DIFY_API_TOKEN`，Token 存在浏览器 localStorage，不上传任何第三方。
@@ -459,23 +484,34 @@ bash scripts/serve_api.sh
 | `SESSION_DB_PATH` | `./data/sessions.db` | SQLite 会话库路径 |
 | `SELF_RAG_ENABLED` | `0` | 是否启用 Agentic RAG 迭代检索 |
 | `SELF_RAG_MAX_ITERATIONS` | `3` | 迭代检索的最大轮数 |
+| `RAG_REQUEST_TIMEOUT` | `120` | 总请求 deadline（秒），覆盖排队、检索、生成及 SSE |
+| `RAG_MAX_CONCURRENT` / `RAG_MAX_QUEUED` | `8` / `16` | 每个服务进程的并发与等待边界 |
+| `RAG_REQUEST_MAX_TOKENS` | 模型窗口 | 完整序列化请求上限，包含历史、标题、引用和输出预留 |
+| `RAG_MAX_MODEL_CALLS` | `0` | 单请求模型调用总次数上限；0 不限制此项 |
+| `RAG_LLM_MAX_INPUT_TOKENS` / `RAG_EMBEDDING_MAX_INPUT_TOKENS` / `RAG_RERANK_MAX_INPUT_TOKENS` | `0` | 各类模型的单请求累计输入上限 |
+| `RAG_USAGE_LEDGER` | 空 | 可选 JSONL 用量账本；实际值与保守估算分列 |
+| `AUTH_TOKEN_PRINCIPALS_FILE` | 空 | 以 Token 的 SHA-256 为键映射用户、租户、角色的 JSON 文件 |
+| `SESSION_REQUIRE_IDENTITY` | `0` | 要求会话具有已认证的 tenant/user；已有无归属会话不可被认领 |
+| `KB_STATE_PATH` | `./data/kb_state_<COLLECTION>.json` | API 与入库共享的发布指针、阶段状态及上一版本 |
 
 ### GraphRAG（P1-2）
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `GRAPH_RAG_ENABLED` | `0` | 是否启用图检索（图谱缺失时自动降级为无图模式） |
-| `GRAPH_PATH` | `./data/graph/kg.json` | 图谱文件路径 |
+| `GRAPH_PATH` | `./data/graph/kg.json` | 尚未迁移的旧图文件路径；新版使用快照中的路径 |
+| `GRAPH_SEMANTIC_ENABLED` | `1` | 建立实体/关系描述向量索引 |
+| `GRAPH_SEMANTIC_BACKEND` | `milvus` | 独立 Milvus 集合；或 `local` 文件向量余弦检索 |
 | `GRAPH_EXTRACT_BACKEND` | `rule` | 抽取方式：`rule`（零 LLM 成本）/ `llm` / `hybrid` |
 | `GRAPH_HOP` | `1` | 实体邻域扩展跳数 |
 | `GRAPH_TOP_K` | `5` | 图路径返回的候选数 |
 | `GRAPH_WEIGHT` | `0.35` | 图路在 RRF 融合中的权重（独立一路，有独立 rank） |
-| `GRAPH_RRF_K` | `60` | 图路 RRF 平滑参数 k |
-| `GRAPH_EVIDENCE_MAX` | `2` | 图证据在最终结果中的独立配额（不占主结果 top-k 名额） |
+| `FUSION_RRF_K` | `40` | 共享管道统一融合平滑参数，包含图来源 |
+| `FUSION_MIN_PER_ROUTE` | `1` | 启用配额融合时每路最低候选数；图来源参与最终 top-k |
 | `GRAPH_EXPAND_MAX` | `2` | 邻域扩展追加的额外事实条数 |
 | `GRAPH_COMMUNITY_ENABLED` | `0` | 是否生成社区摘要（面向综述类问题） |
 
-开启图检索前先跑一次入库：入库流程会自动抽取三元组并维护 `GRAPH_PATH`。
+开启图检索前完成新版入库或图补建。图抽取与向量索引是发布校验的一部分，失败时保留旧 revision；实体/关系命中必须回查原文后才进入答案证据。
 
 ### 上下文压缩（P2）
 
@@ -576,18 +612,14 @@ Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确�
 <details>
 <summary>重新入库后 BM25 仍在检索旧内容？</summary>
 
-词法索引缓存在 `LEXICAL_CACHE_PATH`，入库完成后会自动清理，同时写一个 `LEXICAL_RELOAD_STAMP` 标记文件：
-- **长驻 API 进程**会按该标记的 mtime 做惰性热重载（后台线程重建，本次检索仍用旧索引），无需重启；
-- **CLI / 一次性进程**下次启动时自然重建；`LEXICAL_CACHE_TTL_HOURS`（默认 24 小时）超期也会重建。
+新版管道在请求开始时检查已发布 revision，同步切换来源快照、BM25、图及集合；检索缓存包含 revision 与配置指纹。先检查 API 与入库是否使用同一 `KB_STATE_PATH`，以及 pending 阶段是否失败。`LEXICAL_CACHE_PATH` 和缓存 TTL 主要用于尚未迁移的旧集合。
 
 </details>
 
 <details>
-<summary>如何清空并重建向量库？</summary>
+<summary>如何完整重建向量库？</summary>
 
-设置 `INGEST_OVERWRITE=1` 后重新执行入库脚本即可清空重建集合；保持默认 `0` 时为增量 upsert。
-
-注意：`INGEST_OVERWRITE=1` 会**忽略并重写**入库清单（`INGEST_MANIFEST_PATH`）。这一步是必须的 —— 集合被清空后清单里的指纹全部失效，若仍按指纹比对会得到「无需处理的文档」，重建后的库将是空的，而清单还声称数据都在，后续增量入库会继续空转。
+使用 `python -m pcb_rag.migrate --target-collection 新集合 --execute`，核对来源字段、parent 链接、图来源贡献及真值 ID 映射，再加 `--publish` 激活。旧集合和快照保留供回滚；新版主流程不会自动删除仍可回滚的物理行。`INGEST_OVERWRITE=1` 不再用于清空已有集合。
 
 </details>
 
@@ -595,8 +627,8 @@ Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确�
 <summary>入库后新文档检索不到 / 排得很靠后？</summary>
 
 依次检查三件事：
-1. **词法索引是否已重载** —— 长驻 API 会按 `LEXICAL_RELOAD_STAMP` 自动热重载，`/metrics` 里的 `lexical.reloaded` 计数可确认；
-2. **入库清单是否与实际数据一致** —— 重建库后若没走 `INGEST_OVERWRITE` 全量，清单会与库脱节；
+1. **新版本是否已发布** —— 在 `/manage` 检查 revision、pending 及失败阶段；
+2. **读取状态是否一致** —— API 与入库的 `KB_STATE_PATH` 应相同，响应中的 revision 应对应新集合；
 3. **是否只看了 Hit@K** —— 新文档缺一路投票时 Hit@K 可能不变，但 MRR/NDCG 会掉。
 
 </details>
@@ -607,17 +639,19 @@ Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确�
 
 | # | 现象 | 根因 | 当前状态 |
 | --- | --- | --- | --- |
-| 0 | 全部 r2 消融结论建立在失效的向量索引上 | `nvidia/nemotron-3-embed-1b` 的 query/passage 契约错误，旧集合两侧编码方式相同；`r2_01` 的 MRR 0.0690 与 embedding 报告 `before` 逐位一致 | **已修索引，待重跑**。配对实验显示 MRR@20 0.069→0.394、Hit@200 0.40→0.938。重跑前不得据旧结论删减组件 |
+| 0 | 旧 r2 消融使用失效的向量索引 | NVIDIA query/passage 编码契约错误 | 已修，2026-10-20 已有重跑的检索基线与消融；10 月 23 日本轮代码仍需新效果基线，不能复用旧成绩作为改进结论 |
 | 1 | 评测脚本与评测报告未入库 | `eval/reports/`、`eval/*.json(l)` 被 `.gitignore` 排除（数据集含语料原文，不宜公开）；`eval/evaluate_recall.py` 亦未纳入版本控制 | **未修（唯一需要人工决策的一条）**：脱敏后提交脚本 + 报告摘要，或在 README 给出「数据集规模 / 该集指标 / 脚本版本」对照表。在提交之前，README 里的所有 MRR / Hit@K / NDCG 数字都无法被第三方复现 |
 | 2 | 指标绝对值不可跨数据集比较 | 仓库内多版数据集互不重合（`eval_dataset.json` / `eval_dataset_146.json`）；真值由 chunk 反推问题生成，chunk 按定义相关 | 只用于**同数据集内**的配置对比；换集必须重跑基线。生成侧偏差方向明确：共享词汇使 Hit/Recall 系统性**高估** |
 | 3 | LLM 出题 / 判卷与生成同源 | `build_golden_dataset.py`、`evaluate.py`、`metrics.py` 都用 `build_llm()` | 部分修：`evaluate_recall.py` 支持 `SOFT_JUDGE_*` 指向另一厂商模型；生成侧 judge 仍同源，**需人工抽检 20~30 条校准并报告 judge 与人评一致率** |
-| 4 | 每请求一个 `ThreadPoolExecutor` | `dify_external_api` 在同步端点里按请求开池（`min(n_workers, 8)`），叠加 anyio 线程池与全局 HyDE 线程池 | 未修（检索是 IO 密集，正解是 `asyncio + httpx.AsyncClient`）。当前并发受 anyio 的 40 线程与 HyDE 的 2 worker 约束，不是无界增长 |
-| 5 | SSE 断开后已提交的 HyDE 调用仍会跑完 | 线程池任务无法取消（`Future.cancel()` 只能取消未开始的任务） | 未修；短期可加"同 query 结果缓存"与队列上限，长期改 asyncio 任务 + `wait_for` |
+| 4 | 每请求独立建线程池 | 多入口重复调度检索 | 已改为共享有界执行器与服务并发/队列边界，排队也计入总 deadline |
+| 5 | SSE 断开后的后台工作 | 已开始的同步 HTTP 调用无法强制终止 | 已传播断开/超时并取消待执行工作，停止后续响应；运行中的调用继续占用工作槽直到结束，并记录迟到用量，不能承诺供应商立即停止计费 |
 | 6 | 分路贡献无 ablation | 只有整体开关对比，没有关掉单路的对照实验 | 部分修：`fusion.route_contribution()` 提供"这条只靠哪一路进来"的归因；`quota_rrf_fuse` 补了"单路失效不挤占另一路"的回归测试。完整 ablation 表待新基线重跑补齐 |
-| 7 | 父块扩展语义弱于"分层检索" | 默认 `parent_child` 模式下父块文本未单独入库，`parent_id` 指向同父块的首个子块 | 部分修：父级扩展已真实生效（此前是 no-op）。真正的"子块检索 + 父块替换"需要把父块也写入向量库并加 `node_level` 过滤 |
+| 7 | parent 指向首个子块 | 未存储完整父块文本 | 新版快照已保存完整 parent，子块单独嵌入；检索按 ID 读取真实父节并复核权限/版本。旧集合须迁移 |
 | 8 | O(n²) 的其它潜在热点 | 已修 `_parent_child_parse` 的邻居查找（此前 1e4 chunk 约 30~60s）；其它循环未逐一审计 | 未完全修 |
 
-### 本轮已修复（可对照 git log 复核）
+### 此前修复记录
+
+下表保留早期实现记录；2026-10-23 的共享管道与迁移行为以 [修复报告](docs/LIGHTRAG_FIXES_WSL_20261023.md) 为准。
 
 | 问题 | 现象 | 修法 |
 | --- | --- | --- |

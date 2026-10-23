@@ -1,24 +1,5 @@
-llama-index
-llama-index-llms-ollama
-llama-index-embeddings-ollama
-llama-index-llms-openai-like
-llama-index-embeddings-openai
-llama-index-vector-stores-milvus
-llama-index-readers-file
-pymilvus
-fastapi
-uvicorn[standard]
-pydantic
-nest_asyncio
-chardet
-numpy
-torch
-transformers
-huggingface_hub
-tqdm
-jieba
-sentence-transformers
-pypdf
-pymupdf
-python-docx
-requests
+# Portable runtime profile. Run from the repository root.
+# Reproduce the tested WSL Python 3.12 environment with:
+# python -m pip install -c requirements/constraints-wsl-py312.txt -r requirements.txt -e ".[dev]"
+-e .[runtime,ollama]
+# Optional local torch rerankers: python -m pip install -e ".[local_models]"

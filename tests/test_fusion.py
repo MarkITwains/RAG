@@ -155,9 +155,7 @@ class TestQuotaRrfFuse:
         """保底 1 条时，各路 rank1 先各占一位，再轮到 rank2。"""
         r1 = [_item("a1"), _item("a2")]
         r2 = [_item("b1"), _item("b2")]
-        out = quota_rrf_fuse(
-            [(r1, 1.0), (r2, 1.0)], top_n=4, rrf_k=60, min_per_route=1
-        )
+        out = quota_rrf_fuse([(r1, 1.0), (r2, 1.0)], top_n=4, rrf_k=60, min_per_route=1)
         assert [n.node.node_id for n in out] == ["a1", "b1", "a2", "b2"]
 
     def test_failed_route_cannot_evict_the_other(self):
@@ -172,17 +170,13 @@ class TestQuotaRrfFuse:
         pure = weighted_rrf_fuse([(noisy, 0.9), (good, 0.1)], top_n=3, rrf_k=40)
         assert "good" not in [n.node.node_id for n in pure]
 
-        quota = quota_rrf_fuse(
-            [(noisy, 0.9), (good, 0.1)], top_n=3, rrf_k=40, min_per_route=1
-        )
+        quota = quota_rrf_fuse([(noisy, 0.9), (good, 0.1)], top_n=3, rrf_k=40, min_per_route=1)
         assert "good" in [n.node.node_id for n in quota]
 
     def test_quota_limits_how_many_one_route_takes(self):
         r1 = [_item(f"a{i}") for i in range(5)]
         r2 = [_item(f"b{i}") for i in range(5)]
-        out = quota_rrf_fuse(
-            [(r1, 1.0), (r2, 1.0)], top_n=10, rrf_k=60, quotas=[1, 1]
-        )
+        out = quota_rrf_fuse([(r1, 1.0), (r2, 1.0)], top_n=10, rrf_k=60, quotas=[1, 1])
         # 两路各只保底 1 条，其余按 RRF 补齐
         ids = [n.node.node_id for n in out]
         assert ids[:2] == ["a0", "b0"]
@@ -192,9 +186,7 @@ class TestQuotaRrfFuse:
     def test_duplicates_across_routes_not_repeated(self):
         r1 = [_item("x"), _item("y")]
         r2 = [_item("x"), _item("z")]
-        out = quota_rrf_fuse(
-            [(r1, 1.0), (r2, 1.0)], top_n=10, rrf_k=60, min_per_route=1
-        )
+        out = quota_rrf_fuse([(r1, 1.0), (r2, 1.0)], top_n=10, rrf_k=60, min_per_route=1)
         ids = [n.node.node_id for n in out]
         assert ids.count("x") == 1
 
@@ -202,18 +194,16 @@ class TestQuotaRrfFuse:
         """两套策略的 score 同为加权 RRF 分，便于直接对比。"""
         r1 = [_item("a"), _item("b")]
         r2 = [_item("b"), _item("c")]
-        pure = {n.node.node_id: n.score for n in weighted_rrf_fuse(
-            [(r1, 1.0), (r2, 1.0)], top_n=10, rrf_k=60)}
-        quota = {n.node.node_id: n.score for n in quota_rrf_fuse(
-            [(r1, 1.0), (r2, 1.0)], top_n=10, rrf_k=60, min_per_route=1)}
+        pure = {n.node.node_id: n.score for n in weighted_rrf_fuse([(r1, 1.0), (r2, 1.0)], top_n=10, rrf_k=60)}
+        quota = {
+            n.node.node_id: n.score for n in quota_rrf_fuse([(r1, 1.0), (r2, 1.0)], top_n=10, rrf_k=60, min_per_route=1)
+        }
         assert pure == quota
 
     def test_zero_weight_route_skipped(self):
         r1 = [_item("a")]
         r2 = [_item("b")]
-        out = quota_rrf_fuse(
-            [(r1, 1.0), (r2, 0.0)], top_n=10, rrf_k=60, min_per_route=1
-        )
+        out = quota_rrf_fuse([(r1, 1.0), (r2, 0.0)], top_n=10, rrf_k=60, min_per_route=1)
         assert [n.node.node_id for n in out] == ["a"]
 
     def test_top_n_zero_returns_empty(self):
@@ -226,8 +216,6 @@ class TestQuotaRrfFuse:
     def test_zero_quota_disables_floor_for_that_route(self):
         r1 = [_item("a0"), _item("a1")]
         r2 = [_item("b0")]
-        out = quota_rrf_fuse(
-            [(r1, 1.0), (r2, 1.0)], top_n=2, rrf_k=60, quotas=[0, 1]
-        )
+        out = quota_rrf_fuse([(r1, 1.0), (r2, 1.0)], top_n=2, rrf_k=60, quotas=[0, 1])
         # r1 无保底，r2 保底 1 条 → b0 必然入选
         assert "b0" in [n.node.node_id for n in out]

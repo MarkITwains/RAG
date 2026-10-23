@@ -19,14 +19,15 @@ def resolve_embedding_provider(setting: str, api_base: str) -> str:
     return "nvidia" if host in {"integrate.api.nvidia.com", "ai.api.nvidia.com"} else "openai"
 
 
-def embedding_profile(*, provider: str, api_base: str, model: str, dimension: int, truncate: str = "END") -> dict:
+def embedding_profile(*, provider: str, api_base: str, model: str, dimension: int, truncate: str = "END",
+                      document_text: str = "llama_index_metadata_embed_v1") -> dict:
     profile = {
         "version": 1,
         "provider": provider,
         "api_base": api_base.rstrip("/"),
         "model": model,
         "dimension": dimension,
-        "document_text": "llama_index_metadata_embed_v1",
+        "document_text": document_text,
     }
     if provider == "nvidia":
         profile.update(query_input_type="query", document_input_type="passage", truncate=truncate)
@@ -37,7 +38,7 @@ def profile_digest(profile: dict) -> str:
     return hashlib.sha256(json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def validate_embedding_profile(description: str, expected: dict) -> None:
+def validate_embedding_profile(description: str, expected: dict, *, query_only: bool = False) -> None:
     try:
         stored = json.loads(description or "{}").get(PROFILE_KEY)
     except (ValueError, AttributeError):
@@ -49,6 +50,10 @@ def validate_embedding_profile(description: str, expected: dict) -> None:
                 "Use scripts/repair_embeddings.py to migrate; do not query an unverified legacy collection."
             )
         return
+    if query_only and stored.get("document_text") in {"llama_index_metadata_embed_v1", "passage_text_only_v2"}:
+        # Queries have no passage metadata. Both documented passage encodings
+        # share the same query/vector-space contract; ingestion stays strict.
+        expected = dict(expected, document_text=stored["document_text"])
     if stored != expected:
         raise RuntimeError("Embedding configuration differs from the collection's vector-space profile; re-embed first")
 

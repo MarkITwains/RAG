@@ -17,7 +17,7 @@ chunk 段拿剩余额度并逐条填充。
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Sequence
 
 # 事实句识别：含「数值+单位」「标准号」「规范性措辞」的句子。
 # PCB 规范类问答的落点几乎总是这三类，定义性长句对定位帮助有限。
@@ -31,16 +31,38 @@ _FACT_SENTENCE_RE = re.compile(
 
 
 def estimate_tokens(text: str, chars_per_token: float = 1.5) -> int:
-    """粗估 token 数：中文按字/token 系数折算，其余按 4 字符/token。
+    """Conservative UTF-8 byte estimate when a model tokenizer is unavailable.
 
-    不引入 tiktoken —— 它需要按模型下载词表，而这里只用于预算分配。
-    宁可高估（中文取 1.5 字/token，实际 qwen 系约 1.5~1.7）也不要低估导致超窗。
+    One byte per token is an upper bound for byte based tokenizers, including
+    rare CJK, numbers and punctuation. ``chars_per_token`` remains accepted for
+    API compatibility; it no longer weakens the bound. Actual model usage must
+    be reported separately from this estimate.
     """
-    if not text:
-        return 0
-    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
-    other = max(len(text) - cjk, 0)
-    return int(cjk / max(chars_per_token, 0.5) + other / 4.0) + 1
+    return len((text or "").encode("utf-8"))
+
+
+def truncate_tokens(text: str, budget: int, count: Callable[[str], int] = estimate_tokens) -> str:
+    """Find a prefix that fits, including the truncation marker itself."""
+    if budget <= 0:
+        return ""
+    if count(text) <= budget:
+        return text
+    suffix = "…"
+    if count(suffix) > budget:
+        return ""
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if count(text[:mid].rstrip() + suffix) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    result = text[:lo].rstrip() + suffix
+    # Tokenizers need not be monotonic over prefixes. Verify the actual result.
+    while result and count(result) > budget:
+        lo -= 1
+        result = text[:max(lo, 0)].rstrip() + suffix if lo >= 0 else ""
+    return result
 
 
 def extract_fact_sentences(text: str, limit: int = 2, max_chars: int = 220) -> str:
@@ -166,8 +188,9 @@ def fit_evidence(
             remain = budget - used
             if remain < int(min_chunk_tokens):
                 break
-            keep_chars = max(int(len(text) * (remain / max(cost, 1))), 80)
-            text = text[:keep_chars].rstrip() + "…"
+            text = truncate_tokens(text, remain, lambda value: estimate_tokens(value, chars_per_token))
+            if not text or text == "…":
+                break
             cost = estimate_tokens(text, chars_per_token)
             truncated = True
 

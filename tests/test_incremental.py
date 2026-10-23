@@ -68,9 +68,7 @@ class TestFingerprint:
 # ---------------------------------------------------------------------------
 class TestDiffDocuments:
     def test_new_document_is_processed(self, doc_file):
-        to_process, stale, current = incremental.diff_documents(
-            [_doc(str(doc_file))], {"version": 2, "docs": {}}
-        )
+        to_process, stale, current = incremental.diff_documents([_doc(str(doc_file))], {"version": 2, "docs": {}})
         assert len(to_process) == 1
         assert stale == []
         assert len(current) == 1
@@ -104,9 +102,7 @@ class TestPlanIngest:
         """核心回归：OVERWRITE 必须忽略并重写清单，否则重建后是空库。"""
         docs = [_doc(str(doc_file))]
         manifest = {"version": 2, "docs": incremental.snapshot_of(docs)}
-        to_process, stale, current, did_diff = incremental.plan_ingest(
-            docs, manifest, incremental=True, overwrite=True
-        )
+        to_process, stale, current, did_diff = incremental.plan_ingest(docs, manifest, incremental=True, overwrite=True)
         assert len(to_process) == 1, "重建集合后必须全量处理，否则库会是空的"
         assert stale == []
         assert did_diff is False
@@ -125,9 +121,7 @@ class TestPlanIngest:
     def test_incremental_uses_diff(self, doc_file):
         docs = [_doc(str(doc_file))]
         manifest = {"version": 2, "docs": incremental.snapshot_of(docs)}
-        to_process, stale, _, did_diff = incremental.plan_ingest(
-            docs, manifest, incremental=True, overwrite=False
-        )
+        to_process, stale, _, did_diff = incremental.plan_ingest(docs, manifest, incremental=True, overwrite=False)
         assert to_process == []
         assert did_diff is True
 
@@ -138,9 +132,7 @@ class TestPlanIngest:
         全部变更，导致每次入库都全量重嵌入。
         """
         docs = [_doc(str(doc_file))]
-        _, _, current, _ = incremental.plan_ingest(
-            docs, {"version": 2, "docs": {}}, incremental=True, overwrite=True
-        )
+        _, _, current, _ = incremental.plan_ingest(docs, {"version": 2, "docs": {}}, incremental=True, overwrite=True)
         to_process, stale, _, _ = incremental.plan_ingest(
             docs, {"version": 2, "docs": current}, incremental=True, overwrite=False
         )
@@ -171,7 +163,8 @@ class TestManifest:
 
     def test_old_version_needs_full_reprocess(self):
         assert incremental.needs_full_reprocess({"version": 1, "docs": {}}) is True
-        assert incremental.needs_full_reprocess({"version": 2, "docs": {}}) is False
+        assert incremental.needs_full_reprocess({"version": 2, "docs": {}}) is True
+        assert incremental.needs_full_reprocess({"version": 3, "docs": {}}) is False
 
     def test_atomic_write_leaves_no_tmp_file(self, tmp_path, doc_file):
         path = tmp_path / "m.json"

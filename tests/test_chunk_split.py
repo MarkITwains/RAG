@@ -66,7 +66,7 @@ class TestOverlapRealized:
             if tail and tail in _norm(nxt)[:200]:
                 hit += 1
         assert hit >= len(chunks) - 2, (
-            f"相邻块 overlap 命中 {hit}/{len(chunks)-1}："
+            f"相邻块 overlap 命中 {hit}/{len(chunks) - 1}："
             "旧实现的 bug 是 overlap 被句号截没（实测 1.1%），修复后应绝大多数命中"
         )
 
@@ -82,9 +82,7 @@ class TestOverlapRealized:
         # 对齐成功时前一个字符本来就是句号，这是合法情形。
         start = len(chunk) - len(carry)
         if start > 0 and chunk[start - 1] not in "。.":
-            assert "。" not in chunk[max(0, start - OVERLAP):start], (
-                "窗口内明明有句首却从句中开始，说明对齐逻辑失效"
-            )
+            assert "。" not in chunk[max(0, start - OVERLAP) : start], "窗口内明明有句首却从句中开始，说明对齐逻辑失效"
 
 
 class TestHardCap:
@@ -100,9 +98,7 @@ class TestHardCap:
         assert len(blob) == 1440
         text = _make_sentences(5) + blob + _make_sentences(5)
         chunks = _splitter()._split_by_length(text, MAX_SIZE, MIN_SIZE, OVERLAP)
-        assert all(len(c) <= MAX_SIZE for c in chunks), (
-            f"超长段应被硬切，实际最长 {max(map(len, chunks))}"
-        )
+        assert all(len(c) <= MAX_SIZE for c in chunks), f"超长段应被硬切，实际最长 {max(map(len, chunks))}"
 
     def test_hard_split_covers_input(self):
         blob = "参数A，参数B；参数C：参数D" * 60

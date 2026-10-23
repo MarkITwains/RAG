@@ -78,17 +78,8 @@ class TestEnsureDocNodeId:
         assert n.metadata["doc_node_id"] == ingest._doc_node_id_of(doc)
 
 
-class TestIncrementalOrder:
-    """从源码层面锁定「删除在 insert 之前」——避免以后重构时又调回去。"""
-
-    def test_delete_happens_before_insert(self, ingest):
-        import inspect
-
-        src = inspect.getsource(ingest.main) if hasattr(ingest, "main") else inspect.getsource(ingest)
-        i_del = src.find("_delete_chunks_by_doc_node_id(vector_store, nid)")
-        i_ins = src.find("index.insert_nodes(nodes)")
-        assert i_del != -1 and i_ins != -1
-        assert i_del < i_ins, "增量入库必须先删旧 chunk 再插入新 chunk"
+# Transaction ordering/recovery is exercised with real staged writes in
+# test_ingestion_recovery.py; source-string ordering assertions were removed.
 
 
 class TestIngestHelpersDelegateToIncremental:

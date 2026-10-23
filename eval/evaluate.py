@@ -29,7 +29,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 # 允许直接运行脚本时导入 pcb_rag 与 eval 包
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,134 +77,28 @@ def _load_dataset(path: Path, limit: int = 0) -> list[dict]:
 
 
 class EvalEngine:
-    """检索引擎：复用 query.py 的检索链路（查询理解 + 多路召回 + 精排）。"""
-
-    def __init__(self, recall_k: int, top_k: int, use_rerank: bool = True):
-        from llama_index.core import Settings
-
-        from pcb_rag.query import (
-            HYDE_ENABLED,
-            HYDE_ROUTE_WEIGHT,
-            LocalBM25Retriever,
-            QUERY2DOC_ENABLED,
-            QUERY_ENHANCE_ALL,
-            FUSION_RRF_K,
-            ThreeWayHyDEFusionRetriever,
-            _build_multi_expand_queries,
-            _expand_query,
-            _extract_query_filters,
-            _is_short_query,
-            _load_or_build_bm25,
-            _try_build_reranker,
-            build_index,
-            decompose_query,
-            hyde_expand_query,
-            query2doc_expand,
-            step_back_query,
-            understand_query,
-        )
-
-        self.recall_k = recall_k
-        self.top_k = top_k
-
-        llm = build_llm()
-        Settings.llm = llm
-        self.llm = llm
-        print(f"[Eval] LLM: {getattr(llm, 'model', 'unknown')}")
-
-        self.index = build_index(getattr(llm, "model", "eval"))
-        print("[Eval] 向量索引就绪")
-
-        self.rerank = _try_build_reranker() if use_rerank else None
-        print(f"[Eval] 精排: {'启用' if self.rerank else '关闭'}")
-
-        vector_store = self.index.storage_context.vector_store
-        self.bm25 = _load_or_build_bm25(vector_store)
-        print(f"[Eval] BM25 词法索引: {'就绪' if self.bm25 else '不可用'}")
-
-        # 保存引用，供 retrieve 使用
-        self._mod = {
-            "LocalBM25Retriever": LocalBM25Retriever,
-            "ThreeWayHyDEFusionRetriever": ThreeWayHyDEFusionRetriever,
-            "_extract_query_filters": _extract_query_filters,
-            "_expand_query": _expand_query,
-            "_is_short_query": _is_short_query,
-            "_build_multi_expand_queries": _build_multi_expand_queries,
-            "hyde_expand_query": hyde_expand_query,
-            "query2doc_expand": query2doc_expand,
-            "understand_query": understand_query,
-            "decompose_query": decompose_query,
-            "step_back_query": step_back_query,
-            "FUSION_RRF_K": FUSION_RRF_K,
-            "HYDE_ROUTE_WEIGHT": HYDE_ROUTE_WEIGHT,
-            "HYDE_ENABLED": HYDE_ENABLED,
-            "QUERY2DOC_ENABLED": QUERY2DOC_ENABLED,
-            "QUERY_ENHANCE_ALL": QUERY_ENHANCE_ALL,
-        }
+    """Quality evaluation uses the production pipeline with explicit overrides."""
+    def __init__(self, recall_k: int, top_k: int, use_rerank: bool = True, *, pipeline=None):
+        from pcb_rag.retrieval import PipelineConfig, RetrievalPipeline
+        self.recall_k, self.top_k = recall_k, top_k
+        self.pipeline = pipeline or RetrievalPipeline(PipelineConfig.from_env(recall_k=recall_k, rerank_enabled=use_rerank))
+        self.pipeline.initialize()
+        self.llm = self.pipeline.llm
+        self.index = self.pipeline.state.get("index")
+        self.rerank = self.pipeline.state.get("rerank")
+        self.bm25 = self.pipeline.state.get("bm25_index")
+        self.last_run = None
 
     def retrieve(self, query: str) -> list:
-        from llama_index.core.schema import QueryBundle
+        from pcb_rag.query import build_context_bundle
+        self.last_run = self.pipeline.retrieve(query, top_k=self.top_k)
+        self.last_bundle = build_context_bundle(self.last_run.nodes)
+        return self.last_bundle.nodes
 
-        m = self._mod
-        clean_q, filters = m["_extract_query_filters"](query)
-
-        understanding = m["understand_query"](clean_q)
-        vec_w = understanding["vector_weight"]
-        bm25_w = understanding["bm25_weight"]
-
-        sub_queries = m["decompose_query"](clean_q) if understanding["need_decompose"] else []
-        step_back_q = m["step_back_query"](clean_q) if understanding["need_step_back"] else []
-
-        expanded_q = m["_expand_query"](clean_q)
-        should_enhance = m["QUERY_ENHANCE_ALL"] or m["_is_short_query"](clean_q)
-
-        hyde_q = expanded_q
-        q2doc_q = expanded_q
-        if should_enhance:
-            if m["HYDE_ENABLED"]:
-                try:
-                    hyde_q = m["hyde_expand_query"](expanded_q)
-                except Exception:
-                    hyde_q = expanded_q
-            if m["QUERY2DOC_ENABLED"]:
-                try:
-                    q2doc_q = m["query2doc_expand"](expanded_q)
-                except Exception:
-                    q2doc_q = expanded_q
-
-        vector_retriever = self.index.as_retriever(
-            similarity_top_k=self.recall_k, filters=filters
-        )
-
-        if self.bm25 is None:
-            nodes = vector_retriever.retrieve(QueryBundle(query_str=hyde_q))
-        else:
-            lexical = m["LocalBM25Retriever"](
-                self.bm25, similarity_top_k=self.recall_k, filters=filters
-            )
-            fusion = m["ThreeWayHyDEFusionRetriever"](
-                vector_retriever=vector_retriever,
-                bm25_retriever=lexical,
-                similarity_top_k=self.recall_k,
-                vector_weight=vec_w,
-                hyde_weight=vec_w * m["HYDE_ROUTE_WEIGHT"],
-                bm25_weight=bm25_w,
-                rrf_k=m["FUSION_RRF_K"],
-                llm=self.llm,
-                use_hyde=m["HYDE_ENABLED"],
-                use_query2doc=m["QUERY2DOC_ENABLED"],
-                primed_queries={expanded_q: (hyde_q, q2doc_q)},
-                extra_queries=sub_queries,
-                step_back_query=step_back_q,
-            )
-            nodes = fusion.retrieve(QueryBundle(query_str=expanded_q))
-
-        if self.rerank is not None:
-            nodes = self.rerank._postprocess_nodes(
-                nodes, query_bundle=QueryBundle(query_str=expanded_q)
-            )
-
-        return nodes[: self.top_k]
+    def configuration(self):
+        from dataclasses import asdict
+        return {"pipeline": asdict(self.pipeline.config), "pipeline_fingerprint": self.pipeline.config.fingerprint,
+                "revision": self.pipeline.state.get("revision", "legacy")}
 
 
 def _node_text(node) -> str:
@@ -267,6 +161,7 @@ def run(
                 answer = ""
             else:
                 result = generate_answer_with_citation(question, nodes, engine.llm)
+                contexts = [node.node.text for node in result["evidence_bundle"].nodes]
                 answer = result.get("answer", "")
                 item["answer"] = answer
                 item["citations"] = result.get("citations", [])
@@ -302,6 +197,7 @@ def run(
 
     report = {
         "config": {
+            **engine.configuration(),
             "dataset": str(dataset_path),
             "samples": len(results),
             "top_k": top_k,

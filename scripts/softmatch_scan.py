@@ -38,7 +38,7 @@ from pcb_rag.env_loader import load_project_env  # noqa: E402
 
 load_project_env()
 
-from llama_index.core.schema import MetadataMode, QueryBundle  # noqa: E402
+from llama_index.core.schema import MetadataMode  # noqa: E402
 
 import pcb_rag.query as rag_query  # noqa: E402
 from eval import evaluate_recall as er  # noqa: E402

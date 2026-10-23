@@ -10,7 +10,7 @@ import pytest
 
 pytest.importorskip("llama_index.core")
 
-from llama_index.core.schema import MetadataMode, NodeWithScore, TextNode  # noqa: E402
+from llama_index.core.schema import NodeWithScore, TextNode  # noqa: E402
 
 from pcb_rag import query as rag_query  # noqa: E402
 
@@ -96,10 +96,7 @@ class TestBuildContextWithBudget:
 
     def test_more_docs_than_old_fixed_limit(self):
         """旧实现固定 5 条；预算模式应能吃下更多短块。"""
-        docs = [
-            _make_doc(f"第{i}条：镀金层厚度应不小于 0.05 μm。", f"n{i}", score=1.0 - i * 0.01)
-            for i in range(12)
-        ]
+        docs = [_make_doc(f"第{i}条：镀金层厚度应不小于 0.05 μm。", f"n{i}", score=1.0 - i * 0.01) for i in range(12)]
         _, sources = rag_query.build_context_with_budget(docs, max_total_tokens=6000)
         assert len(sources) > 5
 

@@ -2,6 +2,7 @@ import os
 
 # 先加载仓库根目录的 .env：直接 `python -m pcb_rag.query` 时也能读到配置
 # （必须早于下方任何环境变量读取）
+from pcb_rag.usage import model_complete
 from pcb_rag.env_loader import load_project_env
 
 load_project_env()
@@ -11,6 +12,11 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import asyncio
 import json
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
 import warnings
 import re
 import site
@@ -124,8 +130,6 @@ warnings.filterwarnings(
 from llama_index.core import Settings, StorageContext, VectorStoreIndex
 from llama_index.vector_stores.milvus import MilvusVectorStore
 from llama_index.core.base.base_retriever import BaseRetriever
-from llama_index.core.retrievers import QueryFusionRetriever
-from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.schema import MetadataMode, NodeWithScore, QueryBundle, TextNode
 from llama_index.core.bridge.pydantic import Field, PrivateAttr
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
@@ -141,15 +145,15 @@ from pcb_rag import fusion
 from pcb_rag.api_clients import (
     EMBED_BACKEND,
     LLM_BACKEND,
-    OLLAMA_BASE,
+    OLLAMA_BASE as OLLAMA_BASE,
     OLLAMA_EMBED_MODEL,
-    OLLAMA_LLM_MODEL,
+    OLLAMA_LLM_MODEL as OLLAMA_LLM_MODEL,
     RERANK_API_MODEL,
     RERANK_API_URL,
     build_api_reranker,
     build_embed_model,
     build_llm,
-    describe_backends,
+    describe_backends as describe_backends,
     get_embedding_dim,
 )
 
@@ -157,17 +161,18 @@ from pcb_rag.api_clients import (
 from pcb_rag.compression import (
     COMPRESSION_ENABLED,
     compress_pipeline,
-    describe_compression,
+    describe_compression as describe_compression,
 )
 
 # P1-2：GraphRAG（实体关系图检索）
 from pcb_rag.graph_rag import (
+    GRAPH_HOP,
     GRAPH_RAG_ENABLED,
     GRAPH_TOP_K,
     GRAPH_WEIGHT,
     GraphRetriever,
     KnowledgeGraph,
-    describe_graph,
+    describe_graph as describe_graph,
     expand_nodes_with_graph,
     fuse_with_graph,
 )
@@ -175,11 +180,9 @@ from pcb_rag.graph_rag import (
 # P2：可观测性（tracing / 指标 / 事件）
 from pcb_rag.observability import (
     counter,
-    describe_observability,
+    describe_observability as describe_observability,
     record_event,
     span,
-    trace_context,
-    traced,
 )
 
 # P2：访问控制（多租户 / 角色 / 组）
@@ -187,10 +190,10 @@ from pcb_rag.security import (
     ACL_ENABLED,
     build_acl_filters,
     current_principal,
-    describe_acl,
+    describe_acl as describe_acl,
     filter_nodes,
     merge_filters,
-    resolve_principal,
+    resolve_principal as resolve_principal,
 )
 
 try:
@@ -490,10 +493,10 @@ def _try_build_reranker():
             if free:
                 best_gpu = max(free, key=free.get)  # type: ignore[arg-type]
                 best_free = free[best_gpu]
-                print(f"[RERANK] GPU 显存: " + ", ".join(f"GPU{k}={v}MiB free" for k, v in sorted(free.items())))
+                print("[RERANK] GPU 显存: " + ", ".join(f"GPU{k}={v}MiB free" for k, v in sorted(free.items())))
                 if best_free < 4000:  # <4GB 连 4B 模型都放不下
                     print(f"[RERANK] ⚠️ 所有 GPU 均无足够显存 (最大空闲 {best_free}MiB < 4000MiB)")
-                    print(f"[RERANK] 提示: 运行 `ollama ps` 检查，`ollama stop <model>` 释放显存")
+                    print("[RERANK] 提示: 运行 `ollama ps` 检查，`ollama stop <model>` 释放显存")
                     return None
             try:
                 return Qwen3Reranker(
@@ -510,8 +513,8 @@ def _try_build_reranker():
                 # 显示 GPU 状态帮助诊断 OOM
                 free_after = _gpu_free_mib()
                 if free_after:
-                    print(f"[RERANK] 当前 GPU 显存: " + ", ".join(f"GPU{k}={v}MiB" for k, v in sorted(free_after.items())))
-                    print(f"[RERANK] 提示: 运行 `ollama stop <model>` 释放显存后重试")
+                    print("[RERANK] 当前 GPU 显存: " + ", ".join(f"GPU{k}={v}MiB" for k, v in sorted(free_after.items())))
+                    print("[RERANK] 提示: 运行 `ollama stop <model>` 释放显存后重试")
                 return None
 
     if RERANK_BACKEND == "hf":
@@ -745,18 +748,17 @@ class Qwen3Reranker(BaseNodePostprocessor):
         target_gpu_id: int | None = None
         if torch.cuda.is_available():
             gpu_spec = RERANK_GPU_ID
-            n_gpus = torch.cuda.device_count()
             if gpu_spec == "cpu":
                 pass
             elif gpu_spec == "auto":
                 free = _gpu_free_mib()
                 if free:
                     target_gpu_id = max(free, key=free.get)
-                    print(f"[RERANK] GPU 显存: " + ", ".join(f"GPU{k}={v}MiB free" for k, v in sorted(free.items())))
+                    print("[RERANK] GPU 显存: " + ", ".join(f"GPU{k}={v}MiB free" for k, v in sorted(free.items())))
                     print(f"[RERANK] 选择空闲显存最多的 GPU {target_gpu_id} ({free[target_gpu_id]}MiB free)")
                 else:
                     target_gpu_id = 0
-                    print(f"[RERANK] 无法获取显存信息，默认加载到 GPU 0")
+                    print("[RERANK] 无法获取显存信息，默认加载到 GPU 0")
             elif gpu_spec.isdigit():
                 target_gpu_id = int(gpu_spec)
                 print(f"[RERANK] 将 Reranker 加载到 GPU {target_gpu_id}")
@@ -765,7 +767,7 @@ class Qwen3Reranker(BaseNodePostprocessor):
                 print(f"[RERANK] 将 Reranker 加载到 GPU {target_gpu_id}")
             else:
                 target_gpu_id = 0
-                print(f"[RERANK] 将 Reranker 加载到 GPU 0")
+                print("[RERANK] 将 Reranker 加载到 GPU 0")
 
         # ---------- 预下载 ----------
         model_path = model
@@ -1072,7 +1074,7 @@ def llm_rewrite_query(query: str, num_queries: int = 4, llm=None) -> list[str]:
     
     try:
         prompt = QUERY_REWRITE_PROMPT.format(num_queries=num_queries, query=query)
-        response = llm.complete(prompt)
+        response = model_complete(llm, prompt)
         response_text = response.text if hasattr(response, 'text') else str(response)
         
         # 解析生成的查询变体
@@ -1151,7 +1153,7 @@ def _build_rule_based_variants(query: str, num_variants: int) -> list[str]:
     return variants[:num_variants]
 
 
-def _build_multi_expand_queries(query: str, num_queries: int = 7) -> list[str]:
+def _build_multi_expand_queries(query: str, num_queries: int = 7, llm=None) -> list[str]:
     """构建多扩展查询列表，用于Fusion检索。
     
     生成多种查询变体以提升召回多样性：
@@ -1178,7 +1180,7 @@ def _build_multi_expand_queries(query: str, num_queries: int = 7) -> list[str]:
     # 如果启用 LLM 查询改写，使用 LLM 生成高质量变体
     if LLM_QUERY_REWRITE_ENABLED:
         try:
-            variants = llm_rewrite_query(query, num_queries=num_queries - 1)
+            variants = llm_rewrite_query(query, num_queries=num_queries - 1, llm=llm)
             if len(variants) >= 2:  # 至少有原始查询 + 1个变体
                 print(f"[LLM Rewrite] 生成 {len(variants)} 个查询变体")
                 return variants[:num_queries]
@@ -1349,7 +1351,7 @@ def hyde_expand_query(query: str, llm=None) -> str:
 
         fewshot_examples = HYDE_FEWSHOT_EXAMPLES if HYDE_FEWSHOT_ENABLED else ""
         prompt = HYDE_PROMPT_TEMPLATE.format(query=query, fewshot_examples=fewshot_examples)
-        response = llm.complete(prompt)
+        response = model_complete(llm, prompt)
         hypothetical_doc = _normalize_hyde_output(response.text)
         if not hypothetical_doc:
             return query
@@ -1398,7 +1400,7 @@ def query2doc_expand(query: str, llm=None) -> str:
             query=query, 
             max_points=QUERY2DOC_MAX_POINTS
         )
-        response = llm.complete(prompt)
+        response = model_complete(llm, prompt)
         key_points = response.text.strip()
         
         # 清理关键信息点（去除编号、空行等）
@@ -1632,7 +1634,7 @@ RAG_PROMPT_TEMPLATE = """你是 PCB 电路板领域的技术专家。请根据�
 要求：
 1. 只基于参考文档中的信息回答，不要编造
 2. 如果文档中没有相关信息，明确说明"根据提供的文档无法回答"
-3. 回答要准确、专业、简洁
+3. 回答要准确、专业、简洁；数值保留原始单位、标准版本、适用条件，表格依据包含对应列头与脚注；不同版本或条件的要求分别说明，无法判定时明确说明证据不足
 4. 参考文档带有编号 [1] [2]，引用某条信息时请在对应句子末尾标注同样的角标，例如：[1][2]
 5. 参考文档分为「事实摘要」与「原文证据」两部分，编号一一对应。
    事实摘要给出该条证据的定位信息与关键参数，用于快速判断相关性；
@@ -1675,9 +1677,6 @@ RAG_DEMOTE_LOW_VALUE = os.getenv("RAG_DEMOTE_LOW_VALUE", "1") not in {"0", "fals
 from pcb_rag.context_budget import (  # noqa: E402  (需在其配置项之后导入)
     dedupe_by_key as _cb_dedupe_by_key,
     estimate_tokens as _cb_estimate_tokens,
-    fit_evidence as _cb_fit_evidence,
-    plan_budget as _cb_plan_budget,
-    render_sections as _cb_render_sections,
 )
 
 
@@ -1749,107 +1748,11 @@ SELF_RAG_REWRITE_PROMPT = """基于以下信息，生成一个新的检索查询
 新检索查询："""
 
 
-def extract_citations(answer: str, retrieved_docs: list) -> list[dict]:
-    """从答案中提取引用信息。
-    
-    检测答案中出现的标准编号、文档名称等，并与检索到的文档进行匹配。
-    
-    Args:
-        answer: LLM 生成的答案文本
-        retrieved_docs: 检索到的文档列表（NodeWithScore 对象）
-        
-    Returns:
-        引用列表，每个引用包含：
-        - source: 来源文档路径/名称
-        - matched_text: 匹配到的文本片段
-        - confidence: 置信度（high/medium/low）
-    """
-    citations = []
-    
-    # 1. 提取答案中提到的标准编号（如 GBT4588.4-2017, IPC-A-600 等）
-    standard_patterns = [
-        r'GB[/T]*\s*[\d\.\-]+(?:\-\d{4})?',  # 国标：GBT4588.4-2017
-        r'IPC-[A-Z]*-?\d+[A-Z]*',  # IPC 标准：IPC-A-600G
-        r'SJ[/T]*\s*[\d\.\-]+(?:\-\d{4})?',  # 行业标准：SJT11363-2006
-        r'ISO\s*\d+(?:\-\d+)?(?:\:\d{4})?',  # ISO 标准
-    ]
-    
-    mentioned_standards = set()
-    for pattern in standard_patterns:
-        matches = re.findall(pattern, answer, re.IGNORECASE)
-        mentioned_standards.update(m.upper().replace(' ', '') for m in matches)
-    
-    # 2. 解析答案中的角标引用 [1] [2]（与上下文编号一致）
-    bracket_ids: set = set()
-    for raw_id in re.findall(r'\[(\d{1,2})\]', answer):
-        try:
-            bracket_ids.add(int(raw_id))
-        except ValueError:
-            continue
-
-    # 3. 与检索文档匹配
-    for pos, doc in enumerate(retrieved_docs):
-        index = pos + 1
-        node = doc.node if hasattr(doc, 'node') else doc
-        metadata = node.metadata if hasattr(node, 'metadata') else {}
-        source_path = metadata.get('source_path', '')
-        doc_text = node.get_content() if hasattr(node, 'get_content') else str(node)
-
-        # 标准化来源路径
-        source_name = Path(source_path).stem if source_path else '未知来源'
-
-        section = (
-            metadata.get('parent_title')
-            or metadata.get('chunk_section')
-            or metadata.get('section')
-            or ''
-        )
-        chunk_id = getattr(node, 'id_', None) or metadata.get('chunk_id', '')
-
-        # 检查是否在答案中被提及
-        confidence = 'low'
-        matched_text = ''
-
-        # 角标优先：LLM 显式引用了该编号，可信度最高
-        if index in bracket_ids:
-            confidence = 'high'
-            matched_text = f'[{index}]'
-        else:
-            # 检查标准编号匹配
-            for std in mentioned_standards:
-                std_normalized = std.replace('/', '').replace('-', '').replace(' ', '')
-                source_normalized = source_name.upper().replace('/', '').replace('-', '').replace(' ', '')
-                if std_normalized in source_normalized or source_normalized in std_normalized:
-                    confidence = 'high'
-                    matched_text = std
-                    break
-
-            # 如果没有标准编号匹配，检查关键词匹配
-            if confidence == 'low':
-                source_keywords = re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+', source_name)
-                for kw in source_keywords:
-                    if len(kw) >= 2 and kw.lower() in answer.lower():
-                        confidence = 'medium'
-                        matched_text = kw
-                        break
-
-        citations.append({
-            'index': index,
-            'source': source_path or source_name,
-            'source_name': source_name,
-            'section': section,
-            'chunk_id': str(chunk_id) if chunk_id else '',
-            'matched_text': matched_text,
-            'confidence': confidence,
-            'score': doc.score if hasattr(doc, 'score') else 0.0,
-            'snippet': (doc_text or '')[:200],
-        })
-    
-    # 按置信度和分数排序
-    confidence_order = {'high': 0, 'medium': 1, 'low': 2}
-    citations.sort(key=lambda x: (confidence_order.get(x['confidence'], 3), -x['score']))
-    
-    return citations
+def extract_citations(answer: str, retrieved_docs) -> list[dict]:
+    """Resolve explicit citations against final evidence, never original ranks."""
+    from pcb_rag.evidence import EvidenceBundle
+    bundle = retrieved_docs if isinstance(retrieved_docs, EvidenceBundle) else build_context_bundle(retrieved_docs)
+    return bundle.citations(answer)
 
 
 def _doc_dedupe(retrieved_docs: list) -> list:
@@ -1862,135 +1765,36 @@ def _doc_dedupe(retrieved_docs: list) -> list:
     )
 
 
-def build_context_with_budget(
-    retrieved_docs: list,
-    max_total_tokens: int = None,
-) -> tuple[str, list[dict]]:
-    """按 token 预算构建三段式上下文（事实摘要 / 原文证据 / 引用来源）。
-
-    与旧实现（固定 max_docs × max_chars）的差别：
-
-    1. **预算是总量而非条数**。逐条填充直到 token 预算耗尽，短块能多放、
-       长块自动少放，不会被"5 条"这个与内容无关的数字卡住。
-    2. **三段分离**。事实摘要给出定位与关键参数（含数值、标准号、规范性
-       措辞的句子），原文证据给完整上下文。模型可以先扫事实段判断相关性，
-       再回到原文核对细节，减少"读了很多字却没读到关键句"的情况。
-    3. **引用表独立预留**。引用编号与证据编号一一对应，避免截断时错位。
-
-    预算分配与拼装的纯逻辑在 :mod:`pcb_rag.context_budget`，这里只做
-    ``NodeWithScore`` → 字典的规范化。
-
-    Args:
-        retrieved_docs: NodeWithScore 列表（已排序，分数高的在前）
-        max_total_tokens: 总预算；None 时取 RAG_CONTEXT_MAX_TOKENS
-
-    Returns:
-        (context_text, sources_info)。预算 <= 0 或无可用证据时返回 ("", [])。
-    """
-    budget = int(
-        max_total_tokens if max_total_tokens is not None else RAG_CONTEXT_MAX_TOKENS
-    )
-    if budget <= 0:
-        return "", []
-
-    docs = _doc_dedupe(retrieved_docs or [])
-    if not docs:
-        return "", []
-
-    # 低信息密度块（裸标签罗列等）排到末尾：预算充足时仍会保留它们，
-    # 预算紧张时它们最先被挤掉。不做硬过滤 —— 判定是启发式的，
-    # 误删一条条款的代价高于多留一段低价值文本。
-    if RAG_DEMOTE_LOW_VALUE:
-        docs = sorted(
-            docs,
-            key=lambda item: 1
-            if (getattr(getattr(item, "node", item), "metadata", None) or {}).get("low_value")
-            else 0,
-        )
-
-    plan = _cb_plan_budget(
-        budget,
+def build_context_bundle(retrieved_docs: list, max_total_tokens: int = None):
+    from pcb_rag.evidence import build_evidence_bundle
+    return build_evidence_bundle(
+        retrieved_docs or [],
+        RAG_CONTEXT_MAX_TOKENS if max_total_tokens is None else max_total_tokens,
         facts_ratio=RAG_FACTS_BUDGET_RATIO,
-        min_chunk_tokens=RAG_MIN_CHUNK_TOKENS,
+        demote_low_value=RAG_DEMOTE_LOW_VALUE,
     )
 
-    def _text_of(item) -> str:
-        node = item.node if hasattr(item, "node") else item
-        try:
-            # NONE 而非 EMBED：metadata 的定位信息已经拼在标题行（来源 · 章节），
-            # 再用 EMBED 模式会把 source_path / doc_node_id / prev_id 等键值
-            # 一并塞进正文。它们既占预算，也是模型读不懂的技术字段。
-            return node.get_content(metadata_mode=MetadataMode.NONE)
-        except Exception:
-            return str(node)
 
-    fitted = _cb_fit_evidence(
-        docs,
-        _text_of,
-        plan["chunks"],
-        min_chunk_tokens=RAG_MIN_CHUNK_TOKENS,
-        chars_per_token=RAG_CHARS_PER_TOKEN,
+def prepare_generation(query: str, retrieved_docs: list, llm=None, *, template=None, values=None):
+    from pcb_rag.evidence import build_generation_request
+    llm = llm or Settings.llm
+    from pcb_rag.usage import request_limits
+    request_limit, output_limit, reserve, count = request_limits(llm)
+    options = {}
+    tokenizer = getattr(llm, "tokenizer", None)
+    if callable(tokenizer):
+        options = {"count": count, "counter_name": "model_tokenizer"}
+    return build_generation_request(
+        retrieved_docs, template or RAG_PROMPT_TEMPLATE, query=query,
+        context_budget=RAG_CONTEXT_MAX_TOKENS, request_limit=request_limit,
+        output_reserve=reserve, values=values, facts_ratio=RAG_FACTS_BUDGET_RATIO,
+        demote_low_value=RAG_DEMOTE_LOW_VALUE, **options,
     )
-    if not fitted:
-        return "", []
 
-    entries: list[dict] = []
-    for row in fitted:
-        item = row["item"]
-        node = item.node if hasattr(item, "node") else item
-        metadata = getattr(node, "metadata", None) or {}
 
-        source_path = metadata.get("source_path", "未知来源")
-        source_name = (
-            Path(source_path).stem
-            if source_path and source_path != "未知来源"
-            else source_path
-        )
-        section = (
-            metadata.get("parent_title")
-            or metadata.get("chunk_section")
-            or metadata.get("section")
-            or ""
-        )
-        chunk_id = getattr(node, "id_", None) or metadata.get("chunk_id", "")
-        page = metadata.get("page_label") or metadata.get("page") or ""
-
-        entries.append(
-            {
-                "node": node,
-                "text": row["text"],
-                "tokens": row["tokens"],
-                "truncated": row["truncated"],
-                "source_path": source_path,
-                "source_name": source_name,
-                "section": section,
-                "page": str(page) if page else "",
-                "metadata": metadata,
-                "score": getattr(item, "score", 0.0) or 0.0,
-                "chunk_id": str(chunk_id) if chunk_id else "",
-            }
-        )
-
-    context = _cb_render_sections(entries, plan["facts"])
-
-    sources_info = [
-        {
-            "index": idx,
-            "source_path": entry["source_path"],
-            "source_name": entry["source_name"],
-            "section": entry["section"],
-            "chunk_id": entry["chunk_id"],
-            "page": entry["page"],
-            "score": entry["score"],
-            "char_count": len(entry["text"]),
-            "tokens": entry["tokens"],
-            "truncated": entry["truncated"],
-            "snippet": entry["text"][:200],
-        }
-        for idx, entry in enumerate(entries, 1)
-    ]
-
-    return context, sources_info
+def build_context_with_budget(retrieved_docs: list, max_total_tokens: int = None) -> tuple[str, list[dict]]:
+    bundle = build_context_bundle(retrieved_docs, max_total_tokens)
+    return bundle.context, bundle.sources
 
 
 def build_context_with_sources(retrieved_docs: list, max_docs: int = None, max_chars: int = None) -> tuple[str, list[dict]]:
@@ -2067,63 +1871,27 @@ def build_context_with_sources(retrieved_docs: list, max_docs: int = None, max_c
     return context, sources_info
 
 
-def generate_answer_with_citation(query: str, retrieved_docs: list, llm=None) -> dict:
-    """生成带引用的答案。
-    
-    使用优化后的 RAG Prompt 生成答案，并自动提取和标注引用来源。
-    
-    Args:
-        query: 用户查询
-        retrieved_docs: 检索到的文档列表（NodeWithScore 对象）
-        llm: LLM 实例（如果为 None，使用 Settings.llm）
-        
-    Returns:
-        包含以下字段的字典：
-        - answer: 生成的答案文本
-        - citations: 引用列表（带置信度）
-        - sources: 来源文档路径列表
-        - context_info: 上下文构建信息
-    """
-    if llm is None:
-        llm = Settings.llm
-    
-    if not retrieved_docs:
-        return {
-            'answer': '根据提供的文档无法回答该问题，未找到相关文档。',
-            'citations': [],
-            'sources': [],
-            'context_info': {'doc_count': 0},
-        }
-    
-    # 构建上下文
-    context, sources_info = build_context_with_sources(retrieved_docs)
-    
-    # 生成答案
-    prompt = RAG_PROMPT_TEMPLATE.format(context=context, query=query)
-    
-    try:
-        response = llm.complete(prompt)
+def generate_answer_with_citation(query: str, retrieved_docs: list, llm=None, *, template=None, values=None) -> dict:
+    """Generate with the same final evidence used by all citation consumers."""
+    llm = llm or Settings.llm
+    request = prepare_generation(query, retrieved_docs, llm, template=template, values=values)
+    bundle = request.evidence
+    if not bundle.entries:
+        answer = '根据提供的文档无法回答该问题，未找到预算内可用的相关证据。'
+    else:
+        from pcb_rag.runtime import request_scope, run_stage
+        with request_scope(float(os.getenv("RAG_REQUEST_TIMEOUT", "120"))):
+            response = run_stage("generation", model_complete, llm, request.prompt)
         answer = response.text if hasattr(response, 'text') else str(response)
-    except Exception as e:
-        print(f"[RAG] 答案生成失败: {e}")
-        answer = f"答案生成过程中出现错误：{e}"
-    
-    # 提取引用
-    citations = []
-    if CITATION_ENABLED:
-        citations = extract_citations(answer, retrieved_docs)
-    
-    # 构建来源列表
-    sources = [info['source_path'] for info in sources_info]
-    
     return {
-        'answer': answer,
-        'citations': citations,
-        'sources': sources,
+        'answer': answer, 'citations': bundle.citations(answer) if CITATION_ENABLED else [],
+        'invalid_citations': bundle.invalid_citations(answer),
+        'sources': [info['source_path'] for info in bundle.sources],
+        'evidence_bundle': bundle,
         'context_info': {
-            'doc_count': len(sources_info),
-            'total_chars': sum(info['char_count'] for info in sources_info),
-            'sources_detail': sources_info,
+            'doc_count': len(bundle.entries),
+            'total_chars': sum(info['char_count'] for info in bundle.sources),
+            'sources_detail': bundle.sources, 'budget': bundle.budget,
         },
     }
 
@@ -2142,7 +1910,7 @@ def format_answer_with_citations(result: dict, verbose: bool = False) -> str:
     
     if CITATION_ENABLED and result.get('citations'):
         # 筛选高置信度和中置信度的引用
-        valid_citations = [c for c in result['citations'] if c['confidence'] in ('high', 'medium')]
+        valid_citations = [c for c in result['citations'] if c.get('citation_valid') or c['confidence'] in ('high', 'medium')]
         
         if valid_citations:
             output_parts.append('\n\n📚 参考来源：')
@@ -2185,25 +1953,11 @@ def self_rag_evaluate(
     if llm is None:
         llm = Settings.llm
     
-    # 构建上下文摘要（用于评估）
-    context_summary = []
-    for i, doc in enumerate(retrieved_docs[:RAG_TOP_DOCS], 1):
-        node = doc.node if hasattr(doc, 'node') else doc
-        text = node.get_content() if hasattr(node, 'get_content') else str(node)
-        # 截取前 500 字符用于评估
-        context_summary.append(f"[文档{i}] {text[:500]}...")
-    
-    context_text = "\n\n".join(context_summary)
-    
-    # 构建评估 prompt
-    prompt = SELF_RAG_EVALUATE_PROMPT.format(
-        query=query,
-        context=context_text,
-        answer=answer
-    )
-    
+    request = prepare_generation(query, retrieved_docs, llm, template=SELF_RAG_EVALUATE_PROMPT, values={"answer": answer})
+    prompt = request.prompt
+
     try:
-        response = llm.complete(prompt)
+        response = model_complete(llm, prompt)
         response_text = response.text if hasattr(response, 'text') else str(response)
         
         # 解析 JSON 响应
@@ -2279,7 +2033,7 @@ def self_rag_generate_followup_query(
     )
     
     try:
-        response = llm.complete(prompt)
+        response = model_complete(llm, prompt)
         new_query = response.text if hasattr(response, 'text') else str(response)
         new_query = new_query.strip()
         
@@ -2351,9 +2105,8 @@ def _agentic_plan(query: str, docs: list, llm, used_queries: Optional[list] = No
     default = {"sufficient": True, "action": "ANSWER", "next_query": "", "reason": "判断失败，按充分处理"}
 
     try:
-        response = llm.complete(
-            _AGENTIC_PLAN_PROMPT.format(query=query, scratchpad=_agentic_scratchpad(docs))
-        )
+        request = prepare_generation(query, docs, llm, template=_AGENTIC_PLAN_PROMPT.replace("{scratchpad}", "{context}"))
+        response = model_complete(llm, request.prompt)
         text = response.text if hasattr(response, "text") else str(response)
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
@@ -2384,7 +2137,7 @@ def _agentic_plan(query: str, docs: list, llm, used_queries: Optional[list] = No
         return default
 
 
-def self_rag_query(
+def _self_rag_query_impl(
     query: str,
     retriever,
     llm=None,
@@ -2425,6 +2178,7 @@ def self_rag_query(
 
     if max_iterations is None:
         max_iterations = max(1, int(SELF_RAG_MAX_ITERATIONS))
+    max_iterations = min(max(1, int(max_iterations)), int(os.getenv("SELF_RAG_HARD_MAX_ITERATIONS", "5")))
     if threshold is None:
         threshold = SELF_RAG_THRESHOLD
 
@@ -2439,6 +2193,9 @@ def self_rag_query(
         print(f"[Agentic-RAG] 初始查询: {query[:80]}")
 
     for iteration in range(1, max_iterations + 1):
+        from pcb_rag.runtime import current_control
+        if current_control():
+            current_control().remaining()
         # ---- 1) 用当前查询检索 ----
         try:
             new_docs = retriever.retrieve(current_query)
@@ -2499,7 +2256,7 @@ def self_rag_query(
     eval_result = self_rag_evaluate(
         query,
         final_result["answer"],
-        all_docs[:RAG_TOP_DOCS],
+        final_result["evidence_bundle"].nodes,
         llm,
     )
     final_score = float(eval_result.get("overall", 0) or 0)
@@ -2538,6 +2295,12 @@ def self_rag_query(
     return final_result
 
 
+def self_rag_query(*args, **kwargs):
+    from pcb_rag.runtime import request_scope
+    with request_scope(float(os.getenv("RAG_REQUEST_TIMEOUT", "120"))):
+        return _self_rag_query_impl(*args, **kwargs)
+
+
 def format_self_rag_result(result: dict, show_history: bool = False) -> str:
     """格式化 Self-RAG 结果输出。
     
@@ -2556,7 +2319,7 @@ def format_self_rag_result(result: dict, show_history: bool = False) -> str:
     # Self-RAG 信息
     self_rag_info = result.get('self_rag_info', {})
     if self_rag_info.get('enabled'):
-        output_parts.append(f"\n\n🔄 Self-RAG 自反思：")
+        output_parts.append("\n\n🔄 Self-RAG 自反思：")
         output_parts.append(f"   迭代次数: {self_rag_info.get('iterations', 1)}")
         output_parts.append(f"   最终评分: {self_rag_info.get('final_score', 'N/A')}/5")
         
@@ -2820,7 +2583,7 @@ def decompose_query(
     try:
         if llm is None:
             llm = Settings.llm
-        response = llm.complete(_DECOMPOSE_PROMPT.format(query=query, max_sub=max_sub))
+        response = model_complete(llm, _DECOMPOSE_PROMPT.format(query=query, max_sub=max_sub))
         text = response.text if hasattr(response, "text") else str(response)
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
@@ -2861,7 +2624,7 @@ def step_back_query(query: str, llm=None) -> str:
     try:
         if llm is None:
             llm = Settings.llm
-        response = llm.complete(_STEPBACK_PROMPT.format(query=query))
+        response = model_complete(llm, _STEPBACK_PROMPT.format(query=query))
         text = response.text if hasattr(response, "text") else str(response)
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
         text = text.splitlines()[0].strip() if text else ""
@@ -2894,7 +2657,7 @@ def _understand_with_llm(query: str, llm=None) -> Optional[dict]:
     try:
         if llm is None:
             llm = Settings.llm
-        response = llm.complete(_UNDERSTAND_PROMPT.format(query=query))
+        response = model_complete(llm, _UNDERSTAND_PROMPT.format(query=query))
         text = response.text if hasattr(response, "text") else str(response)
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
@@ -3002,7 +2765,6 @@ class ColBERTReranker:
                 "\n- 或提供真正的 ColBERT 模型，例如 jinaai/jina-colbert-v2、colbert-ir/colbertv2.0"
             )
 
-        import torch
         from transformers import AutoModel, AutoTokenizer
         from huggingface_hub import model_info
         from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
@@ -3319,184 +3081,14 @@ class MultiPathRetriever:
 # 层次化 Chunk 扩展策略 (Group + Expand)
 # ============================================================
 
-def expand_chunks_with_context(
-    nodes: list[NodeWithScore],
-    index: "VectorStoreIndex",
-    expand_neighbors: int = CHUNK_EXPAND_NEIGHBORS,
-    expand_parent: bool = CHUNK_EXPAND_PARENT,
-    group_by_doc: bool = CHUNK_GROUP_BY_DOC,
-) -> list[NodeWithScore]:
-    """扩展检索结果，带上相关的上下文 chunks。
-    
-    实现 Group + Expand 策略：
-    1. Group: 按文档/章节分组检索结果
-    2. Expand: 递归扩展相邻 chunks（前后各 N 层）和父 chunks
-    
-    Args:
-        nodes: 原始检索结果
-        index: 向量索引（用于查询相关 chunks）
-        expand_neighbors: 扩展的邻居层数（前后各 N 层，递归扩展）
-        expand_parent: 是否扩展父 chunk
-        group_by_doc: 是否按文档分组
-    
-    Returns:
-        扩展后的节点列表（保持原有顺序，新增节点插入到相关位置）
-    """
-    if not nodes or not CHUNK_EXPAND_ENABLED:
-        return nodes
-    
-    from pymilvus import connections, Collection
-    from llama_index.core.schema import TextNode, NodeWithScore as NWS
-    import json as _json
-    from urllib.parse import urlparse
-
-    # 复用 MILVUS_URI 的 host/port，避免硬编码导致远程 / 自定义端口 Milvus 上扩展静默失败
-    parsed = urlparse(MILVUS_URI if "://" in MILVUS_URI else f"http://{MILVUS_URI}")
-    conn_alias = "pcb_chunk_expand"
-    milvus_host = parsed.hostname or "127.0.0.1"
-    milvus_port = str(parsed.port or 19530)
-
-    try:
-        if not connections.has_connection(conn_alias):
-            connections.connect(alias=conn_alias, host=milvus_host, port=milvus_port)
-        collection = Collection(COLLECTION, using=conn_alias)
-        collection.load()
-    except Exception as e:
-        print(f"[ChunkExpand] Milvus 连接失败({milvus_host}:{milvus_port})，跳过扩展: {e}")
-        return nodes
-    
-    # 收集原始 IDs
-    original_ids = set()
-    node_by_id = {}
-    parent_ids_to_expand = set()
-    
-    for node in nodes:
-        nid = node.node.id_
-        original_ids.add(nid)
-        node_by_id[nid] = node
-        
-        metadata = node.node.metadata or {}
-        
-        # 收集父节点 ID
-        if expand_parent:
-            parent_id = metadata.get('parent_id', '')
-            doc_node_id = metadata.get('doc_node_id', '')
-            if parent_id and parent_id != doc_node_id and parent_id not in original_ids:
-                parent_ids_to_expand.add(parent_id)
-    
-    # ========== 递归扩展邻居（真正的 N 层扩展） ==========
-    all_expand_ids = set()
-    
-    if expand_neighbors > 0:
-        # 第一层：从原始节点开始
-        current_layer_ids = set(original_ids)
-        current_layer_metadata = {nid: node_by_id[nid].node.metadata or {} for nid in original_ids}
-        
-        for layer in range(expand_neighbors):
-            next_layer_ids = set()
-            ids_to_fetch = set()
-            
-            # 从当前层收集需要扩展的邻居 ID
-            for nid in current_layer_ids:
-                metadata = current_layer_metadata.get(nid, {})
-                prev_id = metadata.get('prev_id', '')
-                next_id = metadata.get('next_id', '')
-                
-                if prev_id and prev_id not in original_ids and prev_id not in all_expand_ids:
-                    ids_to_fetch.add(prev_id)
-                    next_layer_ids.add(prev_id)
-                if next_id and next_id not in original_ids and next_id not in all_expand_ids:
-                    ids_to_fetch.add(next_id)
-                    next_layer_ids.add(next_id)
-            
-            if not ids_to_fetch:
-                break
-            
-            # 从 Milvus 获取这些节点的 metadata（用于下一层扩展）
-            try:
-                id_list = list(ids_to_fetch)
-                expr = f'id in {_json.dumps(id_list)}'
-                results = collection.query(
-                    expr=expr, 
-                    output_fields=['id', 'text', 'doc_id', 'prev_id', 'next_id', 'parent_id']
-                )
-                
-                # 更新下一层的 metadata
-                new_metadata = {}
-                for r in results:
-                    rid = r.get('id', '')
-                    if rid:
-                        new_metadata[rid] = {
-                            'prev_id': r.get('prev_id', ''),
-                            'next_id': r.get('next_id', ''),
-                            'parent_id': r.get('parent_id', ''),
-                            'doc_id': r.get('doc_id', ''),
-                            'text': r.get('text', ''),
-                        }
-                
-                all_expand_ids.update(ids_to_fetch)
-                current_layer_ids = next_layer_ids
-                current_layer_metadata = new_metadata
-                
-            except Exception as e:
-                break
-    
-    # 添加父节点
-    all_expand_ids.update(parent_ids_to_expand)
-    
-    if not all_expand_ids:
-        return nodes
-    
-    # ========== 批量获取所有扩展节点 ==========
-    expanded_nodes = []
-    try:
-        id_list = list(all_expand_ids)
-        expr = f'id in {_json.dumps(id_list)}'
-        results = collection.query(expr=expr, output_fields=['id', 'text', 'doc_id'])
-        
-        for r in results:
-            node_id = r.get('id', '')
-            text = r.get('text', '')
-            doc_id = r.get('doc_id', '')
-            
-            if not text:
-                continue
-            
-            # 构建 metadata
-            metadata = {'is_context_expansion': True, 'doc_id': doc_id}
-            
-            # 从已有节点中找到同文档的节点，复制部分 metadata
-            for orig_node in nodes:
-                orig_doc = orig_node.node.metadata.get('doc_node_id') or orig_node.node.metadata.get('doc_id', '')
-                if orig_doc == doc_id:
-                    for key in ['source_path', 'file_name', 'doc_node_id', 'doc_type']:
-                        if key in orig_node.node.metadata:
-                            metadata[key] = orig_node.node.metadata[key]
-                    break
-            
-            node = TextNode(text=text, id_=node_id, metadata=metadata)
-            # 父节点给稍高分数，邻居节点给较低分数
-            score = 0.15 if node_id in parent_ids_to_expand else 0.05
-            expanded_nodes.append(NWS(node=node, score=score))
-            
-    except Exception as e:
-        return nodes
-    
-    if not expanded_nodes:
-        return nodes
-    
-    # 扩展节点分数取「原始最低分 × 0.95」，使其紧跟命中节点且不会被阈值误杀；
-    # 调用方（_retrieve_nodes）为扩展节点保留独立配额，避免被 top_k 截断整体丢弃
-    base_scores = [n.score for n in nodes if n.score is not None]
-    floor_score = (min(base_scores) if base_scores else 1.0) * 0.95
-    for nws in expanded_nodes:
-        nws.score = floor_score
-
-    result = list(nodes)
-    result.extend(expanded_nodes)
-    result.sort(key=lambda x: -(x.score if x.score is not None else 0.0))
-
-    return result
+def expand_chunks_with_context(nodes, index, expand_neighbors=1, expand_parent=True, group_by_doc=False):
+    from pcb_rag.sources import expand_sources, fetch_source_nodes
+    from pcb_rag.retrieval import get_pipeline
+    pipeline = get_pipeline()
+    state = dict(pipeline.state)
+    fetch = (lambda ids: pipeline._fetch(ids, state)) if state.get("source_nodes") is not None else (lambda ids: fetch_source_nodes(index.storage_context.vector_store, ids))
+    return expand_sources(nodes, fetch, neighbors=expand_neighbors, parents=expand_parent,
+                          allowed=lambda items: filter_nodes(items, current_principal()))
 
 
 def group_chunks_by_document(
@@ -3597,8 +3189,8 @@ def _try_build_colbert_reranker() -> Optional[ColBERTReranker]:
     # 检查是否是常见的错误模型名称
     if model_name.lower() in {"qwen3-reranker", "qwen3-vl-reranker", "qwen-vl-reranker"}:
         print(f"[ColBERT] 警告: 模型名称 '{model_name}' 不正确")
-        print(f"[ColBERT] 建议使用完整路径，如: Qwen/Qwen3-Reranker-4B")
-        print(f"[ColBERT] 或使用推荐模型: BAAI/bge-reranker-v2-m3")
+        print("[ColBERT] 建议使用完整路径，如: Qwen/Qwen3-Reranker-4B")
+        print("[ColBERT] 或使用推荐模型: BAAI/bge-reranker-v2-m3")
         return None
 
     try:
@@ -3608,7 +3200,7 @@ def _try_build_colbert_reranker() -> Optional[ColBERTReranker]:
             max_length=COLBERT_MAX_LENGTH,
             batch_size=COLBERT_BATCH_SIZE,
         )
-        print(f"[ColBERT] Reranker 实例创建成功（模型将延迟加载）")
+        print("[ColBERT] Reranker 实例创建成功（模型将延迟加载）")
         return reranker
     except Exception as e:
         print(f"[ColBERT] 构建失败: {e}")
@@ -4257,7 +3849,7 @@ def _milvus_field_names(vector_store: MilvusVectorStore) -> set[str]:
     这里取交集，既让新字段在支持的集合上生效，又不让旧集合导出直接失败。
     """
     try:
-        info = vector_store.client.describe_collection(COLLECTION)
+        info = vector_store.client.describe_collection(getattr(vector_store, "collection_name", COLLECTION))
     except Exception:
         return set()
 
@@ -4266,23 +3858,21 @@ def _milvus_field_names(vector_store: MilvusVectorStore) -> set[str]:
         return set()
 
     names: set[str] = set()
-    for field in fields:
-        if isinstance(field, dict):
-            name = field.get("name")
+    for schema_field in fields:
+        if isinstance(schema_field, dict):
+            name = schema_field.get("name")
         else:
-            name = getattr(field, "name", None)
+            name = getattr(schema_field, "name", None)
         if isinstance(name, str) and name:
             names.add(name)
     return names
 
 
 def _iter_milvus_rows(vector_store: MilvusVectorStore) -> Iterable[dict]:
-    available = _milvus_field_names(vector_store)
-    wanted = ["id", "doc_id", "text", *LEXICAL_METADATA_KEYS]
-    output_fields = [k for k in wanted if not available or k in available]
+    output_fields = ["*"]
 
     it = vector_store.client.query_iterator(
-        collection_name=COLLECTION,
+        collection_name=getattr(vector_store, "collection_name", COLLECTION),
         batch_size=LEXICAL_EXPORT_BATCH,
         limit=LEXICAL_EXPORT_LIMIT,
         filter="id != ''",
@@ -4293,8 +3883,6 @@ def _iter_milvus_rows(vector_store: MilvusVectorStore) -> Iterable[dict]:
         try:
             batch = it.next()
         except StopIteration:
-            break
-        except Exception:
             break
 
         if not batch:
@@ -4424,10 +4012,15 @@ def _load_or_build_bm25(vector_store: MilvusVectorStore) -> Optional[_Bm25Index]
     avgdl = total_len / max(len(docs), 1)
     return _Bm25Index(docs=docs, tfs=tfs, df=df, avgdl=avgdl, inverted=inverted)
 
-def build_index(llm_model: str):
-    _configure_llm(llm_model)
+def build_index(llm_model: str, *, llm=None, collection=None, embed_model=None):
+    if llm is None:
+        _configure_llm(llm_model)
+    else:
+        Settings.llm = llm
+    collection = collection or COLLECTION
     # Embedding 后端由 EMBED_BACKEND 决定（local=Ollama，api=OpenAI 兼容）
-    Settings.embed_model = build_embed_model()
+    configured_embedding = embed_model or build_embed_model()
+    Settings.embed_model = configured_embedding
 
     # Milvus 向量字段需要显式维度；优先 EMBED_DIM，未配置时实际请求一次探测
     embedding_field = os.getenv("MILVUS_EMBEDDING_FIELD", "embedding")
@@ -4451,7 +4044,7 @@ def build_index(llm_model: str):
     async def _init_vector_store() -> MilvusVectorStore:
         return MilvusVectorStore(
             uri=MILVUS_URI,
-            collection_name=COLLECTION,
+            collection_name=collection,
             dim=embed_dim,
             embedding_field=embedding_field,
         )
@@ -4481,9 +4074,10 @@ def build_index(llm_model: str):
         from pcb_rag.api_clients import get_embedding_profile
         from pcb_rag.embedding_contract import validate_embedding_profile
 
-        collection_info = vector_store.client.describe_collection(COLLECTION)
-        validate_embedding_profile(collection_info.get("description", ""), get_embedding_profile(embed_dim))
-    return VectorStoreIndex.from_vector_store(vector_store=vector_store, storage_context=storage_context)
+        collection_info = vector_store.client.describe_collection(collection)
+        validate_embedding_profile(collection_info.get("description", ""), get_embedding_profile(embed_dim), query_only=True)
+    return VectorStoreIndex.from_vector_store(vector_store=vector_store, storage_context=storage_context,
+                                               embed_model=configured_embedding)
 
 # ---------------------------------------------------------------------------
 # GraphRAG / P2 运行时装配（图检索、权限复核、上下文压缩）
@@ -4600,523 +4194,8 @@ def _aux_postprocessors() -> list:
 
 
 def main():
-    llm_candidates = _pick_llm_candidates(OLLAMA_BASE)
-    if not llm_candidates:
-        llm_candidates = ["qwen3:30b-a3b-instruct-2507-q4_K_M"]
-
-    llm_idx = 0
-    index = build_index(llm_candidates[llm_idx])
-
-    # GraphRAG：加载知识图谱（文件缺失 / 未启用时自动降级为无图检索）
-    _GRAPH_STATE["graph"], _GRAPH_STATE["retriever"] = _init_graph()
-
-    rerank = _try_build_reranker()
-    if rerank is not None:
-        # 允许用户把 top_n 配小一点，但召回至少要 >= top_n
-        recall_k = max(RECALL_TOP_K, RERANK_TOP_N)
-        if RERANK_BACKEND == "hf":
-            device = getattr(rerank, "_torch_device", None)
-            print(
-                f"[RERANK] HF Transformers: model={HF_RERANK_MODEL}, top_n={RERANK_TOP_N}, recall_k={recall_k}, device={device}"
-            )
-        elif RERANK_BACKEND == "qwen3reranker" or "qwen3-reranker" in HF_RERANK_MODEL.lower():
-            device = getattr(rerank, "_device", None)
-            print(
-                f"[RERANK] Qwen3-Reranker: model={HF_RERANK_MODEL}, top_n={RERANK_TOP_N}, recall_k={recall_k}, device={device}"
-            )
-        else:
-            print(f"[RERANK] SentenceTransformerRerank: model={RERANK_MODEL}, top_n={RERANK_TOP_N}, recall_k={recall_k}")
-    else:
-        recall_k = 20
-        if RERANK_ENABLED:
-            print("[RERANK] ⚠️ 未启动（GPU 显存不足或加载失败），回退为仅召回 (recall_k=20)")
-            print("[RERANK] 提示: `ollama stop <model>` 释放显存，或设置 RERANK_GPU_ID=1")
-        else:
-            print("[RERANK] 关闭")
-
-    # 词法（BM25）retriever：从 Milvus 导出 text 构建本地索引，失败则回退纯向量
-    bm25_index = None
-    try:
-        # 这里复用 build_index() 中创建过的 vector store：
-        # VectorStoreIndex.from_vector_store 仍持有底层 vector_store，可从 storage_context 取回。
-        vector_store = index.storage_context.vector_store
-        if isinstance(vector_store, MilvusVectorStore):
-            bm25_index = _load_or_build_bm25(vector_store)
-    except Exception:
-        bm25_index = None
-
-    # ColBERT reranker（多路召回模式使用）
-    colbert_reranker = None
-    if MULTIPATH_ENABLED and COLBERT_RERANK_ENABLED and bm25_index is not None:
-        colbert_reranker = _try_build_colbert_reranker()
-
-    # 显示检索模式信息
-    if MULTIPATH_ENABLED and bm25_index is not None:
-        print(f"[检索模式] MultiPath 多路召回 + Late Interaction")
-        print(f"  - Dense召回: top_k={MULTIPATH_DENSE_TOP_K}")
-        print(f"  - Sparse召回: top_k={MULTIPATH_SPARSE_TOP_K}")
-        print(f"  - RRF融合: k={MULTIPATH_RRF_K}")
-        if colbert_reranker is not None:
-            model_name = getattr(colbert_reranker, 'model_name', COLBERT_MODEL)
-            print(f"  - ColBERT重排: model={model_name}, candidates={MULTIPATH_RERANK_CANDIDATES}")
-        else:
-            if COLBERT_RERANK_ENABLED:
-                print(f"  - ColBERT重排: 启用失败，使用标准Rerank")
-            else:
-                print(f"  - ColBERT重排: 未启用，使用标准Rerank")
-    elif bm25_index is not None:
-        print(f"[检索模式] 三路召回 Fusion + Rerank")
-        print(f"  - 召回路由: 原始向量 + HyDE向量 + BM25+")
-        if FUSION_MODE_UNSUPPORTED:
-            print(
-                f"  - Fusion: FUSION_MODE={FUSION_MODE} 不受支持，实际按 "
-                f"{FUSION_MODE_EFFECTIVE} 执行（该变量当前不改变融合行为）, weights={FUSION_WEIGHTS}"
-            )
-        else:
-            print(f"  - Fusion: mode={FUSION_MODE_EFFECTIVE}, weights={FUSION_WEIGHTS}")
-        print(f"  - HyDE路降权: raw_vec=1.0, hyde_vec={HYDE_ROUTE_WEIGHT}")
-        print(f"  - 多扩展查询: num_queries={FUSION_NUM_QUERIES}, enabled={MULTI_EXPAND_ENABLED}")
-        print(f"  - Rerank: enabled={RERANK_ENABLED}, top_n={RERANK_TOP_N}")
-    else:
-        print(f"[检索模式] 仅向量检索（词法索引不可用）")
-
-    print(f"[LLM] {llm_candidates[llm_idx]}  (num_ctx={DEFAULT_NUM_CTX})")
-    if QUERY_ROUTING_ENABLED:
-        print("[查询意图理解] 启用智能查询分类")
-        print(f"  支持类型: {', '.join(QUERY_TYPES.keys())}, general")
-    
-    # 显示 Self-RAG 状态
-    if SELF_RAG_ENABLED:
-        print(f"[Self-RAG 自反思] 已启用")
-        print(f"  最大迭代: {SELF_RAG_MAX_ITERATIONS}, 质量阈值: {SELF_RAG_THRESHOLD}/5")
-    else:
-        print(f"[Self-RAG 自反思] 默认关闭（当前问答默认模式为 Fusion+HyDE+Rerank）")
-    
-    # 显示 Chunk 扩展状态
-    if CHUNK_EXPAND_ENABLED:
-        print(f"[层次化Chunk扩展] 已启用")
-        print(f"  邻居扩展: {CHUNK_EXPAND_NEIGHBORS}, 父节点扩展: {CHUNK_EXPAND_PARENT}, 按文档分组: {CHUNK_GROUP_BY_DOC}")
-
-    # P1-2 / P2 能力状态
-    if GRAPH_RAG_ENABLED:
-        graph_info = describe_graph(_GRAPH_STATE.get("graph"))
-        print(
-            f"[GraphRAG] 已启用: 实体={graph_info.get('entities', 0)}, 关系={graph_info.get('relations', 0)}, "
-            f"社区={graph_info.get('communities', 0)}, hop={GRAPH_HOP}, top_k={GRAPH_TOP_K}"
-        )
-    else:
-        print("[GraphRAG] 关闭（GRAPH_RAG_ENABLED=0）")
-    if COMPRESSION_ENABLED:
-        compression_info = describe_compression()
-        print(f"[上下文压缩] 已启用: mode={compression_info['mode']}, 去重={compression_info['dedupe']}")
-    acl_info = describe_acl()
-    print(
-        f"[权限] {'启用' if acl_info['enabled'] else '关闭'}: "
-        f"租户字段={acl_info['tenant_field']}, 公开值={acl_info['public_value']}"
-    )
-    obs_info = describe_observability()
-    print(f"[观测] tracing={obs_info['tracing']}, metrics={obs_info['metrics']}, trace_log={obs_info['trace_log']}")
-    
-    # 显示 HyDE/Query2Doc 状态
-    if HYDE_ENABLED or QUERY2DOC_ENABLED:
-        print("[查询增强] ", end="")
-        enhancements = []
-        if HYDE_ENABLED:
-            enhancements.append(f"HyDE(max_len={HYDE_MAX_LENGTH}, few_shot={HYDE_FEWSHOT_ENABLED})")
-        if QUERY2DOC_ENABLED:
-            enhancements.append(f"Query2Doc(max_points={QUERY2DOC_MAX_POINTS})")
-        print(", ".join(enhancements))
-        if HYDE_ENABLED:
-            print("  HyDE格式约束: 关键事实:/文档摘要: 前缀")
-        print(f"  短查询阈值: {SHORT_QUERY_THRESHOLD} 字符")
-    if not MULTI_EXPAND_ENABLED:
-        print(f"[多扩展查询] 已关闭（单查询 Fusion）")
-    else:
-        print(f"[多扩展查询] 已启用（num_queries={FUSION_NUM_QUERIES}）")
-
-    while True:
-        q = input("\nQ> ").strip()
-        if not q:
-            continue
-        if q.lower() in {"exit", "quit"}:
-            break
-
-        clean_q, filters = _extract_query_filters(q)
-        if filters is not None:
-            fs = "; ".join([f"{f.key}{f.operator.value}{f.value}" for f in filters.filters if isinstance(f, MetadataFilter)])
-            print(f"[FILTER] {fs}")
-
-        # 查询理解：意图识别 + 动态权重 + 分解 / Step-back
-        query_type = "general"
-        dynamic_weights = FUSION_WEIGHTS
-        strategy = None
-        sub_queries: list = []
-        step_back_q = ""
-        if QUERY_ROUTING_ENABLED and bm25_index is not None:
-            understanding = understand_query(clean_q)
-            query_type = understanding["type"]
-            strategy = {
-                "num_queries": understanding["num_queries"],
-                "description": understanding["description"],
-            }
-            dynamic_weights = (understanding["vector_weight"], understanding["bm25_weight"])
-            print(f"[查询意图] {query_type} ({understanding['description']})")
-            print(f"  -> 权重(vec={dynamic_weights[0]:.2f}, bm25={dynamic_weights[1]:.2f}), 查询数={strategy['num_queries']}")
-            if understanding["need_decompose"]:
-                sub_queries = decompose_query(clean_q)
-                if sub_queries:
-                    print(f"[查询分解] 拆出 {len(sub_queries)} 个子问题:")
-                    for sq in sub_queries:
-                        print(f"   - {sq}")
-            if understanding["need_step_back"]:
-                step_back_q = step_back_query(clean_q)
-                if step_back_q:
-                    print(f"[Step-back] 上位问题: {step_back_q}")
-
-        # 查询扩展：添加同义词提升召回
-        expanded_q = _expand_query(clean_q)
-        if expanded_q != clean_q:
-            print(f"[查询扩展] {expanded_q}")
-
-        # HyDE / Query2Doc 查询增强（针对短查询）
-        #
-        # 分工与 API 侧一致：扩展串只喂 BM25，向量检索与 HyDE 以原问题为输入。
-        # HyDE 的语义是"为这个问题生成假设答案"，输入同义词表会让假设答案偏离。
-        hyde_q = clean_q  # 用于向量检索的增强查询
-        q2doc_q = expanded_q  # 用于 BM25 检索的增强查询
-        
-        should_enhance_query = QUERY_ENHANCE_ALL or _is_short_query(clean_q)
-        if should_enhance_query:
-            if HYDE_ENABLED:
-                if QUERY_ENHANCE_ALL:
-                    print(f"[HyDE] 启用查询增强，生成假设文档...")
-                else:
-                    print(f"[HyDE] 检测到短查询，生成假设文档...")
-                hyde_q = hyde_expand_query(clean_q)
-                if hyde_q != clean_q:
-                    # 只显示假设文档的前100字符
-                    hyde_preview = hyde_q.replace(clean_q, "").strip()[:100]
-                    print(f"[HyDE] 假设文档: {hyde_preview}...")
-            
-            if QUERY2DOC_ENABLED:
-                if QUERY_ENHANCE_ALL:
-                    print(f"[Query2Doc] 启用查询增强，提取关键信息点...")
-                else:
-                    print(f"[Query2Doc] 检测到短查询，提取关键信息点...")
-                q2doc_q = query2doc_expand(expanded_q)
-                if q2doc_q != expanded_q:
-                    # 显示增加的关键词
-                    added_keywords = q2doc_q.replace(expanded_q, "").strip()[:80]
-                    print(f"[Query2Doc] 关键信息: {added_keywords}...")
-
-        # =================================================================
-        # 检索流程：MultiPath 多路召回 或 Fusion 模式
-        # =================================================================
-        vector_retriever = index.as_retriever(similarity_top_k=recall_k, filters=filters)
-        
-        if MULTIPATH_ENABLED and bm25_index is not None:
-            # ============================================================
-            # MultiPath 多路召回 + Late Interaction 模式 (Phase 3.1)
-            # ============================================================
-            lexical_retriever = LocalBM25Retriever(bm25_index, similarity_top_k=MULTIPATH_SPARSE_TOP_K, filters=filters)
-
-            # 构建多扩展查询变体（向量检索使用 HyDE 增强，BM25 使用 Query2Doc 增强）
-            target_num_queries = strategy["num_queries"] if strategy else FUSION_NUM_QUERIES
-            if MULTI_EXPAND_ENABLED and len(clean_q) <= SHORT_QUERY_THRESHOLD:
-                # 使用 Query2Doc 增强的查询构建变体（用于 BM25）
-                expand_queries = _build_multi_expand_queries(q2doc_q, num_queries=target_num_queries)
-                # 并入查询分解出的子问题
-                if sub_queries:
-                    expand_queries = list(dict.fromkeys([*expand_queries, *sub_queries]))
-                if len(expand_queries) > 1:
-                    print(f"[多扩展查询] 生成 {len(expand_queries)} 个查询变体")
-                    for i, eq in enumerate(expand_queries[:3]):  # 只显示前3个
-                        print(f"   {i+1}. {eq[:60]}{'...' if len(eq) > 60 else ''}")
-            else:
-                expand_queries = list(dict.fromkeys([q2doc_q, *sub_queries]))
-
-            # 创建 MultiPathRetriever
-            multipath_retriever = MultiPathRetriever(
-                dense_retriever=vector_retriever,
-                sparse_retriever=lexical_retriever,
-                colbert_reranker=colbert_reranker,
-                dense_top_k=MULTIPATH_DENSE_TOP_K,
-                sparse_top_k=MULTIPATH_SPARSE_TOP_K,
-                rerank_candidates=MULTIPATH_RERANK_CANDIDATES,
-                rrf_k=MULTIPATH_RRF_K,
-                enable_colbert=COLBERT_RERANK_ENABLED and colbert_reranker is not None,
-            )
-
-            # 执行多路召回检索（向量检索使用 HyDE 增强的查询）
-            print(f"[MultiPath] 执行多路召回...")
-            try:
-                retrieved_nodes = multipath_retriever.retrieve(
-                    hyde_q,  # 向量检索使用 HyDE 增强的查询
-                    top_k=RERANK_TOP_N if rerank else 10,
-                    expand_queries=expand_queries,  # BM25 使用 Query2Doc 增强的变体
-                )
-                
-                # 如果 ColBERT 未启用但有标准 rerank，则进行后处理
-                if rerank is not None and (colbert_reranker is None or not COLBERT_RERANK_ENABLED):
-                    print(f"[Rerank] 标准精排，top_n={RERANK_TOP_N}")
-                    retrieved_nodes = rerank._postprocess_nodes(
-                        retrieved_nodes,
-                        query_bundle=QueryBundle(query_str=clean_q),
-                    )
-
-                # GraphRAG：图检索融合 + 邻域事实扩展
-                retrieved_nodes = _graph_augment(hyde_q, retrieved_nodes)
-
-                # P2：权限复核 + 上下文压缩
-                for postprocessor in _aux_postprocessors():
-                    retrieved_nodes = postprocessor._postprocess_nodes(
-                        retrieved_nodes,
-                        query_bundle=QueryBundle(query_str=clean_q),
-                    )
-
-                # 层次化 Chunk 扩展：带上相关上下文
-                if CHUNK_EXPAND_ENABLED and retrieved_nodes:
-                    original_count = len(retrieved_nodes)
-                    retrieved_nodes = expand_chunks_with_context(
-                        retrieved_nodes,
-                        index=index,
-                        expand_neighbors=CHUNK_EXPAND_NEIGHBORS,
-                        expand_parent=CHUNK_EXPAND_PARENT,
-                        group_by_doc=CHUNK_GROUP_BY_DOC,
-                    )
-                    if len(retrieved_nodes) > original_count:
-                        print(f"[ChunkExpand] 扩展上下文: {original_count} → {len(retrieved_nodes)} chunks")
-
-                # 构建响应（需要 LLM 合成答案）- 使用优化后的带引用答案生成
-                if retrieved_nodes:
-                    # Self-RAG 自反思模式：如果启用，则进行迭代式检索
-                    if SELF_RAG_ENABLED:
-                        # 创建一个轻量级包装器来支持 Self-RAG 的迭代检索
-                        class _MultiPathRetrieverWrapper:
-                            def __init__(self, retriever, reranker, base_query, expand_queries):
-                                self._retriever = retriever
-                                self._reranker = reranker
-                                self._base_query = base_query
-                                self._expand_queries = expand_queries
-                            
-                            def retrieve(self, query_str):
-                                # 检索（可能使用变体查询）
-                                nodes = self._retriever.retrieve(
-                                    query_str,
-                                    top_k=RERANK_TOP_N if self._reranker else recall_k,
-                                    expand_queries=self._expand_queries if query_str == self._base_query else [query_str],
-                                )
-                                # 重排
-                                if self._reranker and (colbert_reranker is None or not COLBERT_RERANK_ENABLED):
-                                    nodes = self._reranker._postprocess_nodes(
-                                        nodes, query_bundle=QueryBundle(query_str=query_str)
-                                    )
-                                return nodes
-                        
-                        wrapper = _MultiPathRetrieverWrapper(multipath_retriever, rerank, hyde_q, expand_queries)
-                        # 执行 Self-RAG 流程
-                        result = self_rag_query(
-                            query=expanded_q,  # 使用扩展后的原始查询
-                            retriever=wrapper,
-                            llm=Settings.llm,
-                        )
-                        # 格式化输出（包含 Self-RAG 信息）
-                        formatted_answer = format_self_rag_result(result, show_history=False)
-                    else:
-                        # 普通模式：直接生成答案
-                        result = generate_answer_with_citation(
-                            query=expanded_q,
-                            retrieved_docs=retrieved_nodes,
-                            llm=Settings.llm,
-                        )
-                        formatted_answer = format_answer_with_citations(result, verbose=False)
-                    
-                    print(f"\nA> {formatted_answer}")
-                    
-                    # 显示检索统计（可选）
-                    if result['context_info'].get('doc_count', 0) > 0:
-                        high_conf = len([c for c in result.get('citations', []) if c['confidence'] == 'high'])
-                        if high_conf > 0:
-                            print(f"\n[引用] 高置信度匹配: {high_conf} 个来源")
-                else:
-                    print("\nA> 未找到相关文档")
-                    
-            except Exception as e:
-                print(f"\n[错误] MultiPath 检索失败：{e}")
-                import traceback
-                traceback.print_exc()
-
-        elif bm25_index is not None:
-            # ============================================================
-            # 三路召回 Fusion + Rerank 模式（原始向量 + HyDE向量 + BM25+）
-            # ============================================================
-            lexical_retriever = LocalBM25Retriever(bm25_index, similarity_top_k=recall_k, filters=filters)
-
-            # 三路权重：原始向量 = vec_weight，HyDE向量 = vec_weight * HYDE_ROUTE_WEIGHT，BM25 = bm25_weight
-            vec_weight = float(dynamic_weights[0]) if len(dynamic_weights) >= 1 else 1.0
-            bm25_weight = float(dynamic_weights[1]) if len(dynamic_weights) >= 2 else 1.0
-            hyde_weight = vec_weight * float(HYDE_ROUTE_WEIGHT)
-            primed = {expanded_q: (hyde_q, q2doc_q)}
-
-            fusion_retriever = ThreeWayHyDEFusionRetriever(
-                vector_retriever=vector_retriever,
-                bm25_retriever=lexical_retriever,
-                similarity_top_k=recall_k,
-                vector_weight=vec_weight,
-                hyde_weight=hyde_weight,
-                bm25_weight=bm25_weight,
-                rrf_k=FUSION_RRF_K,
-                llm=Settings.llm,
-                use_hyde=HYDE_ENABLED,
-                use_query2doc=QUERY2DOC_ENABLED,
-                primed_queries=primed,
-                extra_queries=sub_queries,
-                step_back_query=step_back_q,
-            )
-            print(
-                f"[三路融合] weights(raw_vec={vec_weight:.2f}, hyde_vec={hyde_weight:.2f}, bm25={bm25_weight:.2f}), "
-                f"rrf_k={FUSION_RRF_K}"
-            )
-            
-            # 构建查询引擎（带 Rerank 后处理）- 使用 HyDE 增强的查询
-            postprocessors = []
-            if rerank is not None:
-                postprocessors.append(rerank)
-                print(f"[Rerank] 启用精排，top_n={RERANK_TOP_N}")
-            postprocessors.extend(_aux_postprocessors())
-
-            try:
-                # Self-RAG 自反思模式
-                if SELF_RAG_ENABLED:
-                    # 创建融合检索器包装器
-                    class _FusionRetrieverWrapper:
-                        def __init__(self, retriever, postprocessors):
-                            self._retriever = retriever
-                            self._postprocessors = postprocessors or []
-                        
-                        def retrieve(self, query_str):
-                            # 使用三路召回检索器
-                            nodes = self._retriever._retrieve(QueryBundle(query_str=query_str))
-                            # 应用后处理器（reranker）
-                            for postprocessor in self._postprocessors:
-                                nodes = postprocessor._postprocess_nodes(
-                                    nodes, query_bundle=QueryBundle(query_str=query_str)
-                                )
-                            return nodes
-                    
-                    wrapper = _FusionRetrieverWrapper(fusion_retriever, postprocessors)
-                    # 执行 Self-RAG 流程
-                    result = self_rag_query(
-                        query=expanded_q,
-                        retriever=wrapper,
-                        llm=Settings.llm,
-                    )
-                    # 格式化输出（包含 Self-RAG 信息）
-                    formatted_answer = format_self_rag_result(result, show_history=False)
-                    print(f"\nA> {formatted_answer}")
-                else:
-                    # 普通模式：使用 RetrieverQueryEngine
-                    qe = RetrieverQueryEngine.from_args(
-                        _wrap_with_graph(fusion_retriever),
-                        node_postprocessors=postprocessors if postprocessors else None,
-                    )
-                    # 必须用 expanded_q 作为检索入口查询：
-                    #   primed_queries 的键就是 expanded_q，命中的值 (hyde_q, q2doc_q) 才决定
-                    #   HyDE 路与 BM25 路各自的输入。早先这里传 hyde_q，导致 primed 查表 misses
-                    #   → 又对 hyde_q 跑一次 HyDE（多一次 LLM 调用），且原始查询根本没进检索、
-                    #   BM25 被喂进一段 LLM 生成的长文（长文会稀释 tf）。详见 README 已知问题。
-                    ans = qe.query(expanded_q)
-                    print("\nA> ", ans)
-            except Exception as e:
-                # Ollama runner 可能因为模型过大/内存不足崩溃：500 + runner terminated。
-                msg = str(e)
-                can_fallback = llm_idx + 1 < len(llm_candidates)
-                if ("runner process has terminated" in msg or "status code: 500" in msg) and can_fallback:
-                    llm_idx += 1
-                    _configure_llm(llm_candidates[llm_idx])
-                    print(f"\n[提示] 当前模型运行失败，已自动切换到: {llm_candidates[llm_idx]}")
-                    # 重试
-                    try:
-                        if SELF_RAG_ENABLED:
-                            wrapper = _FusionRetrieverWrapper(fusion_retriever, postprocessors)
-                            result = self_rag_query(query=expanded_q, retriever=wrapper, llm=Settings.llm)
-                            print(f"\nA> {format_self_rag_result(result, show_history=False)}")
-                        else:
-                            qe = RetrieverQueryEngine.from_args(
-                                _wrap_with_graph(fusion_retriever),
-                                node_postprocessors=postprocessors if postprocessors else None,
-                            )
-                            ans = qe.query(expanded_q)
-                            print("\nA> ", ans)
-                    except Exception as e2:
-                        print(f"\n[错误] 仍然失败：{e2}")
-                else:
-                    print(f"\n[错误] 查询失败：{e}")
-        else:
-            # ============================================================
-            # 无 BM25 时使用纯向量检索 + Rerank
-            # ============================================================
-            postprocessors = []
-            if rerank is not None:
-                postprocessors.append(rerank)
-                print(f"[Rerank] 启用精排，top_n={RERANK_TOP_N}")
-            postprocessors.extend(_aux_postprocessors())
-
-            try:
-                # Self-RAG 自反思模式
-                if SELF_RAG_ENABLED:
-                    class _VectorRetrieverWrapper:
-                        def __init__(self, retriever, postprocessors):
-                            self._retriever = retriever
-                            self._postprocessors = postprocessors or []
-                        
-                        def retrieve(self, query_str):
-                            nodes = self._retriever.retrieve(query_str)
-                            for postprocessor in self._postprocessors:
-                                nodes = postprocessor._postprocess_nodes(
-                                    nodes, query_bundle=QueryBundle(query_str=query_str)
-                                )
-                            return nodes
-                    
-                    wrapper = _VectorRetrieverWrapper(vector_retriever, postprocessors)
-                    result = self_rag_query(
-                        query=expanded_q,
-                        retriever=wrapper,
-                        llm=Settings.llm,
-                    )
-                    formatted_answer = format_self_rag_result(result, show_history=False)
-                    print(f"\nA> {formatted_answer}")
-                else:
-                    # 普通模式
-                    qe = RetrieverQueryEngine.from_args(
-                        vector_retriever,
-                        node_postprocessors=postprocessors if postprocessors else None,
-                    )
-                    ans = qe.query(expanded_q)
-                    print("\nA> ", ans)
-            except Exception as e:
-                msg = str(e)
-                can_fallback = llm_idx + 1 < len(llm_candidates)
-                if ("runner process has terminated" in msg or "status code: 500" in msg) and can_fallback:
-                    llm_idx += 1
-                    _configure_llm(llm_candidates[llm_idx])
-                    print(f"\n[提示] 当前模型运行失败，已自动切换到: {llm_candidates[llm_idx]}")
-                    try:
-                        if SELF_RAG_ENABLED:
-                            wrapper = _VectorRetrieverWrapper(vector_retriever, postprocessors)
-                            result = self_rag_query(query=expanded_q, retriever=wrapper, llm=Settings.llm)
-                            print(f"\nA> {format_self_rag_result(result, show_history=False)}")
-                        else:
-                            qe = RetrieverQueryEngine.from_args(
-                                vector_retriever,
-                                node_postprocessors=postprocessors if postprocessors else None,
-                            )
-                            ans = qe.query(expanded_q)
-                            print("\nA> ", ans)
-                    except Exception as e2:
-                        print(f"\n[错误] 仍然失败：{e2}")
-                else:
-                    print(f"\n[错误] 查询失败：{e}")
+    from pcb_rag.cli import main as cli_main
+    return cli_main()
 
 if __name__ == "__main__":
     main()

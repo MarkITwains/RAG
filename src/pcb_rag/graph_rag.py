@@ -48,7 +48,7 @@ import re
 import tempfile
 import threading
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 # 复用上下文压缩模块的轻量词元抽取（纯标准库，不会引入重型依赖）
@@ -116,7 +116,7 @@ GRAPH_COMMUNITY_ENABLED = _env_bool("GRAPH_COMMUNITY_ENABLED", False)
 GRAPH_COMMUNITY_MIN_SIZE = int(os.getenv("GRAPH_COMMUNITY_MIN_SIZE", "3"))
 GRAPH_COMMUNITY_MAX_SUMMARY_CHARS = int(os.getenv("GRAPH_COMMUNITY_MAX_SUMMARY_CHARS", "600"))
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +292,9 @@ class Triple:
     head_desc: str = ""
     tail_desc: str = ""
     relation_desc: str = ""
+    revision: str = ""
+    qualifiers: Dict[str, Any] = field(default_factory=dict)
+    aliases: List[str] = field(default_factory=list)
 
     def key(self) -> Tuple[str, str, str]:
         return (self.head, self.relation, self.tail)
@@ -314,9 +317,9 @@ class GraphNode:
         if self.desc:
             data["s"] = self.desc[:GRAPH_NODE_DESC_CHARS]
         if self.chunk_ids:
-            data["c"] = self.chunk_ids[:20]
+            data["c"] = list(self.chunk_ids)
         if self.doc_ids:
-            data["d"] = self.doc_ids[:10]
+            data["d"] = list(self.doc_ids)
         if self.aliases:
             data["a"] = self.aliases[:10]
         return data
@@ -333,192 +336,165 @@ class KnowledgeGraph:
         self.incident: Dict[str, Set[Tuple[str, str, str]]] = defaultdict(set)
         self.communities: Dict[str, Dict[str, Any]] = {}
         self.built_at: float = 0.0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self.revision: str = ""
 
     # ---- 构建 ----
-    def add_triple(self, triple: Triple) -> bool:
-        """加入一条三元组；重复出现时累加权重并合并证据。"""
+    @staticmethod
+    def _contributions(edge):
+        if "contributions" in edge:
+            return edge["contributions"]
+        # Old files did not retain the doc/chunk association. Preserve that
+        # uncertainty explicitly; never invent a zip or Cartesian product.
+        import hashlib
+        identity = json.dumps(edge, sort_keys=True, ensure_ascii=False)
+        return [{"id": "legacy-" + hashlib.sha256(identity.encode()).hexdigest(),
+                 "legacy": True, "needs_backfill": True,
+                 "doc_ids": list(edge.get("d", [])), "chunk_ids": list(edge.get("c", [])),
+                 "doc_id": "", "chunk_id": "", "weight": float(edge.get("w", 1)),
+                 "evidence": edge.get("e", ""), "source_path": edge.get("s", ""),
+                 "relation_desc": edge.get("rd", ""), "qualifiers": {}}]
 
+    def _refresh_edge(self, edge):
+        contributions = edge["contributions"]
+        edge["w"] = sum(float(c.get("weight", 1)) for c in contributions)
+        edge["c"] = list(dict.fromkeys(cid for c in contributions
+                          for cid in ([c.get("chunk_id")] if c.get("chunk_id") else c.get("chunk_ids", [])) if cid))
+        edge["d"] = list(dict.fromkeys(did for c in contributions
+                          for did in ([c.get("doc_id")] if c.get("doc_id") else c.get("doc_ids", [])) if did))
+        for dst, src in (("e", "evidence"), ("rd", "relation_desc")):
+            edge[dst] = "；".join(dict.fromkeys(str(c.get(src, "")) for c in contributions if c.get(src)))
+        edge["s"] = next((c.get("source_path", "") for c in contributions if c.get("source_path")), "")
+        edge["facts"] = [dict(c.get("qualifiers") or {}, doc_id=c.get("doc_id", ""),
+                              chunk_id=c.get("chunk_id", ""), revision=c.get("revision", ""))
+                         for c in contributions if c.get("qualifiers")]
+        edge["needs_backfill"] = any(c.get("needs_backfill", False) for c in contributions)
+
+    def _refresh_nodes(self, names):
+        for name in names:
+            keys = self.incident.get(name, set())
+            if not keys:
+                self.nodes.pop(name, None)
+                self.adjacency.pop(name, None)
+                self.incident.pop(name, None)
+                continue
+            node = GraphNode(name=name, type=_entity_type(name))
+            descriptions = []
+            explicit_type = False
+            for key in sorted(keys, key=lambda key: self.edges[key].get("order", 0)):
+                edge = self.edges[key]
+                side = "head" if edge["h"] == name else "tail"
+                for c in edge["contributions"]:
+                    node.count += 1
+                    resolved = _normalize_entity_type(c.get(side + "_type", ""))
+                    if resolved and not explicit_type:
+                        node.type = resolved
+                        explicit_type = True
+                    desc = c.get(side + "_desc", "")
+                    if desc and desc not in descriptions:
+                        descriptions.append(desc)
+                    node.aliases.extend(a for a in c.get("aliases", []) if a not in node.aliases)
+                node.chunk_ids.extend(cid for cid in edge["c"] if cid not in node.chunk_ids)
+                node.doc_ids.extend(did for did in edge["d"] if did not in node.doc_ids)
+            node.desc = "；".join(descriptions)[:GRAPH_NODE_DESC_CHARS]
+            self.nodes[name] = node
+
+    def _rebuild_derived(self):
+        self.adjacency = defaultdict(set)
+        self.incident = defaultdict(set)
+        previous_names = set(self.nodes)
+        for key, edge in self.edges.items():
+            self._refresh_edge(edge)
+            self.adjacency[key[0]].add(key[2])
+            self.adjacency[key[2]].add(key[0])
+            self.incident[key[0]].add(key)
+            self.incident[key[2]].add(key)
+        self._refresh_nodes(previous_names | set(self.incident))
+
+    def add_triple(self, triple: Triple) -> bool:
+        """Upsert identified source contributions; anonymous occurrences accumulate."""
+        import hashlib
+        import uuid
         head, tail = normalize_entity(triple.head), normalize_entity(triple.tail)
         relation = _WS_RE.sub(" ", (triple.relation or "").strip())
         if not head or not tail or not relation or head == tail:
             return False
-        # 过长的实体名多为抽取噪声
         if len(head) > 40 or len(tail) > 40 or len(relation) > 24:
             return False
-
-        evidence = _WS_RE.sub(" ", (triple.evidence or "").strip())[:GRAPH_EVIDENCE_CHARS]
-
+        contribution = asdict(triple)
+        identity = json.dumps([triple.doc_id, triple.chunk_id, triple.revision, triple.qualifiers],
+                              sort_keys=True, ensure_ascii=False)
+        contribution["id"] = (hashlib.sha256(identity.encode()).hexdigest()
+                              if triple.doc_id or triple.chunk_id else uuid.uuid4().hex)
         with self._lock:
-            for name, ent_type, ent_desc in (
-                (head, triple.head_type, triple.head_desc),
-                (tail, triple.tail_type, triple.tail_desc),
-            ):
-                node = self.nodes.get(name)
-                if node is None:
-                    node = GraphNode(
-                        name=name,
-                        type=_normalize_entity_type(ent_type) or _entity_type(name),
-                    )
-                    self.nodes[name] = node
-                elif ent_type:
-                    # 规则抽取先建出的节点 type 常是 concept；LLM 后续给出类型时补上。
-                    # 已有明确类型则不覆盖 —— 先到先得的类型更接近规则模式匹配结果。
-                    resolved = _normalize_entity_type(ent_type)
-                    if resolved and node.type in {"concept", ""}:
-                        node.type = resolved
-
-                node.count += 1
-                if ent_desc:
-                    _merge_node_desc(node, ent_desc)
-                if triple.chunk_id and triple.chunk_id not in node.chunk_ids and len(node.chunk_ids) < 20:
-                    node.chunk_ids.append(triple.chunk_id)
-                if triple.doc_id and triple.doc_id not in node.doc_ids and len(node.doc_ids) < 10:
-                    node.doc_ids.append(triple.doc_id)
-
             key = (head, relation, tail)
-            edge = self.edges.get(key)
-            if edge is None:
-                edge = {
-                    "h": head,
-                    "r": relation,
-                    "t": tail,
-                    "w": 0.0,
-                    "c": [],
-                    "d": [],
-                    "e": evidence,
-                    "s": triple.source_path or "",
-                    "rd": "",
-                }
-                self.edges[key] = edge
-            edge["w"] = float(edge.get("w", 0.0)) + float(triple.weight or 1.0)
-
-            # 关系描述：与实体描述同样做去重累加，供检索时直接作为"这条边说明了什么"
-            if triple.relation_desc:
-                rel_desc = _WS_RE.sub(" ", triple.relation_desc).strip()
-                if rel_desc and rel_desc not in edge.get("rd", ""):
-                    if not edge.get("rd"):
-                        edge["rd"] = rel_desc[: GRAPH_LLM_DESC_CHARS]
-                    elif len(edge["rd"]) + len(rel_desc) + 3 <= GRAPH_NODE_DESC_CHARS:
-                        edge["rd"] = edge["rd"] + "；" + rel_desc
-
-            if triple.chunk_id and triple.chunk_id not in edge["c"] and len(edge["c"]) < 12:
-                edge["c"].append(triple.chunk_id)
-            if triple.doc_id and triple.doc_id not in edge["d"] and len(edge["d"]) < 8:
-                edge["d"].append(triple.doc_id)
-            if not edge.get("e") and evidence:
-                edge["e"] = evidence
-            elif evidence and evidence not in edge["e"] and len(edge["e"]) < GRAPH_EVIDENCE_CHARS * 2:
-                edge["e"] = (edge["e"] + " … " + evidence)[: GRAPH_EVIDENCE_CHARS * 2]
-
+            edge = self.edges.setdefault(key, {"h": head, "r": relation, "t": tail, "contributions": [], "order": len(self.edges)})
+            contributions = {c["id"]: c for c in self._contributions(edge)}
+            contributions[contribution["id"]] = contribution
+            edge["contributions"] = list(contributions.values())
+            self._refresh_edge(edge)
             self.adjacency[head].add(tail)
             self.adjacency[tail].add(head)
             self.incident[head].add(key)
             self.incident[tail].add(key)
-
+            self._refresh_nodes({head, tail})
+            self.communities = {}
         return True
 
     def add_triples(self, triples: Iterable[Triple]) -> int:
         return sum(1 for t in triples if self.add_triple(t))
 
     def merge(self, other: "KnowledgeGraph") -> None:
-        """把另一张图并入当前图（增量入库时合并新旧抽取结果）。"""
-
-        if other is None:
+        """Merge every contribution without multiplying identified-source weight."""
+        import copy
+        if other is None or other is self:
             return
-        for edge in other.edges.values():
-            h_node = other.nodes.get(edge.get("h"))
-            t_node = other.nodes.get(edge.get("t"))
-            self.add_triple(
-                Triple(
-                    head=edge["h"],
-                    relation=edge["r"],
-                    tail=edge["t"],
-                    chunk_id=(edge.get("c") or [""])[0],
-                    doc_id=(edge.get("d") or [""])[0],
-                    source_path=edge.get("s", ""),
-                    evidence=edge.get("e", ""),
-                    weight=float(edge.get("w", 1.0)),
-                    # 描述与类型不随边存储，需从节点回填，否则增量合并会丢掉
-                    # 上一轮 LLM 抽取产出的语义信息，只剩邻接关系。
-                    head_type=getattr(h_node, "type", "") if h_node else "",
-                    head_desc=getattr(h_node, "desc", "") if h_node else "",
-                    tail_type=getattr(t_node, "type", "") if t_node else "",
-                    tail_desc=getattr(t_node, "desc", "") if t_node else "",
-                    relation_desc=edge.get("rd", ""),
-                )
-            )
-        for name, node in other.nodes.items():
-            target = self.nodes.get(name)
-            if target is None:
-                self.nodes[name] = GraphNode(
-                    name=name,
-                    type=node.type,
-                    count=node.count,
-                    chunk_ids=list(node.chunk_ids),
-                    doc_ids=list(node.doc_ids),
-                    aliases=list(node.aliases),
-                )
+        with self._lock:
+            for key, source in other.edges.items():
+                target = self.edges.setdefault(key, {"h": key[0], "r": key[1], "t": key[2], "contributions": [], "order": len(self.edges)})
+                contributions = {c["id"]: c for c in self._contributions(target)}
+                contributions.update({c["id"]: copy.deepcopy(c) for c in self._contributions(source)})
+                target["contributions"] = list(contributions.values())
+            self._rebuild_derived()
+            self.communities = {}
+
+    def _remove_sources(self, targets, field):
+        targets = {value for value in targets if value}
+        if not targets:
+            return 0
+        removed = 0
+        with self._lock:
+            for key, edge in list(self.edges.items()):
+                remaining = []
+                for contribution in self._contributions(edge):
+                    if contribution.get(field) in targets:
+                        continue
+                    plural = field + "s"
+                    legacy_ids = contribution.get(plural, [])
+                    if contribution.get("legacy") and set(legacy_ids) & targets:
+                        kept = [value for value in legacy_ids if value not in targets]
+                        if not kept:
+                            continue
+                        contribution = dict(contribution, **{plural: kept}, needs_backfill=True)
+                        # Aggregated legacy text may come from the deleted source.
+                        for attr in ("evidence", "source_path", "head_desc", "tail_desc", "relation_desc"):
+                            contribution[attr] = ""
+                        contribution["chunk_ids" if field == "doc_id" else "doc_ids"] = []
+                    remaining.append(contribution)
+                if remaining:
+                    edge["contributions"] = remaining
+                else:
+                    del self.edges[key]
+                    removed += 1
+            self._rebuild_derived()
+            self.communities = {}
+        return removed
 
     def remove_docs(self, doc_ids: Iterable[str]) -> int:
-        """删除指定文档贡献的全部关系（增量入库时清理已变更 / 已删除文档）。
-
-        与 ``remove_chunks`` 的区别：这里按边的 ``d``（文档节点 id）匹配，
-        因为已删除文档的 chunk id 无法从 manifest 反推。
-        """
-
-        targets = {d for d in doc_ids if d}
-        if not targets:
-            return 0
-
-        removed = 0
-        with self._lock:
-            for key, edge in list(self.edges.items()):
-                if not (set(edge.get("d", [])) & targets):
-                    continue
-                del self.edges[key]
-                self.adjacency[key[0]].discard(key[2])
-                self.adjacency[key[2]].discard(key[0])
-                self.incident[key[0]].discard(key)
-                self.incident[key[2]].discard(key)
-                removed += 1
-
-            # 清理已无任何关系引用的孤立节点
-            for name in list(self.nodes):
-                if not self.incident.get(name):
-                    self.nodes.pop(name, None)
-
-        return removed
+        return self._remove_sources(doc_ids, "doc_id")
 
     def remove_chunks(self, chunk_ids: Iterable[str]) -> int:
-        """删除指定 chunk 的证据；边权重归零后移除边，孤立节点一并清理。"""
-
-        targets = {c for c in chunk_ids if c}
-        if not targets:
-            return 0
-
-        removed = 0
-        with self._lock:
-            for key, edge in list(self.edges.items()):
-                hit = [c for c in edge.get("c", []) if c in targets]
-                if not hit:
-                    continue
-                edge["c"] = [c for c in edge.get("c", []) if c not in targets]
-                edge["d"] = [d for d in edge.get("d", []) if d not in targets]
-                if not edge["c"]:
-                    del self.edges[key]
-                    self.adjacency[key[0]].discard(key[2])
-                    self.adjacency[key[2]].discard(key[0])
-                    self.incident[key[0]].discard(key)
-                    self.incident[key[2]].discard(key)
-                    removed += 1
-
-            for name, node in list(self.nodes.items()):
-                node.chunk_ids = [c for c in node.chunk_ids if c not in targets]
-                if not node.chunk_ids and name not in self.adjacency:
-                    self.nodes.pop(name, None)
-
-        return removed
+        return self._remove_sources(chunk_ids, "chunk_id")
 
     # ---- 查询 ----
     def neighbors(self, entity: str, hops: int = 1, limit: int = GRAPH_MAX_NEIGHBORS) -> List[str]:
@@ -613,6 +589,7 @@ class KnowledgeGraph:
         return {
             "version": _SCHEMA_VERSION,
             "built_at": self.built_at,
+            "revision": self.revision,
             "nodes": {name: node.to_dict() for name, node in sorted(self.nodes.items())},
             "edges": edges,
             "communities": self.communities,
@@ -629,11 +606,7 @@ class KnowledgeGraph:
             self.built_at = time.time()
 
         payload = self.to_dict()
-        if compact:
-            payload["edges"] = [
-                {k: v for k, v in edge.items() if k in {"h", "r", "t", "w", "c"}} for edge in payload["edges"]
-            ]
-
+        # compact is retained for compatibility; provenance is never discarded.
         fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(target) or ".", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -663,6 +636,7 @@ class KnowledgeGraph:
 
         graph = cls()
         graph.built_at = float(payload.get("built_at") or 0.0)
+        graph.revision = str(payload.get("revision") or "")
         graph.communities = payload.get("communities") or {}
 
         for name, raw in (payload.get("nodes") or {}).items():
@@ -695,6 +669,8 @@ class KnowledgeGraph:
                 "e": str(edge.get("e") or ""),
                 "s": str(edge.get("s") or ""),
                 "rd": str(edge.get("rd") or ""),
+                "contributions": cls._contributions(edge),
+                "order": edge.get("order", len(graph.edges)),
             }
             graph.adjacency[head].add(tail)
             graph.adjacency[tail].add(head)
@@ -830,7 +806,10 @@ _TRIPLE_TYPE_TABLE = """- Standard：标准、规范、条款（GB/T 4677-2002�
 _TRIPLE_JSON_SCHEMA = (
     '{"head": "实体名", "head_type": "Standard", "head_desc": "该实体是什么，40字内", '
     '"relation": "关系", "relation_desc": "这条关系说明了什么，40字内", '
-    '"tail": "实体名", "tail_type": "Material", "tail_desc": "该实体是什么，40字内"}'
+    '"tail": "实体名", "tail_type": "Material", "tail_desc": "该实体是什么，40字内", '
+    '"evidence": "逐字原文", "aliases": [], "qualifiers": {"standard": "标准号", '
+    '"edition": "版本", "clause": "条款", "scope": "适用对象", "conditions": "适用条件", '
+    '"parameter": "参数", "comparator": "比较符", "value": "原始数值", "unit": "原始单位"}}'
 )
 
 
@@ -857,6 +836,8 @@ def _build_triple_prompt(text: str) -> str:
         f"不超过 40 字；relation_desc 用一句说明这条关系「说了什么」，不超过 40 字；\n"
         f"5. 实体类型只能从下列取值中选一个，无法归类用 Concept：\n{_TRIPLE_TYPE_TABLE}"
         f"6. 最多输出 {GRAPH_MAX_TRIPLES_PER_CHUNK} 条，没有则输出空数组 []；\n"
+        "数值事实保留版本、对象、条件、比较符、原始值和单位；不同条件分别输出，不合并。"
+        "缺失字段留空，evidence 必须逐字引用原文，aliases 只填原文明确给出的别名。\n"
         "7. 只输出 JSON 数组，不要输出解释文字或 Markdown 代码块，格式：\n"
         f"[{_TRIPLE_JSON_SCHEMA}]\n\n"
         f"片段：\n{text}"
@@ -888,6 +869,7 @@ def _build_gleaning_prompt(text: str, existing: List[Dict[str, str]]) -> str:
         "不要重复上面已列出的三元组。\n\n"
         f"若确实没有遗漏，输出空数组 []。\n"
         "只输出 JSON 数组，不要输出解释文字或 Markdown 代码块。\n\n"
+        f"格式：[{_TRIPLE_JSON_SCHEMA}]\n"
         f"片段：\n{text}"
     )
 
@@ -895,7 +877,7 @@ def _build_gleaning_prompt(text: str, existing: List[Dict[str, str]]) -> str:
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
 
-def _parse_triple_json(raw: str) -> List[Dict[str, str]]:
+def _parse_triple_json(raw: str, *, strict: bool = False) -> List[Dict[str, Any]]:
     """从模型输出中稳健地解析三元组数组。
 
     兼容中英文键名与缺失的可选字段：旧提示词只产出 head/relation/tail，
@@ -903,6 +885,8 @@ def _parse_triple_json(raw: str) -> List[Dict[str, str]]:
     """
 
     if not raw:
+        if strict:
+            raise ValueError("empty graph extraction response")
         return []
     text = raw.strip()
     # 去掉 Markdown 围栏
@@ -910,10 +894,14 @@ def _parse_triple_json(raw: str) -> List[Dict[str, str]]:
 
     match = _JSON_ARRAY_RE.search(text)
     if not match:
+        if strict:
+            raise ValueError("graph extraction response has no JSON array")
         return []
     try:
         payload = json.loads(match.group(0))
-    except Exception:
+    except ValueError:
+        if strict:
+            raise ValueError("invalid graph extraction JSON") from None
         return []
     if not isinstance(payload, list):
         return []
@@ -928,11 +916,15 @@ def _parse_triple_json(raw: str) -> List[Dict[str, str]]:
     triples: List[Dict[str, str]] = []
     for item in payload:
         if not isinstance(item, dict):
+            if strict:
+                raise ValueError("graph extraction item must be an object")
             continue
         head = _pick(item, "head", "头实体", "source_entity")
         relation = _pick(item, "relation", "关系", "relationship")
         tail = _pick(item, "tail", "尾实体", "target_entity")
         if not (head and relation and tail):
+            if strict:
+                raise ValueError("graph extraction item has missing entities or relation")
             continue
         triples.append(
             {
@@ -944,6 +936,12 @@ def _parse_triple_json(raw: str) -> List[Dict[str, str]]:
                 "relation_desc": _pick(item, "relation_desc", "relationship_desc", "关系描述")[:GRAPH_LLM_DESC_CHARS],
                 "tail_type": _pick(item, "tail_type", "target_type", "尾实体类型"),
                 "tail_desc": _pick(item, "tail_desc", "target_desc", "尾实体描述")[:GRAPH_LLM_DESC_CHARS],
+                "evidence": _pick(item, "evidence", "原文"),
+                "qualifiers": {key: str(value) for key, value in (item.get("qualifiers") or {}).items()
+                               if key in {"standard", "edition", "clause", "scope", "conditions", "parameter", "comparator", "value", "unit"}
+                               and isinstance(value, (str, int, float))} if isinstance(item.get("qualifiers"), dict) else {},
+                "aliases": [value for value in item.get("aliases", []) if isinstance(value, str)][:10]
+                           if isinstance(item.get("aliases"), list) else [],
             }
         )
     return triples
@@ -956,6 +954,7 @@ def extract_triples_llm(
     chunk_id: str = "",
     doc_id: str = "",
     source_path: str = "",
+    strict: bool = False,
 ) -> List[Triple]:
     """LLM 抽取：调用模型输出三元组 JSON（失败时返回空列表，由上层决定是否回退规则）。
 
@@ -968,26 +967,31 @@ def extract_triples_llm(
 
     snippet = text[:GRAPH_LLM_MAX_CHARS]
     try:
-        response = llm.complete(_build_triple_prompt(snippet))
+        from pcb_rag.usage import model_complete
+        response = model_complete(llm, _build_triple_prompt(snippet))
     except Exception:
+        if strict:
+            raise
         return []
 
     raw = str(getattr(response, "text", response))
-    records = _parse_triple_json(raw)
+    records = _parse_triple_json(raw, strict=strict)
 
     # gleaning：补一轮遗漏
     if records and GRAPH_LLM_GLEANING > 0:
-        seen = {(r["head"], r["relation"], r["tail"]) for r in records}
+        seen = {(r["head"], r["relation"], r["tail"], json.dumps(r.get("qualifiers", {}), sort_keys=True)) for r in records}
         for _ in range(GRAPH_LLM_GLEANING):
             try:
                 more_raw = str(
-                    getattr(llm.complete(_build_gleaning_prompt(snippet, records)), "text", "")
+                    getattr(model_complete(llm, _build_gleaning_prompt(snippet, records)), "text", "")
                 )
             except Exception:
+                if strict:
+                    raise
                 break
             added = 0
-            for item in _parse_triple_json(more_raw):
-                key = (item["head"], item["relation"], item["tail"])
+            for item in _parse_triple_json(more_raw, strict=strict):
+                key = (item["head"], item["relation"], item["tail"], json.dumps(item.get("qualifiers", {}), sort_keys=True))
                 if key in seen:
                     continue
                 seen.add(key)
@@ -997,6 +1001,8 @@ def extract_triples_llm(
                 break
 
     evidence = _WS_RE.sub(" ", snippet)[:GRAPH_EVIDENCE_CHARS]
+    if strict and any(item.get("evidence") and item["evidence"] not in snippet for item in records):
+        raise ValueError("graph extraction evidence is not an exact source quote")
     triples = [
         Triple(
             head=item["head"],
@@ -1005,13 +1011,15 @@ def extract_triples_llm(
             chunk_id=chunk_id,
             doc_id=doc_id,
             source_path=source_path,
-            evidence=evidence,
+            evidence=item.get("evidence") or evidence,
             weight=1.5,
             head_type=item.get("head_type", ""),
             tail_type=item.get("tail_type", ""),
             head_desc=item.get("head_desc", ""),
             tail_desc=item.get("tail_desc", ""),
             relation_desc=item.get("relation_desc", ""),
+            qualifiers=item.get("qualifiers", {}),
+            aliases=item.get("aliases", []),
         )
         for item in records
     ]
@@ -1074,6 +1082,7 @@ def build_graph_from_nodes(
     graph: Optional[KnowledgeGraph] = None,
     backend: Optional[str] = None,
     progress: bool = False,
+    strict: bool = False,
 ) -> KnowledgeGraph:
     """从切分好的 chunk 构建（或增量合并）知识图谱。
 
@@ -1088,8 +1097,10 @@ def build_graph_from_nodes(
     mode = (backend or GRAPH_EXTRACT_BACKEND or "rule").strip().lower()
     triples: List[Triple] = []
 
+    if strict and mode in {"llm", "hybrid"} and llm is None:
+        raise ValueError("configured graph extraction requires an LLM")
     if mode in {"llm", "hybrid"} and llm is not None:
-        triples = _extract_triples_concurrent(nodes, llm, mode=mode, progress=progress)
+        triples = _extract_triples_concurrent(nodes, llm, mode=mode, progress=progress, strict=strict)
     else:
         for node in nodes:
             metadata = _node_metadata(node)
@@ -1097,12 +1108,30 @@ def build_graph_from_nodes(
                 extract_triples(
                     _node_text(node),
                     backend="rule",
-                    chunk_id=str(getattr(node, "node_id", "") or metadata.get("chunk_id", "") or ""),
+                    chunk_id=str(getattr(node, "node_id", "") or getattr(node, "id_", "") or metadata.get("chunk_id", "") or ""),
                     doc_id=str(metadata.get("doc_node_id", "") or ""),
                     source_path=str(metadata.get("source_path") or metadata.get("file_path") or ""),
                 )
             )
 
+    from pcb_rag.pcb_facts import extract_qualified_facts
+    metadata_by_id = {str(getattr(node, "node_id", "") or getattr(node, "id_", "") or ""): _node_metadata(node) for node in nodes}
+    for triple in triples:
+        metadata = metadata_by_id.get(triple.chunk_id, {})
+        triple.revision = str(metadata.get("revision") or "")
+        triple.qualifiers = {**{key: metadata.get(key, "") for key in ("standard", "edition", "scope", "conditions", "section", "page_label")},
+                             **{key: value for key, value in triple.qualifiers.items() if value != ""}}
+    for node in nodes:
+        metadata = _node_metadata(node)
+        chunk_id = str(getattr(node, "node_id", "") or getattr(node, "id_", "") or "")
+        for fact in metadata.get("pcb_facts") or extract_qualified_facts(_node_text(node), metadata):
+            parameter = fact.get("parameter", "")
+            if parameter and len(parameter) <= 40:
+                triples.append(Triple(head=parameter, relation=fact.get("comparator") or "限值",
+                    tail=fact["value"] + " " + fact["unit"], chunk_id=chunk_id,
+                    doc_id=str(metadata.get("doc_node_id") or ""), source_path=str(metadata.get("source_path") or ""),
+                    evidence=fact["evidence"], head_type="parameter", revision=str(metadata.get("revision") or ""),
+                    qualifiers=fact))
     added = graph.add_triples(triples)
     if progress:
         print(f"[GraphRAG] 抽取三元组 {len(triples)} 条，去重后新增/合并 {added} 条")
@@ -1125,6 +1154,7 @@ def _extract_triples_concurrent(
     *,
     mode: str,
     progress: bool = False,
+    strict: bool = False,
 ) -> List[Triple]:
     """并发调用 LLM 抽取三元组（受 GRAPH_LLM_WORKERS 限制）。"""
 
@@ -1134,13 +1164,13 @@ def _extract_triples_concurrent(
         metadata = _node_metadata(node)
         text = _node_text(node)
         kwargs = {
-            "chunk_id": str(getattr(node, "node_id", "") or metadata.get("chunk_id", "") or ""),
+            "chunk_id": str(getattr(node, "node_id", "") or getattr(node, "id_", "") or metadata.get("chunk_id", "") or ""),
             "doc_id": str(metadata.get("doc_node_id", "") or ""),
             "source_path": str(metadata.get("source_path") or metadata.get("file_path") or ""),
         }
         if mode == "hybrid":
-            return extract_triples_rule(text, **kwargs) + extract_triples_llm(text, llm, **kwargs)
-        return extract_triples_llm(text, llm, **kwargs)
+            return extract_triples_rule(text, **kwargs) + extract_triples_llm(text, llm, strict=strict, **kwargs)
+        return extract_triples_llm(text, llm, strict=strict, **kwargs)
 
     results: List[Triple] = []
     workers = max(1, GRAPH_LLM_WORKERS)
@@ -1152,6 +1182,10 @@ def _extract_triples_concurrent(
             try:
                 results.extend(future.result())
             except Exception:
+                if strict:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
                 continue
             if progress and done % 50 == 0:
                 print(f"[GraphRAG] 抽取进度 {done}/{len(nodes)}")
@@ -1196,6 +1230,8 @@ def link_entities(
     for name, node in graph.nodes.items():
         name_lower = name.lower()
         score = 0.0
+        if any(alias.lower() in lowered for alias in node.aliases if len(alias) >= 2):
+            score = 0.8
 
         if len(name_lower) >= 2 and name_lower in lowered:
             # 完整命中：名字越长越可信
@@ -1295,7 +1331,8 @@ def summarize_communities(graph: KnowledgeGraph, llm: Any = None) -> Dict[str, D
                 f"实体：{'、'.join(entities[:30])}\n关系：{fallback}"
             )
             try:
-                response = llm.complete(prompt)
+                from pcb_rag.usage import model_complete
+                response = model_complete(llm, prompt)
                 summary = str(getattr(response, "text", response)).strip() or fallback
             except Exception:
                 summary = fallback

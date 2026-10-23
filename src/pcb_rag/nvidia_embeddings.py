@@ -54,14 +54,46 @@ class NvidiaApiEmbedding(OpenAIEmbedding):
     def _embed(self, texts: List[str], input_type: str) -> List[List[float]]:
         if not texts:
             return []
-        response = self._get_client().embeddings.create(**self._payload(texts, input_type))
-        return self._vectors(response, len(texts))
+        from pcb_rag.runtime import current_control, run_stage
+        from pcb_rag.usage import finish_usage, reserve_usage
+        ticket = reserve_usage("embedding", texts, self.model_name)
+        def invoke():
+            control = current_control()
+            payload = self._payload(texts, input_type)
+            if control:
+                payload["timeout"] = min(float(self.timeout), control.remaining())
+            response = None
+            try:
+                response = self._get_client().embeddings.create(**payload)
+                result = self._vectors(response, len(texts))
+            except BaseException:
+                finish_usage(ticket, response, error=True)
+                raise
+            finish_usage(ticket, response)
+            return result
+        return run_stage("embedding", invoke)
 
     async def _aembed(self, texts: List[str], input_type: str) -> List[List[float]]:
         if not texts:
             return []
-        response = await self._get_aclient().embeddings.create(**self._payload(texts, input_type))
-        return self._vectors(response, len(texts))
+        import asyncio
+        from pcb_rag.runtime import current_control
+        from pcb_rag.usage import finish_usage, reserve_usage
+        ticket = reserve_usage("embedding", texts, self.model_name)
+        control = current_control()
+        response = None
+        try:
+            payload = self._payload(texts, input_type)
+            if control:
+                payload["timeout"] = min(float(self.timeout), control.remaining())
+            call = self._get_aclient().embeddings.create(**payload)
+            response = await asyncio.wait_for(call, control.remaining()) if control else await call
+            result = self._vectors(response, len(texts))
+        except BaseException:
+            finish_usage(ticket, response, error=True)
+            raise
+        finish_usage(ticket, response)
+        return result
 
     def _get_query_embedding(self, query: str) -> List[float]:
         return self._embed([query], "query")[0]

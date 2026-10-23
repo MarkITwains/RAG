@@ -24,38 +24,21 @@ import os
 # 先加载仓库根目录的 .env：直接 `uvicorn pcb_rag.dify_external_api:app` 或
 # `python -m pcb_rag.dify_external_api` 时也能读到 LLM / Embedding / Rerank /
 # Token 配置（否则只有走 scripts/*.sh 才会有）
+from pcb_rag.usage import model_stream
 from pcb_rag.env_loader import load_project_env
 
 load_project_env()
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-# ---------------------------------------------------------------------------
-# 0b. API 模式性能参数覆盖（在 import query 之前执行，setdefault 不覆盖已有值）
-#     大幅减少召回候选数、精排数量、查询变体，缩短单次请求耗时
-# ---------------------------------------------------------------------------
-os.environ.setdefault("RECALL_TOP_K", "200")
-os.environ.setdefault("RERANK_TOP_N", "10")
-os.environ.setdefault("FUSION_NUM_QUERIES", "3")
-os.environ.setdefault("CHUNK_EXPAND_ENABLED", "1")
-os.environ.setdefault("RAG_DOC_MAX_CHARS", "1000")
-os.environ.setdefault("RAG_TOP_DOCS", "5")
-os.environ.setdefault("HYDE_MAX_LENGTH", "200")
-os.environ.setdefault("HF_RERANK_MAX_LENGTH", "1024")
-os.environ.setdefault("OLLAMA_TIMEOUT", "180")         # qwen3.5:35b-a3b-q4_K_M 生成长答案可能需要 60-150s
-
-import sqlite3
-import sys
-import time
 import asyncio
 import logging
 import secrets
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -67,72 +50,14 @@ import uvicorn
 # ---------------------------------------------------------------------------
 from pcb_rag.query import (
     # ── 配置常量 ──────────────────────────────────────────────────────────
-    OLLAMA_BASE,
     RECALL_TOP_K,
     RERANK_TOP_N,
-    RERANK_ENABLED,
     HYDE_ENABLED,
-    QUERY2DOC_ENABLED,
-    QUERY_ENHANCE_ALL,
-    SHORT_QUERY_THRESHOLD,
-    MULTI_EXPAND_ENABLED,
     FUSION_NUM_QUERIES,
-    MULTIPATH_ENABLED,
-    COLBERT_RERANK_ENABLED,
-    MULTIPATH_DENSE_TOP_K,
-    MULTIPATH_SPARSE_TOP_K,
-    MULTIPATH_RERANK_CANDIDATES,
-    MULTIPATH_RRF_K,
     CHUNK_EXPAND_ENABLED,
-    CHUNK_EXPAND_NEIGHBORS,
-    CHUNK_EXPAND_PARENT,
-    CHUNK_GROUP_BY_DOC,
-    FUSION_WEIGHTS,
-    FUSION_RRF_K,
-    HYDE_ROUTE_WEIGHT,
-    # ── 查询路由（动态权重） ──────────────────────────────────────────────
-    QUERY_ROUTING_ENABLED,
-    _classify_query,
-    _get_query_strategy,
-    # ── 查询理解升级：意图识别 / 查询分解 / Step-back ──────────────────────
-    understand_query,
-    decompose_query,
-    step_back_query,
-    STEPBACK_ROUTE_WEIGHT,
-    # ── 工具函数 ──────────────────────────────────────────────────────────
-    build_index,
-    _try_build_reranker,
-    _load_or_build_bm25,
-    _try_build_colbert_reranker,
-    _expand_query,
-    _extract_query_filters,
-    _is_short_query,
-    _build_multi_expand_queries,
-    _pick_llm_candidates,
-    _configure_llm,
-    DEFAULT_NUM_CTX,
-    DEFAULT_TIMEOUT,
-    # ── 查询增强函数 ──────────────────────────────────────────────────────
-    hyde_expand_query,
-    query2doc_expand,
-    # ── RAG Prompt / 上下文构建 ──────────────────────────────────────────
-    RAG_PROMPT_TEMPLATE,
-    build_context_with_sources,
-    # ── Retriever 类 ──────────────────────────────────────────────────────
-    LocalBM25Retriever,
-    MultiPathRetriever,
-    ThreeWayHyDEFusionRetriever,
-    expand_chunks_with_context,
-    # ── 内部工具（并行 Fusion 检索需要）─────────────────────────────────
-    _node_id_key,
-    _weighted_rrf_fuse_three_routes,
-    # ── LlamaIndex 核心类 ─────────────────────────────────────────────────
-    QueryBundle,
     MetadataMode,
-    NodeWithScore,
     Settings,
     # ── 答案生成函数 ──────────────────────────────────────────────────────
-    generate_answer_with_citation,
     format_answer_with_citations,
     CITATION_ENABLED,
     extract_citations,
@@ -140,253 +65,33 @@ from pcb_rag.query import (
     self_rag_query,
     format_self_rag_result,
 )
-from llama_index.vector_stores.milvus import MilvusVectorStore
 
-from pcb_rag.api_clients import build_llm, describe_backends
+from pcb_rag.api_clients import describe_backends
 from pcb_rag.cache import all_cache_stats, embed_query_for_cache, get_cache
 
 # P2：上下文压缩（去重 + 抽取式压缩 + 预算裁剪）
 from pcb_rag.compression import (
-    COMPRESSION_ENABLED,
-    compress_pipeline,
     describe_compression,
 )
 
 # P1-2：GraphRAG 图检索
 from pcb_rag.graph_rag import (
-    GRAPH_HOP,
-    GRAPH_RAG_ENABLED,
-    GRAPH_TOP_K,
-    GRAPH_WEIGHT,
-    GraphRetriever,
-    KnowledgeGraph,
     describe_graph,
-    expand_nodes_with_graph,
-    fuse_with_graph,
 )
 
 # P2：可观测性（指标快照 / trace / span）
 from pcb_rag.observability import (
-    counter,
     describe_observability,
     metrics_snapshot,
-    span,
-    trace_context,
 )
 
 # P2：访问控制（多租户 / 角色）
 from pcb_rag.security import (
     ACL_ENABLED,
-    build_acl_filters,
     current_principal,
     describe_acl,
-    filter_nodes,
-    reset_request_principal,
-    resolve_principal,
-    set_request_principal,
     validate_acl_security,
 )
-
-# ---------------------------------------------------------------------------
-# 1c. 持久 HyDE 线程池 + 第二路变体函数
-#     - _HYDE_EXECUTOR 独立于主检索 pool，不会被 with 语句 shutdown 阻塞
-#     - _hyde_expand_v2 从规范/标准引用角度生成假设文档，与 HyDE 路1 互补
-# ---------------------------------------------------------------------------
-_HYDE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hyde")
-
-_HYDE_PROMPT_V2 = """你是 PCB 电路板领域的技术专家。请根据问题生成"规范引用型"检索片段。
-
-内容应包括：相关国标/行标条款、测试方法名称、关键技术指标名称。
-长度控制在 80-160 字。严禁编造具体数值或标准号。
-
-问题：{query}
-
-输出："""
-
-
-def _hyde_expand_v2(query: str, llm=None) -> str:
-    """HyDE 第二路变体：以规范/标准引用角度生成假设文档，增加检索多样性。"""
-    import re
-    try:
-        if llm is None:
-            llm = Settings.llm
-        prompt = _HYDE_PROMPT_V2.format(query=query)
-        response = llm.complete(prompt)
-        text = (response.text if hasattr(response, "text") else str(response)).strip()
-        text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
-        if not text or len(text) < 20:
-            return query
-        max_len = int(os.getenv("HYDE_MAX_LENGTH", "200"))
-        if len(text) > max_len:
-            text = text[:max_len] + "..."
-        return f"{query}\n\n{text}"
-    except Exception:
-        return query
-
-
-# ---------------------------------------------------------------------------
-# 1b. 会话历史感知查询改写 Prompt
-# ---------------------------------------------------------------------------
-_HISTORY_REWRITE_PROMPT = """你是 PCB 领域的智能助手。用户的最新问题可能包含代词或省略，需要结合对话历史改写为一个独立、完整的检索查询。
-
-规则：
-1. 如果最新问题本身已经完整（不含代词/省略），直接原样输出。
-2. 如果最新问题包含"它""这个""那个""上述"等指代词，或省略了主语，用对话历史中的具体实体替换。
-3. 只输出改写后的查询，不要解释。
-4. 保留原始问题的疑问意图。
-
-对话历史（最近 {n} 轮）：
-{history}
-
-最新问题：{query}
-
-改写后的查询："""
-
-# 带历史的 RAG Prompt 模板
-_RAG_PROMPT_WITH_HISTORY = """你是 PCB 电路板领域的技术专家。请根据以下参考文档和对话历史回答用户问题。
-
-要求：
-1. 只基于参考文档中的信息回答，不要编造
-2. 如果文档中没有相关信息，明确说明"根据提供的文档无法回答"
-3. 回答要准确、专业、简洁
-4. 参考文档带有编号 [1] [2]，引用某条信息时请在对应句子末尾标注同样的角标，例如：[1][2]
-5. 如果用户的问题是对前一轮的追问，请结合对话历史进行回答
-
-对话历史（最近 {n} 轮）：
-{history}
-
-参考文档：
-{context}
-
-用户问题：{query}
-
-回答："""
-
-# 最大保留历史轮数
-_MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "5"))
-
-
-def _rewrite_query_with_history(
-    query: str,
-    chat_history: list,
-    llm=None,
-) -> str:
-    """利用 LLM 将含有指代/省略的追问改写为完整的独立查询。
-
-    如果历史为空或查询本身足够完整（>30字且无代词），直接返回原查询。
-    """
-    if not chat_history:
-        return query
-
-    # 快速判断：如果查询本身很长且没有明显代词，跳过改写
-    _ANAPHORA_PATTERNS = ["它", "这个", "那个", "上述", "前面", "刚才", "上面",
-                          "该", "其", "此", "这些", "那些", "还有呢", "继续",
-                          "接着", "然后呢", "补充", "详细"]
-    has_anaphora = any(p in query for p in _ANAPHORA_PATTERNS)
-    if len(query) > 40 and not has_anaphora:
-        return query
-
-    if llm is None:
-        llm = Settings.llm
-
-    # 构建历史文本（最近 N 轮）
-    recent = chat_history[-_MAX_HISTORY_TURNS:]
-    history_lines = []
-    for msg in recent:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "user":
-            history_lines.append(f"用户：{content}")
-        elif role == "assistant":
-            # 截断过长的助手回复
-            truncated = content[:200] + "..." if len(content) > 200 else content
-            history_lines.append(f"助手：{truncated}")
-    history_text = "\n".join(history_lines)
-
-    prompt = _HISTORY_REWRITE_PROMPT.format(
-        n=len(recent), history=history_text, query=query
-    )
-
-    try:
-        response = llm.complete(prompt)
-        rewritten = (response.text if hasattr(response, "text") else str(response)).strip()
-        # 基本合理性检查
-        if rewritten and 3 < len(rewritten) < 500:
-            logger.info(f"[HistoryRewrite] '{query}' → '{rewritten[:80]}'")
-            return rewritten
-    except Exception as e:
-        logger.warning(f"[HistoryRewrite] 改写失败，使用原始查询: {e}")
-
-    return query
-
-
-def _generate_answer_with_history(
-    query: str,
-    retrieved_docs: list,
-    chat_history: list,
-    llm=None,
-) -> dict:
-    """在 generate_answer_with_citation 基础上注入对话历史，使 LLM 能理解上下文。"""
-    if not chat_history:
-        # 无历史时回退到标准函数
-        return generate_answer_with_citation(query, retrieved_docs, llm)
-
-    if llm is None:
-        llm = Settings.llm
-
-    if not retrieved_docs:
-        return {
-            'answer': '根据提供的文档无法回答该问题，未找到相关文档。',
-            'citations': [],
-            'sources': [],
-            'context_info': {'doc_count': 0},
-        }
-
-    # 构建 context
-    context, sources_info = build_context_with_sources(retrieved_docs)
-
-    # 构建历史文本
-    recent = chat_history[-_MAX_HISTORY_TURNS:]
-    history_lines = []
-    for msg in recent:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "user":
-            history_lines.append(f"用户：{content}")
-        elif role == "assistant":
-            truncated = content[:300] + "..." if len(content) > 300 else content
-            history_lines.append(f"助手：{truncated}")
-    history_text = "\n".join(history_lines)
-
-    prompt = _RAG_PROMPT_WITH_HISTORY.format(
-        n=len(recent), history=history_text, context=context, query=query
-    )
-
-    try:
-        response = llm.complete(prompt)
-        answer = response.text if hasattr(response, 'text') else str(response)
-    except Exception as e:
-        logger.error(f"[RAG] 带历史答案生成失败: {e}")
-        answer = f"答案生成过程中出现错误：{e}"
-
-    from pcb_rag.query import CITATION_ENABLED, extract_citations
-    citations = []
-    if CITATION_ENABLED:
-        citations = extract_citations(answer, retrieved_docs)
-
-    sources = [info['source_path'] for info in sources_info]
-
-    return {
-        'answer': answer,
-        'citations': citations,
-        'sources': sources,
-        'context_info': {
-            'doc_count': len(sources_info),
-            'total_chars': sum(info['char_count'] for info in sources_info),
-            'sources_detail': sources_info,
-        },
-    }
-
 
 # ---------------------------------------------------------------------------
 # 2. 配置日志
@@ -427,11 +132,6 @@ def _assert_token_configured() -> None:
 # ---------------------------------------------------------------------------
 # 3b. 会话管理器（服务端对话记忆）
 # ---------------------------------------------------------------------------
-import uuid
-import threading
-from datetime import datetime, timedelta
-from collections import OrderedDict
-from typing import Dict, List, Tuple
 
 SESSION_EXPIRE_MINUTES = int(os.getenv("SESSION_EXPIRE_MINUTES", "60"))
 SESSION_MAX_COUNT = int(os.getenv("SESSION_MAX_COUNT", "1000"))
@@ -441,247 +141,7 @@ SESSION_STORE = os.getenv("SESSION_STORE", "memory").strip().lower()
 SESSION_DB_PATH = os.getenv("SESSION_DB_PATH", "./data/sessions.db")
 
 
-class SessionManager:
-    """
-    服务端会话管理器：维护多轮对话历史，支持按 session_id 隔离。
-
-    特性：
-    - LRU 淘汰：超过 SESSION_MAX_COUNT 时淘汰最久未访问的会话
-    - 过期清理：SESSION_EXPIRE_MINUTES 后自动清理
-    - 线程安全：使用 threading.Lock 保护共享状态
-    """
-
-    def __init__(
-        self,
-        max_sessions: int = SESSION_MAX_COUNT,
-        expire_minutes: int = SESSION_EXPIRE_MINUTES,
-    ):
-        self._sessions: OrderedDict[str, dict] = OrderedDict()
-        self._max_sessions = max_sessions
-        self._expire_delta = timedelta(minutes=expire_minutes)
-        self._lock = threading.Lock()
-        self._last_cleanup = datetime.now()
-        self._db: Optional[sqlite3.Connection] = None
-        self._init_store()
-        logger.info(
-            f"[SessionManager] 初始化完成 (max={max_sessions}, expire={expire_minutes}min, "
-            f"store={SESSION_STORE})"
-        )
-
-    # ---------------------------------------------------------------- 持久化
-    def _init_store(self) -> None:
-        """按 SESSION_STORE 初始化持久化存储，失败自动回退内存模式。"""
-        if SESSION_STORE != "sqlite":
-            return
-        try:
-            db_path = Path(SESSION_DB_PATH)
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._db = sqlite3.connect(str(db_path), check_same_thread=False)
-            self._db.execute(
-                "CREATE TABLE IF NOT EXISTS sessions "
-                "(session_id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT)"
-            )
-            self._db.execute(
-                "CREATE TABLE IF NOT EXISTS messages "
-                "(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
-                "content TEXT, timestamp TEXT)"
-            )
-            self._db.commit()
-            self._load_from_db()
-            logger.info(f"[SessionManager] 已启用 SQLite 持久化: {db_path}")
-        except Exception as e:
-            logger.warning(f"[SessionManager] SQLite 初始化失败，回退内存模式: {e}")
-            self._db = None
-
-    def _load_from_db(self) -> None:
-        """启动时把已持久化的会话加载回内存。"""
-        if self._db is None:
-            return
-        try:
-            for sid, created, updated in self._db.execute(
-                "SELECT session_id, created_at, updated_at FROM sessions"
-            ).fetchall():
-                try:
-                    created_dt = datetime.fromisoformat(created)
-                    updated_dt = datetime.fromisoformat(updated)
-                except Exception:
-                    created_dt = updated_dt = datetime.now()
-                self._sessions[sid] = {
-                    "history": [],
-                    "created_at": created_dt,
-                    "updated_at": updated_dt,
-                }
-
-            for sid, role, content, ts in self._db.execute(
-                "SELECT session_id, role, content, timestamp FROM messages ORDER BY id"
-            ).fetchall():
-                session = self._sessions.get(sid)
-                if session is not None:
-                    session["history"].append({"role": role, "content": content, "timestamp": ts})
-        except Exception as e:
-            logger.warning(f"[SessionManager] 加载持久化会话失败: {e}")
-
-    def _db_upsert_session(self, sid: str) -> None:
-        if self._db is None:
-            return
-        try:
-            session = self._sessions.get(sid)
-            if session is None:
-                return
-            self._db.execute(
-                "INSERT OR REPLACE INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)",
-                (sid, session["created_at"].isoformat(), session["updated_at"].isoformat()),
-            )
-            self._db.commit()
-        except Exception as e:
-            logger.debug(f"[SessionManager] 持久化会话元数据失败: {e}")
-
-    def _db_insert_message(self, sid: str, role: str, content: str, ts: str) -> None:
-        if self._db is None:
-            return
-        try:
-            self._db.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-                (sid, role, content, ts),
-            )
-            self._db.commit()
-        except Exception as e:
-            logger.debug(f"[SessionManager] 持久化消息失败: {e}")
-
-    def _db_drop_session(self, sid: str) -> None:
-        if self._db is None:
-            return
-        try:
-            self._db.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-            self._db.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
-            self._db.commit()
-        except Exception as e:
-            logger.debug(f"[SessionManager] 删除持久化会话失败: {e}")
-
-    def _db_clear_messages(self, sid: str) -> None:
-        if self._db is None:
-            return
-        try:
-            self._db.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-            self._db.commit()
-        except Exception as e:
-            logger.debug(f"[SessionManager] 清空持久化消息失败: {e}")
-
-    def create_session(self, session_id: str = None) -> str:
-        """创建新会话，返回 session_id。"""
-        sid = session_id or str(uuid.uuid4())
-        with self._lock:
-            if sid not in self._sessions:
-                self._sessions[sid] = {
-                    "history": [],
-                    "created_at": datetime.now(),
-                    "updated_at": datetime.now(),
-                }
-                self._sessions.move_to_end(sid)
-                self._evict_if_needed()
-                self._db_upsert_session(sid)
-        logger.debug(f"[SessionManager] 创建会话: {sid[:8]}...")
-        return sid
-
-    def get_or_create(self, session_id: str = None) -> Tuple[str, bool]:
-        """获取或创建会话，返回 (session_id, is_new)。"""
-        if session_id:
-            with self._lock:
-                if session_id in self._sessions:
-                    self._sessions[session_id]["updated_at"] = datetime.now()
-                    self._sessions.move_to_end(session_id)
-                    return session_id, False
-        new_sid = self.create_session(session_id)
-        return new_sid, True
-
-    def get_history(self, session_id: str) -> List[dict]:
-        """获取会话历史（按时间顺序）。"""
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if session:
-                session["updated_at"] = datetime.now()
-                self._sessions.move_to_end(session_id)
-                return list(session["history"])
-        return []
-
-    def exists(self, session_id: str) -> bool:
-        """判断会话是否存在（线程安全，避免调用方直接访问内部状态）。"""
-        with self._lock:
-            return session_id in self._sessions
-
-    def add_message(self, session_id: str, role: str, content: str) -> None:
-        """向会话添加一条消息。"""
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if session:
-                ts = datetime.now().isoformat()
-                session["history"].append({
-                    "role": role,
-                    "content": content,
-                    "timestamp": ts,
-                })
-                session["updated_at"] = datetime.now()
-                self._sessions.move_to_end(session_id)
-                self._db_insert_message(session_id, role, content, ts)
-                self._db_upsert_session(session_id)
-                logger.debug(f"[SessionManager] 会话 {session_id[:8]}... 添加消息 ({role})")
-
-    def clear_session(self, session_id: str) -> bool:
-        """清空会话历史（保留会话）。"""
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if session:
-                session["history"] = []
-                session["updated_at"] = datetime.now()
-                self._db_clear_messages(session_id)
-                return True
-        return False
-
-    def delete_session(self, session_id: str) -> bool:
-        """删除会话。"""
-        with self._lock:
-            if session_id in self._sessions:
-                del self._sessions[session_id]
-                self._db_drop_session(session_id)
-                logger.debug(f"[SessionManager] 删除会话: {session_id[:8]}...")
-                return True
-        return False
-
-    def list_sessions(self) -> List[dict]:
-        """列出所有会话摘要。"""
-        with self._lock:
-            return [
-                {
-                    "session_id": sid,
-                    "message_count": len(s["history"]),
-                    "created_at": s["created_at"].isoformat(),
-                    "updated_at": s["updated_at"].isoformat(),
-                }
-                for sid, s in self._sessions.items()
-            ]
-
-    def cleanup_expired(self) -> int:
-        """清理过期会话，返回清理数量。"""
-        now = datetime.now()
-        expired = []
-        with self._lock:
-            for sid, session in list(self._sessions.items()):
-                if now - session["updated_at"] > self._expire_delta:
-                    expired.append(sid)
-            for sid in expired:
-                del self._sessions[sid]
-                self._db_drop_session(sid)
-        if expired:
-            logger.info(f"[SessionManager] 清理过期会话: {len(expired)} 个")
-        return len(expired)
-
-    def _evict_if_needed(self) -> None:
-        """LRU 淘汰最久未访问的会话。"""
-        while len(self._sessions) > self._max_sessions:
-            oldest_sid = next(iter(self._sessions))
-            del self._sessions[oldest_sid]
-            self._db_drop_session(oldest_sid)
-            logger.info(f"[SessionManager] LRU 淘汰会话: {oldest_sid[:8]}...")
+from pcb_rag.sessions import SessionManager, principal_from_token
 
 
 _session_manager: Optional[SessionManager] = None
@@ -697,172 +157,22 @@ def get_session_manager() -> SessionManager:
 # ---------------------------------------------------------------------------
 # 4. 全局单例：在应用启动时一次性完成耗时初始化，服务运行期间复用
 # ---------------------------------------------------------------------------
-_app_state: dict = {}
-
-
-def _initialize_retrieval_engine() -> None:
-    """
-    在 FastAPI 启动阶段一次性初始化：
-      - LLM + Embedding 配置
-      - Milvus VectorStoreIndex
-      - 本地 BM25 索引
-      - Reranker（HF / Qwen3-Reranker-4B）
-      - ColBERT Reranker（可选）
-    """
-    logger.info("=== PCB-RAG 初始化中 ===")
-
-    # 选择 LLM：local 后端探测 Ollama 模型列表，api 后端使用配置的 LLM_MODEL
-    llm_candidates = _pick_llm_candidates(OLLAMA_BASE)
-    if not llm_candidates:
-        llm_candidates = [
-            os.getenv("LLM_MODEL")
-            or os.getenv("OLLAMA_LLM_MODEL")
-            or "qwen3.5:35b-a3b-q4_K_M"
-        ]
-    model_name = llm_candidates[0]
-    Settings.llm = build_llm(model_name)
-    _app_state["llm_candidates"] = llm_candidates
-    backend_info = describe_backends()
-    logger.info(
-        f"[LLM] backend={backend_info['llm_backend']}, model={model_name}, "
-        f"base_url={backend_info['llm_base_url']}"
-    )
-
-    # 初始化向量索引（连接 Milvus + 加载 Embedding 模型）
-    logger.info("[Index] 正在连接 Milvus 并加载 Embedding 模型...")
-    index = build_index(llm_candidates[0])
-    _app_state["index"] = index
-    logger.info("[Index] VectorStoreIndex 初始化完成")
-
-    # 初始化本地 BM25 索引
-    bm25_index = None
-    if os.getenv("LEXICAL_ENABLED", "1") not in {"0", "false", "False"} or RERANK_ENABLED:
-        try:
-            vector_store = index.storage_context.vector_store
-            if isinstance(vector_store, MilvusVectorStore):
-                logger.info("[BM25] 正在加载/构建本地词法索引...")
-                bm25_index = _load_or_build_bm25(vector_store)
-                if bm25_index:
-                    logger.info(f"[BM25] 词法索引就绪，文档数={len(bm25_index.docs)}")
-                else:
-                    logger.warning("[BM25] 词法索引构建失败，将回退为纯向量检索")
-        except Exception as e:
-            logger.warning(f"[BM25] 未能初始化: {e}")
-    _app_state["bm25_index"] = bm25_index
-
-    # 初始化 Reranker（BGE / Qwen3-Reranker-4B）
-    rerank = _try_build_reranker()
-    _app_state["rerank"] = rerank
-    if rerank:
-        recall_k = max(RECALL_TOP_K, RERANK_TOP_N)
-        logger.info(f"[Rerank] 精排模型就绪，top_n={RERANK_TOP_N}, recall_k={recall_k}")
-    else:
-        recall_k = 20
-        logger.warning("[Rerank] 未启用或加载失败，使用 recall_k=20")
-    _app_state["recall_k"] = recall_k
-
-    # GraphRAG：加载知识图谱（缺失 / 未启用时按无图模式运行，不影响主链路）
-    graph, graph_retriever = None, None
-    if GRAPH_RAG_ENABLED:
-        try:
-            graph = KnowledgeGraph.load()
-            if graph is not None and graph.nodes:
-                graph_retriever = GraphRetriever(graph)
-                stats = graph.stats()
-                logger.info(
-                    f"[GraphRAG] 图谱就绪: 实体={stats['entities']}, 关系={stats['relations']}, "
-                    f"社区={stats['communities']}, hop={GRAPH_HOP}"
-                )
-            else:
-                logger.warning("[GraphRAG] 未找到可用图谱，按无图模式运行")
-                graph = None
-        except Exception as e:
-            logger.warning(f"[GraphRAG] 图谱加载失败，按无图模式运行: {e}")
-            graph, graph_retriever = None, None
-    _app_state["graph"] = graph
-    _app_state["graph_retriever"] = graph_retriever
-
-    # 初始化 ColBERT Reranker（MultiPath 模式可选）
-    colbert_reranker = None
-    if MULTIPATH_ENABLED and COLBERT_RERANK_ENABLED and bm25_index is not None:
-        colbert_reranker = _try_build_colbert_reranker()
-        if colbert_reranker:
-            logger.info("[ColBERT] 多路召回精排模型就绪")
-    _app_state["colbert_reranker"] = colbert_reranker
-
-    # 打印最终检索模式
-    if MULTIPATH_ENABLED and bm25_index:
-        logger.info("[检索模式] MultiPath 多路召回 + Late Interaction")
-    elif bm25_index:
-        logger.info("[检索模式] 三路 Fusion（向量 + HyDE向量 + BM25+）+ Rerank")
-    else:
-        logger.info("[检索模式] 纯向量检索（BM25 不可用）")
-
-    logger.info("=== PCB-RAG 初始化完成，开始服务 ===")
-
-
-_lexical_reload_lock = threading.Lock()
-_lexical_stamp_seen: Optional[float] = None
-#: 入库脚本结束时会写入该 sentinel（见 ingest.py 末尾），mtime 变化即代表语料变了
-LEXICAL_RELOAD_STAMP = os.getenv(
-    "LEXICAL_RELOAD_STAMP", os.getenv("LEXICAL_CACHE_PATH", "./data/lexical_corpus.jsonl") + ".stamp"
+from pcb_rag.retrieval import get_pipeline
+from pcb_rag.conversation import (
+    rewrite_query_with_history as _rewrite_query_with_history,
+    generate_answer_with_history as _generate_answer_with_history,
+    prepare_with_history,
 )
 
-
-def _lexical_stamp_mtime() -> Optional[float]:
-    try:
-        return Path(LEXICAL_RELOAD_STAMP).stat().st_mtime
-    except OSError:
-        return None
+_app_state: dict = get_pipeline().state
 
 
-def _rebuild_lexical_index_worker() -> None:
-    """后台重建 BM25（失败则保留旧索引，绝不让检索因此不可用）。"""
-    try:
-        index = _app_state.get("index")
-        if index is None:
-            return
-        logger.info("[BM25] 检测到语料变更，后台重建词法索引...")
-        new_index = _load_or_build_bm25(index.storage_context.vector_store)
-        if new_index is not None:
-            _app_state["bm25_index"] = new_index
-            counter("lexical.reloaded", 1)
-            logger.info(f"[BM25] 词法索引已重载，文档数={len(new_index.docs)}")
-        else:
-            logger.warning("[BM25] 词法索引重建失败，继续使用旧索引")
-    except Exception as e:
-        logger.warning(f"[BM25] 词法索引重载异常（继续使用旧索引）: {e}")
-    finally:
-        try:
-            _lexical_reload_lock.release()
-        except RuntimeError:
-            pass
+def _initialize_retrieval_engine():
+    get_pipeline().initialize()
 
 
-def _maybe_reload_lexical_index() -> None:
-    """sentinel mtime 变新则异步重建 BM25；本次检索继续用旧索引，不阻塞请求。
-
-    为什么必须有这一步：长驻 API 进程只在启动时构建一次 BM25，入库脚本删缓存
-    对它毫无影响 —— 新文档因此缺失整条稀疏路投票，在融合中被系统性降权。
-    成本是每次检索一次 ``stat``，可忽略。
-    """
-    global _lexical_stamp_seen
-
-    stamp = _lexical_stamp_mtime()
-    if stamp is None:
-        return
-    if _lexical_stamp_seen is not None and stamp <= _lexical_stamp_seen:
-        return
-    if _lexical_stamp_seen is None and _app_state.get("bm25_index") is None:
-        # 启动时就没有词法索引（LEXICAL_ENABLED=0 等），不必热重载
-        _lexical_stamp_seen = stamp
-        return
-    if not _lexical_reload_lock.acquire(blocking=False):
-        return  # 已有一次重建在进行
-    _lexical_stamp_seen = stamp  # 先记账，避免同一变更触发多次重建
-    threading.Thread(
-        target=_rebuild_lexical_index_worker, name="bm25-reload", daemon=True
-    ).start()
+def _maybe_reload_lexical_index():
+    get_pipeline().refresh()
 
 
 @asynccontextmanager
@@ -878,8 +188,7 @@ async def lifespan(app: FastAPI):
 
     _initialize_retrieval_engine()
 
-    global _lexical_stamp_seen
-    _lexical_stamp_seen = _lexical_stamp_mtime()  # 记录词法热重载基线
+    get_pipeline().refresh()
 
     _session_cleanup_task = asyncio.create_task(_session_cleanup_worker())
 
@@ -901,7 +210,7 @@ async def _session_cleanup_worker():
         try:
             await asyncio.sleep(SESSION_CLEANUP_INTERVAL)
             sm = get_session_manager()
-            cleaned = sm.cleanup_expired()
+            cleaned = sm.cleanup_expired(all_owners=True)
             if cleaned > 0:
                 logger.info(f"[SessionCleanup] 自动清理了 {cleaned} 个过期会话")
         except asyncio.CancelledError:
@@ -948,6 +257,11 @@ def favicon():
     return Response(status_code=204)
 
 
+@app.get("/manage", include_in_schema=False)
+def management_ui():
+    return FileResponse(_WEBUI_DIR / "manage.html", media_type="text/html")
+
+
 # CORS 中间件
 #
 # 默认不开通配。威胁模型：本服务是 Bearer 认证、不使用 cookie，浏览器不会自动
@@ -966,51 +280,22 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """记录请求日志，并绑定 trace 与访问主体。
-
-    - trace：沿用外部传入的 ``X-Trace-Id``（没有则生成），并回写到响应头，
-      便于与 Dify 侧日志逐条对齐
-    - 主体：从请求头解析租户 / 角色，写入 ContextVar；FastAPI 执行同步端点时
-      会复制上下文，因此下游的 ACL 过滤无需改动任何端点签名
-    """
-    start = time.time()
-    method = request.method
-    path = request.url.path
-    logger.info(f"[REQ] {method} {path} - 开始处理")
-
-    principal = resolve_principal(dict(request.headers))
-    principal_token = set_request_principal(principal)
-    incoming_trace = request.headers.get("X-Trace-Id") or request.headers.get("x-trace-id")
-
-    try:
-        with trace_context(incoming_trace) as tid, span(f"http.{method}", path=path):
-            response = await call_next(request)
-            elapsed = time.time() - start
-            response.headers["X-Trace-Id"] = tid
-            logger.info(f"[REQ] {method} {path} - {response.status_code} ({elapsed:.1f}s)")
-            return response
-    except Exception as e:
-        elapsed = time.time() - start
-        logger.error(f"[REQ] {method} {path} - 异常 ({elapsed:.1f}s): {e}")
-        raise
-    finally:
-        reset_request_principal(principal_token)
+from pcb_rag.service_runtime import RequestBoundaryMiddleware
+app.add_middleware(RequestBoundaryMiddleware)
 
 
 # ---------------------------------------------------------------------------
 # 6. 数据模型（严格遵循 Dify 外部知识库 API 规范）
 # ---------------------------------------------------------------------------
 class RetrievalSetting(BaseModel):
-    top_k: int = Field(default=5, description="返回的最大文档数")
+    top_k: int = Field(default=5, ge=1, le=100, description="返回的最大文档数")
     score_threshold: float = Field(default=0.0, description="最低得分阈值")
     score_threshold_enabled: bool = Field(default=False)
 
 
 class RetrievalReq(BaseModel):
     knowledge_id: str = Field(description="知识库 ID（Dify 生成，接收即可）")
-    query: str = Field(description="用户查询文本")
+    query: str = Field(description="用户查询文本", max_length=8000)
     retrieval_setting: RetrievalSetting = Field(default_factory=RetrievalSetting)
 
 
@@ -1043,6 +328,8 @@ def verify_token(authorization: str = Header(None)):
     不是高危漏洞。
     """
     expected = f"Bearer {API_TOKEN}"
+    if principal_from_token(authorization) is not None:
+        return
     if not authorization or not secrets.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing API token.")
 
@@ -1050,473 +337,10 @@ def verify_token(authorization: str = Header(None)):
 # ---------------------------------------------------------------------------
 # 8. 核心检索函数（完整复用 query.py 的优化管道）
 # ---------------------------------------------------------------------------
-def _retrieve_nodes(
-    user_query: str,
-    top_k: int = 5,
-    score_threshold: float = 0.0,
-    _no_business_filter: bool = False,
-) -> List[NodeWithScore]:
-    """
-    完整执行 PCB-RAG 检索管道，返回原始 NodeWithScore 列表（供 LLM 合成使用）。
-
-    管道顺序：
-      1. 元数据过滤解析（source_type/vendor/eda 等）
-      2. 查询扩展（PCB 同义词替换）
-      3. HyDE / Query2Doc 查询增强（短查询或全量增强）
-      4. 多路召回（MultiPath 或 Fusion 三路）
-      5. BGE / Qwen3-VL Rerank 精排
-      6. Chunk 上下文扩展（邻近 Chunk 合并）
-      7. 按得分阈值过滤 + top_k 截断
-    """
-    # 入库后 BM25 会被自动重载（按 sentinel mtime）；本次请求仍可能用到旧索引
-    _maybe_reload_lexical_index()
-
-    index       = _app_state["index"]
-    bm25_index  = _app_state["bm25_index"]
-    rerank      = _app_state["rerank"]
-    recall_k    = _app_state["recall_k"]
-    colbert_reranker = _app_state["colbert_reranker"]
-
-    # 最终分数的量纲来源：rerank(0~1 概率) / rrf(倒数排名分) / vector(相似度)
-    _score_kind = "vector"
-
-    t_start = time.time()
-
-    # ── Step 1: 提取元数据过滤条件 ────────────────────────────────────────
-    clean_q, filters = _extract_query_filters(user_query)
-    if _no_business_filter:
-        # 过滤误杀回退模式：只保留 ACL 权限过滤，业务过滤（eda=xxx 等）全部放弃。
-        # ACL 关闭时为 None = 不过滤。权限边界仍由末尾的 filter_nodes 兜底保证。
-        filters = build_acl_filters(current_principal()) if ACL_ENABLED else None
-        logger.info("[Filter] 回退模式：仅 ACL 过滤（业务过滤已放弃）")
-    if filters:
-        filter_strs = [f"{f.key}={f.value}" for f in getattr(filters, "filters", [])]
-        logger.info(f"[Filter] {'; '.join(filter_strs)}")
-
-    # ── Step 2: 查询理解（意图识别 + 动态权重 + 分解 / Step-back 决策）────
-    query_type = "general"
-    strategy = None
-    dynamic_weights = FUSION_WEIGHTS
-    sub_queries: List[str] = []
-    step_back_q = ""
-    if QUERY_ROUTING_ENABLED:
-        understanding = understand_query(clean_q)
-        query_type = understanding["type"]
-        strategy = {
-            "num_queries": understanding["num_queries"],
-            "description": understanding["description"],
-        }
-        dynamic_weights = (understanding["vector_weight"], understanding["bm25_weight"])
-        logger.info(
-            f"[QueryRoute] {query_type} ({understanding['description']}), "
-            f"weights(vec={dynamic_weights[0]:.2f}, bm25={dynamic_weights[1]:.2f}), "
-            f"decompose={understanding['need_decompose']}, step_back={understanding['need_step_back']}"
-        )
-
-        # 查询分解：复合问题拆成子问题，作为额外召回查询
-        if understanding["need_decompose"]:
-            sub_queries = decompose_query(clean_q)
-            if sub_queries:
-                logger.info(f"[Decompose] 拆出 {len(sub_queries)} 个子问题: {sub_queries}")
-
-        # Step-back：生成上位问题，作为额外向量召回路径
-        if understanding["need_step_back"]:
-            step_back_q = step_back_query(clean_q)
-            if step_back_q:
-                logger.info(f"[StepBack] 上位问题: {step_back_q}")
-
-    # ── Step 3: 查询扩展（同义词）────────────────────────────────────────
-    #
-    # 扩展串**只喂 BM25**，不喂向量检索与精排。
-    #
-    # 理由：BM25 是词袋模型，追加同义词等价于扩展 OR 查询，通常提升词汇匹配
-    # 召回；dense 检索把整串编码成单个向量，拼上同义词会让向量偏离原问题意图；
-    # cross-encoder 做 query-doc 逐词交互，长 query 会稀释关键短语的权重。
-    # 早先三者共用同一个拼接串，等于让扩展的副作用同时作用在三个环节上。
-    expanded_q = _expand_query(clean_q)
-    if expanded_q != clean_q:
-        logger.info(f"[QueryExpand] BM25 专用扩展: {expanded_q[:80]}")
-
-    # ── Step 4: HyDE / Query2Doc 查询增强 ────────────────────────────────
-    #    Fusion 模式下 HyDE 将在 Step 5 中与检索并行执行，此处跳过
-    #    HyDE 的输入用原问题：它的语义是"为这个问题生成假设答案"，
-    #    输入一张同义词表会让假设答案偏离原问题。
-    hyde_q   = clean_q
-    q2doc_q  = clean_q
-    should_enhance = QUERY_ENHANCE_ALL or _is_short_query(clean_q)
-    _use_parallel_fusion = (bm25_index is not None and not MULTIPATH_ENABLED)
-
-    if should_enhance and not _use_parallel_fusion:
-        # 仅 MultiPath / 纯向量模式：同步预计算 HyDE / Query2Doc
-        if HYDE_ENABLED:
-            try:
-                hyde_q = hyde_expand_query(clean_q)
-            except Exception as e:
-                logger.warning(f"[HyDE] 生成失败: {e}")
-                hyde_q = clean_q
-        if QUERY2DOC_ENABLED:
-            try:
-                q2doc_q = query2doc_expand(clean_q)
-            except Exception as e:
-                logger.warning(f"[Query2Doc] 失败: {e}")
-                q2doc_q = clean_q
-
-    t_prep = time.time()
-    logger.info(f"[Timing] 预处理: {t_prep - t_start:.2f}s")
-
-    # ── Step 5: 构建检索器 ────────────────────────────────────────────────
-    vector_retriever = index.as_retriever(similarity_top_k=recall_k, filters=filters)
-
-    retrieved_nodes: List[NodeWithScore] = []
-
-    if MULTIPATH_ENABLED and bm25_index is not None:
-        # ── 5a. MultiPath 多路召回 + Late Interaction ──────────────────
-        logger.info("[MultiPath] 执行多路 Dense+Sparse 召回...")
-        lexical_retriever = LocalBM25Retriever(
-            bm25_index,
-            similarity_top_k=MULTIPATH_SPARSE_TOP_K,
-            filters=filters,
-        )
-
-        # 多扩展查询变体（用于 BM25）- 使用路由策略的 num_queries
-        target_num_queries = strategy["num_queries"] if strategy else FUSION_NUM_QUERIES
-        if MULTI_EXPAND_ENABLED and len(clean_q) <= SHORT_QUERY_THRESHOLD:
-            expand_queries = _build_multi_expand_queries(q2doc_q, num_queries=target_num_queries)
-            logger.info(f"[MultiExpand] 生成 {len(expand_queries)} 个变体查询")
-        else:
-            expand_queries = [q2doc_q]
-
-        # 查询分解出的子问题并入召回查询集
-        if sub_queries:
-            expand_queries = list(dict.fromkeys([*expand_queries, *sub_queries]))
-
-        multipath_retriever = MultiPathRetriever(
-            dense_retriever=vector_retriever,
-            sparse_retriever=lexical_retriever,
-            colbert_reranker=colbert_reranker,
-            dense_top_k=MULTIPATH_DENSE_TOP_K,
-            sparse_top_k=MULTIPATH_SPARSE_TOP_K,
-            rerank_candidates=MULTIPATH_RERANK_CANDIDATES,
-            rrf_k=MULTIPATH_RRF_K,
-            enable_colbert=COLBERT_RERANK_ENABLED and colbert_reranker is not None,
-        )
-        retrieved_nodes = multipath_retriever.retrieve(
-            hyde_q,
-            top_k=RERANK_TOP_N if rerank else recall_k,
-            expand_queries=expand_queries,
-        )
-
-        # 标准 Rerank（ColBERT 未启用时）
-        if rerank is not None and (colbert_reranker is None or not COLBERT_RERANK_ENABLED):
-            logger.info(f"[Rerank] 精排中，top_n={RERANK_TOP_N}...")
-            retrieved_nodes = rerank._postprocess_nodes(
-                retrieved_nodes,
-                query_bundle=QueryBundle(query_str=clean_q),
-            )
-            _score_kind = "rerank"
-        elif colbert_reranker is not None and COLBERT_RERANK_ENABLED:
-            _score_kind = "rerank"
-        else:
-            _score_kind = "rrf"
-
-    elif bm25_index is not None:
-        # ── 5b. 并行 Fusion 召回（HyDE LLM + 向量 + BM25 同时执行）──────
-        logger.info("[Fusion] 并行三路 RRF 召回（向量 + HyDE + BM25+）...")
-        lexical_retriever = LocalBM25Retriever(
-            bm25_index, similarity_top_k=recall_k, filters=filters,
-        )
-
-        vec_weight  = float(dynamic_weights[0]) if len(dynamic_weights) >= 1 else 1.0
-        bm25_weight = float(dynamic_weights[1]) if len(dynamic_weights) >= 2 else 1.0
-        hyde_weight = vec_weight * float(HYDE_ROUTE_WEIGHT)
-
-        # 多扩展查询变体（规则生成，<0.01s）
-        #
-        # 向量路以原问题为种子，BM25 路以扩展串为种子 —— 见 Step 3 的分工说明。
-        target_nq = strategy["num_queries"] if strategy else FUSION_NUM_QUERIES
-        if MULTI_EXPAND_ENABLED:
-            raw_queries = _build_multi_expand_queries(clean_q, num_queries=target_nq)
-            bm25_queries = _build_multi_expand_queries(expanded_q, num_queries=target_nq)
-        else:
-            raw_queries = [clean_q]
-            bm25_queries = [expanded_q]
-
-        # 查询分解出的子问题并入多路召回
-        if sub_queries:
-            raw_queries = list(dict.fromkeys([*raw_queries, *sub_queries]))
-            bm25_queries = list(dict.fromkeys([*bm25_queries, *sub_queries]))
-
-        # Step-back 上位问题：单独一路向量召回，补足背景知识
-        stepback_vec_nodes: List[NodeWithScore] = []
-        if step_back_q:
-            try:
-                seen_stepback: set = set()
-                for n in vector_retriever.retrieve(step_back_q)[:recall_k]:
-                    nid = _node_id_key(n)
-                    if nid not in seen_stepback:
-                        seen_stepback.add(nid)
-                        stepback_vec_nodes.append(n)
-                logger.info(f"[StepBack] 上位问题召回 {len(stepback_vec_nodes)} 条")
-            except Exception as e:
-                logger.warning(f"[StepBack] 检索失败: {e}")
-
-        # ★ 核心优化：
-        #   HyDE 2路提前提交到专用 _HYDE_EXECUTOR（不阻塞主检索）
-        #   主检索 pool 仅跑向量+BM25，完成后非阻塞 check HyDE
-        hyde_futs: list = []
-        if should_enhance and HYDE_ENABLED:
-            hyde_futs.append(_HYDE_EXECUTOR.submit(hyde_expand_query, clean_q))  # 路1: 事实型
-            hyde_futs.append(_HYDE_EXECUTOR.submit(_hyde_expand_v2, clean_q))    # 路2: 规范型
-
-        # 主检索 pool：向量 + BM25（与 HyDE LLM 完全并行）
-        n_workers = len(raw_queries) + len(bm25_queries)
-        with ThreadPoolExecutor(max_workers=min(n_workers, 8)) as pool:
-            # ① 所有向量检索并行提交
-            vec_futs = [pool.submit(vector_retriever.retrieve, q) for q in raw_queries]
-            # ② 所有 BM25 检索并行提交
-            bm25_futs = [pool.submit(lexical_retriever.retrieve, q) for q in bm25_queries]
-
-            # 收集向量结果（去重）
-            all_raw_vec: List[NodeWithScore] = []
-            seen_raw: set = set()
-            for f in vec_futs:
-                try:
-                    for n in f.result(timeout=60)[:recall_k]:
-                        nid = _node_id_key(n)
-                        if nid not in seen_raw:
-                            seen_raw.add(nid)
-                            all_raw_vec.append(n)
-                except Exception as e:
-                    logger.warning(f"[Vec] 检索失败: {e}")
-            raw_vec_nodes = all_raw_vec[:recall_k * 2]
-
-            # 收集 BM25 结果（去重）
-            all_bm25: List[NodeWithScore] = []
-            seen_bm25: set = set()
-            for f in bm25_futs:
-                try:
-                    for n in f.result(timeout=60)[:recall_k]:
-                        nid = _node_id_key(n)
-                        if nid not in seen_bm25:
-                            seen_bm25.add(nid)
-                            all_bm25.append(n)
-                except Exception as e:
-                    logger.warning(f"[BM25] 检索失败: {e}")
-            bm25_nodes = all_bm25[:recall_k * 2]
-
-        t_main = time.time()
-        logger.info(f"[Timing] 主检索: {t_main - t_prep:.2f}s "
-                   f"(vec={len(raw_vec_nodes)}, bm25={len(bm25_nodes)})")
-
-        # ③ 收集 HyDE：给予最多 HYDE_WAIT_BUDGET 秒的等待时间
-        #    qwen3.5:35b-a3b-q4_K_M 关闭思考后 HyDE 一般 5-20s，首次冷启动可能更久
-        HYDE_WAIT_BUDGET = float(os.getenv("HYDE_WAIT_BUDGET", "30"))
-        hyde_elapsed = t_main - t_prep  # HyDE 已经跑了这么久
-        hyde_remain = max(0, HYDE_WAIT_BUDGET - hyde_elapsed)
-
-        hyde_vec_nodes: List[NodeWithScore] = []
-        seen_hyde: set = set()
-        n_hit, n_skip = 0, 0
-
-        if hyde_futs and hyde_remain > 0:
-            from concurrent.futures import wait as _futures_wait
-
-            done_set, not_done = _futures_wait(hyde_futs, timeout=hyde_remain)
-            for hf in done_set:
-                try:
-                    _hq = hf.result()
-                    if _hq and _hq != expanded_q:
-                        for n in vector_retriever.retrieve(_hq)[:recall_k]:
-                            nid = _node_id_key(n)
-                            if nid not in seen_hyde:
-                                seen_hyde.add(nid)
-                                hyde_vec_nodes.append(n)
-                        n_hit += 1
-                except Exception as e:
-                    logger.warning(f"[HyDE] 结果取失败: {e}")
-            n_skip = len(not_done)
-            if not_done:
-                # 已提交到线程池的任务无法真正取消，这里只停止等待，避免误导性日志
-                logger.info(
-                    f"[HyDE] {len(not_done)} 路生成超时（剩余预算 {hyde_remain:.1f}s），"
-                    f"本次放弃等待，任务将在后台自行结束"
-                )
-        elif hyde_futs:
-            n_skip = len(hyde_futs)
-            logger.info(f"[HyDE] 主检索已耗时 {hyde_elapsed:.1f}s，无剩余预算，跳过 HyDE")
-
-        t_hyde = time.time()
-        logger.info(f"[Timing] HyDE: {t_hyde - t_prep:.2f}s "
-                   f"(命中={n_hit}/{len(hyde_futs)}, 跳过={n_skip}/{len(hyde_futs)}, "
-                   f"nodes={len(hyde_vec_nodes)})")
-        if n_hit == 0 and hyde_futs:
-            logger.warning("[HyDE] 本次全部未命中，可能原因: LLM 响应慢/模型加载中。"
-                          f" 预算={HYDE_WAIT_BUDGET}s, 主检索耗时={hyde_elapsed:.1f}s")
-
-        # RRF 多路融合（原始向量 + HyDE 向量 + Step-back 向量 + BM25）
-        routes: list = [
-            (raw_vec_nodes, vec_weight),
-            (bm25_nodes, bm25_weight),
-        ]
-        if hyde_vec_nodes:
-            routes.insert(1, (hyde_vec_nodes, hyde_weight))
-        if stepback_vec_nodes:
-            routes.append((stepback_vec_nodes, vec_weight * float(STEPBACK_ROUTE_WEIGHT)))
-
-        retrieved_nodes = _weighted_rrf_fuse_three_routes(
-            routes, top_n=recall_k, rrf_k=FUSION_RRF_K,
-        )
-
-        # ── 过滤误杀回退（2026-09-20 评测事故）────────────────────────────
-        # 业务过滤抽取（如把查询里的 "Allegro" 抽成 eda=allegro）可能把候选池
-        # 清零：答案所在的 chunk 往往没有该元数据字段（标准/规范类文档）。
-        # 实测 80 题中 13 题被 eda 过滤误杀，其中 8 题完全无召回，MRR 0.133 vs
-        # 无过滤题 0.487。此处降级为"无业务过滤整链重检一次"（保留 ACL），
-        # 把硬失败变成有损降级。递归由 _no_business_filter 标志保证只发生一次。
-        if not retrieved_nodes and filters is not None and not _no_business_filter:
-            logger.warning("[Filter] 过滤后候选为空 → 回退为无业务过滤整链重检一次")
-            return _retrieve_nodes(
-                user_query, top_k=top_k, score_threshold=score_threshold,
-                _no_business_filter=True,
-            )
-
-        # Rerank 精排
-        if rerank is not None:
-            t_pre_rerank = time.time()
-            logger.info(f"[Rerank] 精排 {len(retrieved_nodes)} 候选...")
-            retrieved_nodes = rerank._postprocess_nodes(
-                retrieved_nodes,
-                query_bundle=QueryBundle(query_str=clean_q),
-            )
-            logger.info(f"[Timing] 精排: {time.time() - t_pre_rerank:.2f}s "
-                       f"→ {len(retrieved_nodes)} nodes")
-            _score_kind = "rerank"
-        else:
-            _score_kind = "rrf"
-
-    else:
-        # ── 5c. 纯向量检索（BM25 不可用）──────────────────────────────
-        logger.info("[VectorOnly] 纯向量检索...")
-        retrieved_nodes = vector_retriever.retrieve(
-            QueryBundle(query_str=hyde_q)
-        )
-        if rerank is not None:
-            retrieved_nodes = rerank._postprocess_nodes(
-                retrieved_nodes,
-                query_bundle=QueryBundle(query_str=clean_q),
-            )
-            _score_kind = "rerank"
-        else:
-            _score_kind = "vector"
-
-    # ── Step 6: Chunk 上下文扩展（合并邻近 Chunk）──────────────────────
-    if CHUNK_EXPAND_ENABLED and retrieved_nodes:
-        original_count = len(retrieved_nodes)
-        try:
-            retrieved_nodes = expand_chunks_with_context(
-                retrieved_nodes,
-                index=index,
-                expand_neighbors=CHUNK_EXPAND_NEIGHBORS,
-                expand_parent=CHUNK_EXPAND_PARENT,
-                group_by_doc=CHUNK_GROUP_BY_DOC,
-            )
-            if len(retrieved_nodes) > original_count:
-                logger.info(f"[ChunkExpand] {original_count} → {len(retrieved_nodes)} chunks")
-        except Exception as e:
-            logger.warning(f"[ChunkExpand] 扩展失败，跳过: {e}")
-
-    # ── Step 6b: GraphRAG 图检索融合 + 邻域事实扩展 ──────────────────────
-    # 放在阈值 / 截断之前：图证据必须和主结果一起参与 top_k 竞争，
-    # 否则会被截断悄悄丢掉。放在 _retrieve_nodes 里而不是只放在 /retrieval，
-    # 是因为 /api/ask、/api/chat 等端点直接调本函数 —— 早先它们既拿不到图增强，
-    # 也绕过了内存侧权限复核。
-    if GRAPH_RAG_ENABLED and retrieved_nodes:
-        retrieved_nodes = _graph_augment_nodes(user_query, retrieved_nodes)
-
-    # ── Step 7: 按得分阈值过滤 + top_k 截断 ──────────────────────────────
-    # RRF 分数（约 0.01~0.05）与 rerank 概率（0~1）量纲不同，直接套用阈值会误过滤
-    effective_threshold = score_threshold
-    if _score_kind == "rrf" and score_threshold > 0.0:
-        logger.info("[Score] 当前为 RRF 融合分数（非 0~1 概率），已忽略 score_threshold")
-        effective_threshold = 0.0
-
-    # 扩展上下文节点享有独立配额，避免被 top_k 直接截断导致扩展功能失效
-    max_expand_extra = max(0, int(os.getenv("CHUNK_EXPAND_MAX_EXTRA", "5")))
-    # 图证据同样独立配额：它的规则分（0.2~1.0）与 rerank 概率不同量纲，
-    # 若和主结果一起竞争 top_k，会凭分数把真实检索结果挤出去。
-    max_graph_extra = max(0, int(os.getenv("GRAPH_EVIDENCE_MAX", "2")))
-    ordered = sorted(
-        retrieved_nodes,
-        key=lambda x: -(float(x.score) if x.score is not None else 0.0),
-    )
-
-    filtered: List[NodeWithScore] = []
-    primary_count = 0
-    extra_count = 0
-    graph_count = 0
-    for nws in ordered:
-        score = float(nws.score) if nws.score is not None else 0.0
-        if effective_threshold > 0.0 and score < effective_threshold:
-            continue
-        node = nws.node
-        content = node.get_content(metadata_mode=MetadataMode.NONE).strip()
-        if not content:
-            continue
-        meta = node.metadata or {}
-        if meta.get("is_context_expansion"):
-            if extra_count >= max_expand_extra:
-                continue
-            extra_count += 1
-        elif meta.get("graph_evidence"):
-            if graph_count >= max_graph_extra:
-                continue
-            graph_count += 1
-        else:
-            if primary_count >= top_k:
-                continue
-            primary_count += 1
-        filtered.append(nws)
-
-    # ── Step 8: 权限兜底复核（安全控制必须在最低层强制执行）──────────────
-    # 向量库过滤条件若被服务端忽略 / 编译出错被吞，这里是最后一道拦截。
-    # 放在 _retrieve_nodes 末尾意味着"任何返回给用户的 node 都经过复核"，
-    # 而不是依赖每个端点记得调用 filter_nodes（/api/ask 曾经就是漏的那个）。
-    if ACL_ENABLED:
-        before_acl = len(filtered)
-        filtered = filter_nodes(filtered, current_principal())
-        if len(filtered) < before_acl:
-            logger.info(f"[ACL] 权限复核过滤 {before_acl - len(filtered)} 条无权访问的记录")
-
-    t_total = time.time()
-    logger.info(f"[Timing] 检索总耗时: {t_total - t_start:.2f}s → {len(filtered)} 条 "
-               f"(query={user_query[:40]}...)")
-    return filtered
+def _retrieve_nodes(user_query: str, top_k: int = 5, score_threshold: float = 0.0, _no_business_filter=False):
+    return get_pipeline().retrieve_nodes(user_query, top_k, score_threshold)
 
 
-def _graph_augment_nodes(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
-    """把图检索结果与邻域事实融合进召回结果（未启用图时为 no-op）。"""
-
-    graph = _app_state.get("graph")
-    retriever = _app_state.get("graph_retriever")
-    if not GRAPH_RAG_ENABLED or graph is None or retriever is None or not nodes:
-        return nodes
-
-    try:
-        with span("graph.augment", query=query[:120]):
-            graph_nodes = retriever.retrieve(query, top_k=GRAPH_TOP_K)
-            if graph_nodes:
-                # 这里在 rerank 之后调用：只让图结果按 RRF 排名参与排序，
-                # 不要覆盖已经量纲良好的 rerank 概率（overwrite_scores=False）
-                nodes = fuse_with_graph(
-                    nodes, graph_nodes, graph_weight=GRAPH_WEIGHT, overwrite_scores=False
-                )
-                logger.info(f"[GraphRAG] 图检索补充 {len(graph_nodes)} 条关系证据")
-            nodes = expand_nodes_with_graph(
-                nodes, graph, max_extra=int(os.getenv("GRAPH_EXPAND_MAX", "2"))
-            )
-    except Exception as e:
-        logger.warning(f"[GraphRAG] 图检索融合失败（忽略并继续）: {e}")
-    return nodes
 
 
 def _cache_scope_for_principal() -> str:
@@ -1543,26 +367,24 @@ def retrieve_chunks(user_query: str, top_k: int = 5, score_threshold: float = 0.
     带语义缓存：相同或语义相近的查询直接复用结果（按访问主体隔离，避免跨租户泄漏）。
     """
     cache = get_cache("retrieval")
-    cache_scope = _cache_scope_for_principal()
+    pipeline = get_pipeline()
+    pipeline.refresh()
+    revision = pipeline.state.get("revision", "legacy")
+    config_key = pipeline.config.fingerprint
+    cache_scope = f"{_cache_scope_for_principal()}|revision={revision}|pipeline={config_key}|top_k={top_k}|thr={score_threshold}"
     cache_key = f"{user_query}|top_k={top_k}|thr={score_threshold}"
     query_vec = embed_query_for_cache(user_query)
 
     cached = cache.get(cache_key, query_vec, scope=cache_scope)
-    if isinstance(cached, dict) and cached.get("params") == [top_k, score_threshold]:
+    if isinstance(cached, dict) and cached.get("params") == [top_k, score_threshold] and cached.get("revision") == revision:
         logger.info(f"[Cache] 检索命中缓存（query={user_query[:40]}...）")
         return [Record(**item) for item in cached.get("records", [])]
 
     # GraphRAG 融合 / 邻域扩展与 ACL 兜底复核已下沉到 _retrieve_nodes 末尾，
     # 所有端点（/retrieval、/api/ask、/api/chat、/api/ask/stream）共享同一条链路，
     # 不会再出现"某个端点少了兜底或少了图增强"的分叉。
-    nodes = _retrieve_nodes(user_query, top_k=top_k, score_threshold=score_threshold)
-
-    # P2 上下文压缩：近似去重 + 抽取式压缩 + 字符预算裁剪
-    if COMPRESSION_ENABLED:
-        before_compress = len(nodes)
-        nodes = compress_pipeline(nodes, user_query)
-        if len(nodes) < before_compress:
-            logger.info(f"[Compress] 上下文压缩 {before_compress} → {len(nodes)} 条")
+    from pcb_rag.query import build_context_bundle
+    nodes = build_context_bundle(_retrieve_nodes(user_query, top_k=top_k, score_threshold=score_threshold)).nodes
 
     records: List[Record] = []
     for nws in nodes:
@@ -1577,15 +399,20 @@ def retrieve_chunks(user_query: str, top_k: int = 5, score_threshold: float = 0.
             score=round(score, 6),
             title=source_name,
             metadata={
+                "chunk_id": str(node.id_), "revision": meta.get("revision", ""),
+                "section": meta.get("section") or meta.get("parent_title", ""),
+                "page": str(meta.get("page_label") or meta.get("page", "")),
                 "source_path": source_path,
                 "source_type": meta.get("source_type", ""),
                 "vendor": meta.get("vendor", ""),
                 "eda": meta.get("eda", ""),
             },
         ))
+    if pipeline.state.get("revision", "legacy") != revision:
+        return records
     cache.set(
         cache_key,
-        {"params": [top_k, score_threshold], "records": [r.model_dump() for r in records]},
+        {"params": [top_k, score_threshold], "revision": revision, "pipeline": config_key, "records": [r.model_dump() for r in records]},
         query_vec,
         scope=cache_scope,
     )
@@ -1622,7 +449,7 @@ def external_retrieval(
         )
     except Exception as e:
         logger.error(f"[Error] 检索异常: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"检索失败: {str(e)}")
+        raise _api_error(e) from e
 
     return RetrievalRes(records=records)
 
@@ -1640,7 +467,7 @@ class ChatMessage(BaseModel):
 
 
 class AskReq(BaseModel):
-    query: str = Field(description="用户问题")
+    query: str = Field(description="用户问题", max_length=8000)
     top_k: int = Field(default=5, ge=1, le=20, description="检索 chunk 数量")
     score_threshold: float = Field(default=0.0, ge=0.0, description="最低得分阈值")
     score_threshold_enabled: bool = Field(default=False)
@@ -1653,7 +480,73 @@ class AskReq(BaseModel):
     )
 
 
-class AskRes(BaseModel):
+class AnswerDiagnostics(BaseModel):
+    citations: List[dict] = Field(default_factory=list)
+    invalid_citations: List[int] = Field(default_factory=list)
+    budget: dict = Field(default_factory=dict)
+    revision: str = "legacy"
+    routes: dict = Field(default_factory=dict)
+    timings: dict = Field(default_factory=dict)
+    degraded: List[str] = Field(default_factory=list)
+    usage: List[dict] = Field(default_factory=list)
+
+
+def _pipeline_llm():
+    return get_pipeline().llm or Settings.llm
+
+
+def _api_error(error):
+    from pcb_rag.runtime import DeadlineExceeded, WorkRejected
+    from pcb_rag.sessions import SessionAccessDenied
+    from pcb_rag.usage import UsageBudgetExceeded
+    from pcb_rag.rerank_control import RerankStopped
+    if isinstance(error, (DeadlineExceeded, SessionAccessDenied)):
+        raise error
+    if isinstance(error, HTTPException):
+        return error
+    if isinstance(error, (WorkRejected, UsageBudgetExceeded)):
+        return HTTPException(status_code=429, detail=str(error))
+    if isinstance(error, RerankStopped):
+        return HTTPException(status_code=503, detail="重排服务已停止，请检查用量与服务状态")
+    if isinstance(error, ValueError):
+        return HTTPException(status_code=400, detail=str(error))
+    return HTTPException(status_code=500, detail="问答处理失败，请使用 trace ID 检查服务日志")
+
+
+def _answer_request(raw_query, history, top_k, threshold, use_self_rag):
+    from pcb_rag.runtime import current_control
+    llm = _pipeline_llm()
+    try:
+        search_query = _rewrite_query_with_history(raw_query, history, llm) if history else raw_query
+        if use_self_rag and SELF_RAG_ENABLED:
+            class Retriever:
+                def retrieve(self, value):
+                    return _retrieve_nodes(search_query if value == raw_query else value, top_k, threshold)
+            result = self_rag_query(raw_query, Retriever(), llm=llm)
+            answer = format_self_rag_result(result, show_history=False)
+        else:
+            nodes = _retrieve_nodes(search_query, top_k, threshold)
+            result = _generate_answer_with_history(raw_query, nodes, history, llm)
+            answer = format_answer_with_citations(result, verbose=False)
+        bundle = result["evidence_bundle"]
+        control = current_control()
+        return {"answer": answer, "sources": [entry["source_path"] for entry in bundle.sources],
+            "records": [Record(content=entry["text"], score=entry["score"], title=entry["source_name"],
+                metadata={"citation_id": entry["index"], "chunk_id": entry["chunk_id"],
+                          "source_path": entry["source_path"], "section": entry["section"],
+                          "revision": entry["metadata"].get("revision", ""),
+                          "page": str(entry["metadata"].get("page_label", ""))}) for entry in bundle.entries],
+            "rewritten_query": search_query if search_query != raw_query else None,
+            "citations": bundle.citations(result["answer"]), "invalid_citations": bundle.invalid_citations(result["answer"]),
+            "budget": bundle.budget, "revision": control.revision if control else get_pipeline().state.get("revision", "legacy"),
+            "routes": dict(control.routes) if control else {}, "timings": dict(control.timings) if control else {},
+            "degraded": list(dict.fromkeys(control.degraded)) if control else [], "usage": list(control.usage) if control else []}
+    except Exception as error:
+        logger.exception("answer request failed")
+        raise _api_error(error) from error
+
+
+class AskRes(AnswerDiagnostics):
     answer: str
     sources: List[str] = []
     records: List[Record] = []
@@ -1664,110 +557,11 @@ class AskRes(BaseModel):
 
 
 @app.post("/api/ask", response_model=AskRes, summary="全链路问答接口（检索 + LLM 合成，支持多轮对话）")
-def ask_rag(
-    req: AskReq,
-    _: str = Depends(verify_token),
-):
-    """
-    全链路 RAG 问答端点：执行完整检索管道后，调用本地 LLM 合成答案。
-    使用 def（非 async def）确保同步 LLM 调用在线程池中执行，不阻塞事件循环。
-    **支持多轮对话**：通过 chat_history 传入对话历史，自动解析指代/省略。
-
-    返回：
-    - answer: LLM 生成的答案（含引用标注）
-    - sources: 引用的来源文件路径列表
-    - records: 检索到的原始 chunk 列表（可选用于调试）
-    - rewritten_query: 改写后的查询（仅在有历史改写时返回）
-
-    Dify 工作流 HTTP Request 节点示例配置：
-      Method: POST
-      URL: http://<服务器IP>:8000/api/ask
-      Headers: Authorization: Bearer <API_TOKEN>, Content-Type: application/json
-      Body: {"query": "{{#sys.query#}}", "top_k": 5,
-             "chat_history": {{#sys.conversation_history#}} }
-    提取输出：{{#http_request.body.answer#}}
-    """
+def ask_rag(req: AskReq, _: str = Depends(verify_token)):
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="query 不能为空")
-
-    threshold = req.score_threshold if req.score_threshold_enabled else 0.0
-    raw_query = req.query.strip()
-    history_dicts = [m.model_dump() for m in req.chat_history] if req.chat_history else []
-
-    try:
-        t_ask_start = time.time()
-
-        # ── 历史感知查询改写：解析代词/省略 → 独立查询 ─────────────────
-        search_query = raw_query
-        rewritten = None
-        if history_dicts:
-            search_query = _rewrite_query_with_history(raw_query, history_dicts)
-            if search_query != raw_query:
-                rewritten = search_query
-            logger.info(f"[Timing] 历史改写: {time.time() - t_ask_start:.2f}s")
-
-        # ── 检索阶段：使用改写后的查询检索 ───────────────────────────────
-        t_ret = time.time()
-        nodes = _retrieve_nodes(
-            user_query=search_query,
-            top_k=req.top_k,
-            score_threshold=threshold,
-        )
-        logger.info(f"[Timing] 检索阶段: {time.time() - t_ret:.2f}s")
-
-        # ── 合成阶段：LLM 生成带引用的答案（注入对话历史）───────────────
-        t_synth = time.time()
-        use_sr = req.use_self_rag and SELF_RAG_ENABLED
-        if use_sr:
-            logger.info("[Self-RAG] 启动自反思问答迭代...")
-            class _NodeListRetriever:
-                def __init__(self, ns):
-                    self._ns = ns
-                def retrieve(self, _query_str):
-                    return self._ns
-
-            sr_result = self_rag_query(
-                query=raw_query,
-                retriever=_NodeListRetriever(nodes),
-                llm=Settings.llm,
-            )
-            answer_text = format_self_rag_result(sr_result, show_history=False)
-            sources = []
-        else:
-            result = _generate_answer_with_history(
-                query=raw_query,
-                retrieved_docs=nodes,
-                chat_history=history_dicts,
-                llm=Settings.llm,
-            )
-            answer_text = format_answer_with_citations(result, verbose=False)
-            sources = result.get("sources", [])
-
-        logger.info(f"[Timing] 答案合成: {time.time() - t_synth:.2f}s")
-
-        # ── 同时打包 records（供调试）────────────────────────────────────
-        records_out: List[Record] = []
-        for nws in nodes:
-            score = float(nws.score) if nws.score is not None else 0.0
-            node = nws.node
-            content = node.get_content(metadata_mode=MetadataMode.NONE).strip()
-            meta: dict = node.metadata if hasattr(node, "metadata") else {}
-            source_path: str = meta.get("source_path", "")
-            source_name: str = Path(source_path).stem if source_path else meta.get("source_type", "未知来源")
-            records_out.append(Record(
-                content=content, score=round(score, 6), title=source_name,
-                metadata={"source_path": source_path,
-                          "source_type": meta.get("source_type", ""),
-                          "vendor": meta.get("vendor", ""),
-                          "eda": meta.get("eda", "")},
-            ))
-
-    except Exception as e:
-        logger.error(f"[Error] /api/ask 异常: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"问答失败: {str(e)}")
-
-    logger.info(f"[Ask] 答案生成完毕（总耗时={time.time() - t_ask_start:.1f}s, query={raw_query[:40]}...）")
-    return AskRes(answer=answer_text, sources=sources, records=records_out, rewritten_query=rewritten)
+    return AskRes(**_answer_request(req.query.strip(), [m.model_dump() for m in req.chat_history or []],
+        req.top_k, req.score_threshold if req.score_threshold_enabled else 0.0, req.use_self_rag))
 
 
 # ---------------------------------------------------------------------------
@@ -1775,7 +569,7 @@ def ask_rag(
 #      自动管理对话历史，客户端只需传递 session_id
 # ---------------------------------------------------------------------------
 class ChatReq(BaseModel):
-    query: str = Field(description="用户问题")
+    query: str = Field(description="用户问题", max_length=8000)
     session_id: Optional[str] = Field(
         default=None,
         description="会话ID（首次对话不传，后续对话传入返回的 session_id）"
@@ -1786,7 +580,7 @@ class ChatReq(BaseModel):
     use_self_rag: bool = Field(default=False, description="是否启用 Self-RAG 自反思迭代")
 
 
-class ChatRes(BaseModel):
+class ChatRes(AnswerDiagnostics):
     answer: str
     session_id: str = Field(description="会话ID（后续对话需传入此ID）")
     is_new_session: bool = Field(description="是否为新创建的会话")
@@ -1799,213 +593,26 @@ class ChatRes(BaseModel):
 
 
 @app.post("/api/chat", response_model=ChatRes, summary="带会话记忆的问答接口（推荐）")
-def chat_rag(
-    req: ChatReq,
-    _: str = Depends(verify_token),
-):
-    """
-    带服务端会话记忆的 RAG 问答端点。
-
-    **核心特性**：
-    - 自动管理对话历史，无需客户端维护
-    - 首次对话不传 session_id，返回新会话ID
-    - 后续对话传入 session_id 即可延续上下文
-    - 支持指代消解（"它是什么？"→ 自动补全为完整问题）
-
-    **使用流程**：
-    1. 首次请求：{"query": "什么是HDI板？"}
-       响应：{"answer": "...", "session_id": "abc123", "is_new_session": true}
-    2. 后续请求：{"query": "它的工艺要求是什么？", "session_id": "abc123"}
-       响应：{"answer": "...", "session_id": "abc123", "is_new_session": false}
-       （"它"会被自动解析为"HDI板"）
-
-    **Dify 工作流配置**：
-      Method: POST
-      URL: http://<服务器IP>:8000/api/chat
-      Headers: Authorization: Bearer <API_TOKEN>, Content-Type: application/json
-      Body: {"query": "{{#sys.query#}}", "session_id": "{{#自定义变量.session_id#}}"}
-    提取输出：
-      - 答案：{{#http_request.body.answer#}}
-      - 会话ID：{{#http_request.body.session_id#}}（存入变量供下次使用）
-    """
+def chat_rag(req: ChatReq, _: str = Depends(verify_token)):
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="query 不能为空")
-
     sm = get_session_manager()
     session_id, is_new = sm.get_or_create(req.session_id)
-    threshold = req.score_threshold if req.score_threshold_enabled else 0.0
-    raw_query = req.query.strip()
-
-    try:
-        t_chat_start = time.time()
-
-        history = sm.get_history(session_id)
-
-        history_dicts = history if history else []
-
-        search_query = raw_query
-        rewritten = None
-        if history_dicts:
-            search_query = _rewrite_query_with_history(raw_query, history_dicts)
-            if search_query != raw_query:
-                rewritten = search_query
-            logger.info(f"[Timing] 历史改写: {time.time() - t_chat_start:.2f}s")
-
-        t_ret = time.time()
-        nodes = _retrieve_nodes(
-            user_query=search_query,
-            top_k=req.top_k,
-            score_threshold=threshold,
-        )
-        logger.info(f"[Timing] 检索阶段: {time.time() - t_ret:.2f}s")
-
-        t_synth = time.time()
-        use_sr = req.use_self_rag and SELF_RAG_ENABLED
-        if use_sr:
-            logger.info("[Self-RAG] 启动自反思问答迭代...")
-            class _NodeListRetriever:
-                def __init__(self, ns):
-                    self._ns = ns
-                def retrieve(self, _query_str):
-                    return self._ns
-
-            sr_result = self_rag_query(
-                query=raw_query,
-                retriever=_NodeListRetriever(nodes),
-                llm=Settings.llm,
-            )
-            answer_text = format_self_rag_result(sr_result, show_history=False)
-            sources = []
-        else:
-            result = _generate_answer_with_history(
-                query=raw_query,
-                retrieved_docs=nodes,
-                chat_history=history_dicts,
-                llm=Settings.llm,
-            )
-            answer_text = format_answer_with_citations(result, verbose=False)
-            sources = result.get("sources", [])
-
-        logger.info(f"[Timing] 答案合成: {time.time() - t_synth:.2f}s")
-
-        sm.add_message(session_id, "user", raw_query)
-        sm.add_message(session_id, "assistant", answer_text)
-
-        records_out: List[Record] = []
-        for nws in nodes:
-            score = float(nws.score) if nws.score is not None else 0.0
-            node = nws.node
-            content = node.get_content(metadata_mode=MetadataMode.NONE).strip()
-            meta: dict = node.metadata if hasattr(node, "metadata") else {}
-            source_path: str = meta.get("source_path", "")
-            source_name: str = Path(source_path).stem if source_path else meta.get("source_type", "未知来源")
-            records_out.append(Record(
-                content=content, score=round(score, 6), title=source_name,
-                metadata={"source_path": source_path,
-                          "source_type": meta.get("source_type", ""),
-                          "vendor": meta.get("vendor", ""),
-                          "eda": meta.get("eda", "")},
-            ))
-
-    except Exception as e:
-        logger.error(f"[Error] /api/chat 异常: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"问答失败: {str(e)}")
-
-    logger.info(f"[Chat] 答案生成完毕（总耗时={time.time() - t_chat_start:.1f}s, "
-                f"session={session_id[:8]}..., new={is_new}, query={raw_query[:40]}...）")
-    return ChatRes(
-        answer=answer_text,
-        session_id=session_id,
-        is_new_session=is_new,
-        sources=sources,
-        records=records_out,
-        rewritten_query=rewritten,
-    )
+    payload = _answer_request(req.query.strip(), sm.get_history(session_id), req.top_k,
+        req.score_threshold if req.score_threshold_enabled else 0.0, req.use_self_rag)
+    sm.add_message(session_id, "user", req.query.strip())
+    sm.add_message(session_id, "assistant", payload["answer"])
+    return ChatRes(**payload, session_id=session_id, is_new_session=is_new)
 
 
 # ---------------------------------------------------------------------------
 # 10b. /api/chat/plain：带会话记忆的纯文本问答端点
 # ---------------------------------------------------------------------------
 @app.post("/api/chat/plain", response_class=Response, summary="带会话记忆的纯文本问答接口")
-def chat_rag_plain(
-    req: ChatReq,
-    _: str = Depends(verify_token),
-):
-    """
-    与 /api/chat 逻辑相同，但以 text/plain 返回纯答案字符串。
-    响应头 X-Session-ID 包含会话ID，X-Is-New-Session 标识是否为新会话。
-
-    Dify 工作流配置：
-      Method: POST
-      URL: http://<服务器IP>:8000/api/chat/plain
-      Headers: Authorization: Bearer <API_TOKEN>, Content-Type: application/json
-      Body: {"query": "{{#sys.query#}}", "session_id": "{{#自定义变量.session_id#}}"}
-    结束节点直接引用：{{#http_request.body#}}
-    从响应头提取会话ID：{{#http_request.headers.X-Session-ID#}}
-    """
-    if not req.query.strip():
-        raise HTTPException(status_code=400, detail="query 不能为空")
-
-    sm = get_session_manager()
-    session_id, is_new = sm.get_or_create(req.session_id)
-    threshold = req.score_threshold if req.score_threshold_enabled else 0.0
-    raw_query = req.query.strip()
-
-    try:
-        t_plain_start = time.time()
-
-        history = sm.get_history(session_id)
-        history_dicts = history if history else []
-
-        search_query = raw_query
-        if history_dicts:
-            search_query = _rewrite_query_with_history(raw_query, history_dicts)
-
-        nodes = _retrieve_nodes(
-            user_query=search_query,
-            top_k=req.top_k,
-            score_threshold=threshold,
-        )
-
-        use_sr = req.use_self_rag and SELF_RAG_ENABLED
-        if use_sr:
-            class _NodeListRetriever:
-                def __init__(self, ns):
-                    self._ns = ns
-                def retrieve(self, _q):
-                    return self._ns
-            sr_result = self_rag_query(
-                query=raw_query,
-                retriever=_NodeListRetriever(nodes),
-                llm=Settings.llm,
-            )
-            answer_text = format_self_rag_result(sr_result, show_history=False)
-        else:
-            result = _generate_answer_with_history(
-                query=raw_query,
-                retrieved_docs=nodes,
-                chat_history=history_dicts,
-                llm=Settings.llm,
-            )
-            answer_text = format_answer_with_citations(result, verbose=False)
-
-        sm.add_message(session_id, "user", raw_query)
-        sm.add_message(session_id, "assistant", answer_text)
-
-    except Exception as e:
-        logger.error(f"[Error] /api/chat/plain 异常: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"问答失败: {str(e)}")
-
-    logger.info(f"[ChatPlain] 答案生成完毕（总耗时={time.time() - t_plain_start:.1f}s, "
-                f"session={session_id[:8]}..., new={is_new}, query={raw_query[:40]}...）")
-    return Response(
-        content=answer_text,
-        media_type="text/plain; charset=utf-8",
-        headers={
-            "X-Session-ID": session_id,
-            "X-Is-New-Session": str(is_new).lower(),
-        },
-    )
+def chat_rag_plain(req: ChatReq, _: str = Depends(verify_token)):
+    result = chat_rag(req, _)
+    return Response(content=result.answer, media_type="text/plain; charset=utf-8",
+        headers={"X-Session-ID": result.session_id, "X-Is-New-Session": str(result.is_new_session).lower()})
 
 
 # ---------------------------------------------------------------------------
@@ -2013,70 +620,8 @@ def chat_rag_plain(
 #      直接返回 text/plain，{{http_request.body}} 即为答案，无需 JSON 解析
 # ---------------------------------------------------------------------------
 @app.post("/api/ask/plain", response_class=Response, summary="纯文本问答接口（Dify 工作流推荐，支持多轮对话）")
-def ask_rag_plain(
-    req: AskReq,
-    _: str = Depends(verify_token),
-):
-    """
-    与 /api/ask 逻辑完全相同，但以 text/plain 返回纯答案字符串。
-    使用 def（非 async def）确保同步 LLM 调用在线程池中执行。
-    **支持多轮对话**：通过 chat_history 传入对话历史。
-
-    Dify 工作流 HTTP Request 节点配置：
-      Method: POST
-      URL: http://<服务器IP>:8000/api/ask/plain
-      Headers: Authorization: Bearer <API_TOKEN>, Content-Type: application/json
-      Body: {"query": "{{#sys.query#}}", "top_k": 5,
-             "chat_history": {{#sys.conversation_history#}} }
-    结束节点直接引用：{{#http_request.body#}}
-    """
-    if not req.query.strip():
-        raise HTTPException(status_code=400, detail="query 不能为空")
-
-    threshold = req.score_threshold if req.score_threshold_enabled else 0.0
-    raw_query = req.query.strip()
-    history_dicts = [m.model_dump() for m in req.chat_history] if req.chat_history else []
-
-    try:
-        t_plain_start = time.time()
-
-        # ── 历史感知查询改写 ──────────────────────────────────────────────
-        search_query = raw_query
-        if history_dicts:
-            search_query = _rewrite_query_with_history(raw_query, history_dicts)
-
-        nodes = _retrieve_nodes(
-            user_query=search_query,
-            top_k=req.top_k,
-            score_threshold=threshold,
-        )
-        use_sr = req.use_self_rag and SELF_RAG_ENABLED
-        if use_sr:
-            class _NodeListRetriever:
-                def __init__(self, ns):
-                    self._ns = ns
-                def retrieve(self, _q):
-                    return self._ns
-            sr_result = self_rag_query(
-                query=raw_query,
-                retriever=_NodeListRetriever(nodes),
-                llm=Settings.llm,
-            )
-            answer_text = format_self_rag_result(sr_result, show_history=False)
-        else:
-            result = _generate_answer_with_history(
-                query=raw_query,
-                retrieved_docs=nodes,
-                chat_history=history_dicts,
-                llm=Settings.llm,
-            )
-            answer_text = format_answer_with_citations(result, verbose=False)
-    except Exception as e:
-        logger.error(f"[Error] /api/ask/plain 异常: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"问答失败: {str(e)}")
-
-    logger.info(f"[AskPlain] 答案生成完毕（总耗时={time.time() - t_plain_start:.1f}s, query={raw_query[:40]}...）")
-    return Response(content=answer_text, media_type="text/plain; charset=utf-8")
+def ask_rag_plain(req: AskReq, _: str = Depends(verify_token)):
+    return Response(content=ask_rag(req, _).answer, media_type="text/plain; charset=utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -2115,7 +660,7 @@ def ask_rag_stream(
             # 1) 历史感知查询改写
             search_query = raw_query
             if history_dicts:
-                search_query = _rewrite_query_with_history(raw_query, history_dicts)
+                search_query = _rewrite_query_with_history(raw_query, history_dicts, _pipeline_llm())
 
             # 2) 检索
             nodes = _retrieve_nodes(
@@ -2124,7 +669,10 @@ def ask_rag_stream(
                 score_threshold=threshold,
             )
 
-            context, sources_info = build_context_with_sources(nodes)
+            prepared = prepare_with_history(raw_query, nodes, history_dicts, _pipeline_llm())
+            bundle = prepared.evidence
+            sources_info = bundle.sources
+
             yield _sse(
                 "sources",
                 {
@@ -2148,31 +696,16 @@ def ask_rag_stream(
                 },
             )
 
-            # 3) 构造 Prompt（与 /api/ask 保持一致）
-            if history_dicts:
-                recent = history_dicts[-_MAX_HISTORY_TURNS:]
-                history_lines = []
-                for msg in recent:
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        history_lines.append(f"用户：{content}")
-                    elif role == "assistant":
-                        truncated = content[:300] + "..." if len(content) > 300 else content
-                        history_lines.append(f"助手：{truncated}")
-                prompt = _RAG_PROMPT_WITH_HISTORY.format(
-                    n=len(recent),
-                    history="\n".join(history_lines),
-                    context=context,
-                    query=raw_query,
-                )
-            else:
-                prompt = RAG_PROMPT_TEMPLATE.format(context=context, query=raw_query)
+            prompt = prepared.prompt
 
+            if not bundle.entries:
+                yield _sse("token", {"text": "根据提供的文档无法回答该问题，未找到可用证据。"})
+                yield _sse("done", {"answer_length": 0, "budget": bundle.budget})
+                return
             # 4) 流式生成
             answer_parts: List[str] = []
             try:
-                for chunk in Settings.llm.stream_complete(prompt):
+                for chunk in model_stream(_pipeline_llm(), prompt):
                     delta = getattr(chunk, "delta", None)
                     if delta is None:
                         delta = getattr(chunk, "text", "") or ""
@@ -2186,11 +719,16 @@ def ask_rag_stream(
             answer = "".join(answer_parts)
             if CITATION_ENABLED and answer:
                 try:
-                    yield _sse("citations", {"citations": extract_citations(answer, nodes)})
+                    yield _sse("citations", {"citations": extract_citations(answer, bundle), "invalid_citations": bundle.invalid_citations(answer)})
                 except Exception:
                     pass
 
-            yield _sse("done", {"answer_length": len(answer)})
+            from pcb_rag.runtime import current_control
+            control = current_control()
+            yield _sse("done", {"answer_length": len(answer), "budget": bundle.budget,
+                                "degraded": list(dict.fromkeys(control.degraded)) if control else [],
+                                "routes": control.routes if control else {}, "timings": control.timings if control else {},
+                                "usage": control.usage if control else []})
         except Exception as e:
             logger.error(f"[Error] /api/ask/stream 异常: {e}", exc_info=True)
             yield _sse("error", {"message": str(e)})
@@ -2302,6 +840,46 @@ def cleanup_sessions(_: str = Depends(verify_token)):
         "message": f"已清理 {cleaned} 个过期会话",
         "cleaned_count": cleaned,
     }
+
+
+def verify_admin(_: str = Depends(verify_token)):
+    from pcb_rag import security
+    identity_required = security.ACL_ENABLED or os.getenv("AUTH_TOKEN_PRINCIPALS_FILE") or os.getenv("SESSION_REQUIRE_IDENTITY") == "1"
+    if identity_required and not security.current_principal().is_admin:
+        raise HTTPException(status_code=403, detail="administrator identity required")
+
+
+@app.get("/api/admin/status", summary="发布版本与处理状态")
+def ingestion_status(_: str = Depends(verify_admin)):
+    from pcb_rag.management import JOBS, processing_status
+    return dict(processing_status(get_pipeline().revisions), job=JOBS.status())
+
+
+@app.get("/api/admin/documents", summary="文档处理阶段")
+def ingestion_documents(offset: int = 0, limit: int = 100, _: str = Depends(verify_admin)):
+    from pcb_rag.management import document_status
+    if offset < 0 or not 1 <= limit <= 200:
+        raise HTTPException(status_code=400, detail="invalid pagination")
+    return document_status(get_pipeline().revisions, offset=offset, limit=limit)
+
+
+@app.post("/api/admin/retry", summary="重试未完成入库")
+def retry_ingestion(_: str = Depends(verify_admin)):
+    from pcb_rag.management import JOBS
+    try:
+        return JOBS.retry(get_pipeline().revisions)
+    except (OSError, ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.get("/api/graph/neighbors", summary="按原文权限查看图谱关系")
+def graph_neighbors(entity: str, _: str = Depends(verify_token)):
+    from pcb_rag.engine import KnowledgeBase
+    if not entity.strip() or len(entity) > 200:
+        raise HTTPException(status_code=400, detail="invalid entity")
+    pipeline = get_pipeline()
+    pipeline.refresh()
+    return KnowledgeBase(auto_init=False, pipeline=pipeline).graph_neighbors(entity).to_dict()
 
 
 # ---------------------------------------------------------------------------

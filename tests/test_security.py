@@ -67,9 +67,7 @@ class TestResolvePrincipal:
 
     def test_headers_ignored_when_trust_disabled(self):
         """回归：信任头关闭（默认）时，客户端自报 admin 不生效，退化为匿名租户。"""
-        principal = resolve_principal(
-            {"X-Tenant-Id": "acme", "X-User-Roles": "admin", "X-User-Id": "u1"}
-        )
+        principal = resolve_principal({"X-Tenant-Id": "acme", "X-User-Roles": "admin", "X-User-Id": "u1"})
         assert principal.is_admin is False
         assert principal.tenant_id == security.ACL_ANONYMOUS_TENANT
         assert principal.user_id == "anonymous"
@@ -279,6 +277,7 @@ class TestMergeFilters:
             MetadataFilter,
             MetadataFilters,
         )
+
         return SimpleNamespace(
             FilterCondition=FilterCondition,
             FilterOperator=FilterOperator,

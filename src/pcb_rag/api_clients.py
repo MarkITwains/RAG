@@ -170,6 +170,7 @@ def build_llm(
             max_tokens=LLM_MAX_TOKENS,
             temperature=temp,
             timeout=request_timeout or LLM_TIMEOUT,
+            max_retries=0,
         )
 
     from llama_index.llms.ollama import Ollama
@@ -181,6 +182,7 @@ def build_llm(
         context_window=OLLAMA_NUM_CTX,
         additional_kwargs={
             "num_ctx": OLLAMA_NUM_CTX,
+            "num_predict": LLM_MAX_TOKENS or int(os.getenv("RAG_OUTPUT_RESERVE_TOKENS", "1024")),
             "temperature": temp,
             "top_p": 0.8,
             "top_k": 20,
@@ -201,6 +203,10 @@ def build_embed_model(model: Optional[str] = None, *, backend: Optional[str] = N
 
     if backend == "api":
         from llama_index.embeddings.openai import OpenAIEmbedding
+        from pcb_rag.metered_embeddings import EmbeddingUsageMixin
+
+        class MeteredOpenAIEmbedding(EmbeddingUsageMixin, OpenAIEmbedding):
+            pass
 
         if not EMBED_BASE_URL:
             raise RuntimeError(
@@ -222,6 +228,8 @@ def build_embed_model(model: Optional[str] = None, *, backend: Optional[str] = N
             "api_base": EMBED_BASE_URL,
             "api_key": EMBED_API_KEY or _PLACEHOLDER_KEY,
             "embed_batch_size": EMBED_BATCH_SIZE,
+            "max_retries": 0,
+            "timeout": 120.0,
         }
         provider = resolve_embedding_provider(EMBED_API_PROVIDER, EMBED_BASE_URL)
         if provider == "nvidia":
@@ -233,29 +241,31 @@ def build_embed_model(model: Optional[str] = None, *, backend: Optional[str] = N
                 **kwargs,
                 truncate=EMBED_TRUNCATE,
                 expected_dimension=EMBED_DIM,
-                max_retries=3,
-                timeout=120.0,
             )
         if EMBED_DIM > 0 and _should_send_dimensions(model_name):
             kwargs["dimensions"] = EMBED_DIM
         try:
-            return OpenAIEmbedding(**kwargs)
+            return MeteredOpenAIEmbedding(**kwargs)
         except TypeError:
             # 部分版本 / 服务不支持 dimensions 参数，降级重试
             kwargs.pop("dimensions", None)
-            return OpenAIEmbedding(**kwargs)
+            return MeteredOpenAIEmbedding(**kwargs)
 
     from llama_index.embeddings.ollama import OllamaEmbedding
+    from pcb_rag.metered_embeddings import EmbeddingUsageMixin
+
+    class MeteredOllamaEmbedding(EmbeddingUsageMixin, OllamaEmbedding):
+        pass
 
     # 修复：原先硬编码模型名，导致 OLLAMA_EMBED_MODEL 环境变量完全失效
-    return OllamaEmbedding(
+    return MeteredOllamaEmbedding(
         model_name=model or OLLAMA_EMBED_MODEL,
         base_url=OLLAMA_BASE,
         ollama_additional_kwargs={"num_ctx": EMBED_NUM_CTX},
     )
 
 
-def get_embedding_profile(dimension: Optional[int] = None) -> dict:
+def get_embedding_profile(dimension: Optional[int] = None, *, document_text="llama_index_metadata_embed_v1") -> dict:
     """Identity of the API vector space, without credentials."""
     return embedding_profile(
         provider=resolve_embedding_provider(EMBED_API_PROVIDER, EMBED_BASE_URL),
@@ -263,6 +273,7 @@ def get_embedding_profile(dimension: Optional[int] = None) -> dict:
         model=EMBED_MODEL,
         dimension=dimension if dimension is not None else EMBED_DIM,
         truncate=EMBED_TRUNCATE,
+        document_text=document_text,
     )
 
 
@@ -341,9 +352,14 @@ class ApiReranker(BaseNodePostprocessor):
         provider = provider_identity(self.api_url, self.api_key)
         phase = os.getenv("RERANK_PHASE", "production")
         activity = os.getenv("RERANK_ACTIVITY", "request")
+        from pcb_rag.usage import finish_usage, reserve_usage
+        usage_tickets = {}
 
         def record(ticket, **kwargs):
             event = control.finish(ticket, **kwargs)
+            usage_ticket = usage_tickets.get(ticket.request_id)
+            if usage_ticket:
+                finish_usage(usage_ticket, {"usage": kwargs.get("usage", {})}, error=kwargs.get("status") != "success")
             event.update(
                 model=self.model, phase=phase, activity=activity, candidates=len(documents), wire_top_n=wanted,
                 estimated_tokens=ticket.estimated_tokens,
@@ -357,7 +373,15 @@ class ApiReranker(BaseNodePostprocessor):
             )
             control.wait(ticket)
             try:
-                resp = requests.post(self.api_url, json=payload, headers=headers, timeout=self.timeout, allow_redirects=False)
+                from pcb_rag.runtime import current_control
+                request = current_control()
+                timeout = min(self.timeout, request.remaining()) if request else self.timeout
+                usage_tickets[ticket.request_id] = reserve_usage("rerank", [query, *documents], self.model)
+            except BaseException:
+                control.finish(ticket, status="cancelled", actual_tokens=0, usage_source="not_sent")
+                raise
+            try:
+                resp = requests.post(self.api_url, json=payload, headers=headers, timeout=timeout, allow_redirects=False)
             except requests.RequestException as exc:
                 record(ticket, status="transport_error", error_type=type(exc).__name__, stop_reason="transport_error_billing_unknown")
                 raise RerankStopped("Rerank transport failed; billing is unknown and automatic retries are disabled") from exc

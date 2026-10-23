@@ -65,11 +65,7 @@ class TestExtractFactSentences:
         assert out.startswith("阻抗控制")
 
     def test_respects_limit(self):
-        text = (
-            "镀金层厚度应不小于 0.05 μm。"
-            "镍层厚度应为 3~6 μm。"
-            "金层纯度必须达到 99.9%。"
-        )
+        text = "镀金层厚度应不小于 0.05 μm。镍层厚度应为 3~6 μm。金层纯度必须达到 99.9%。"
         out = extract_fact_sentences(text, limit=1)
         assert out.count(" / ") == 0
 

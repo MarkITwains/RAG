@@ -15,7 +15,7 @@ pytest.importorskip("llama_index.core")
 from llama_index.core.llms import CompletionResponse, CustomLLM  # noqa: E402
 from llama_index.core.schema import NodeWithScore, TextNode  # noqa: E402
 
-from pcb_rag import dify_external_api  # noqa: E402
+from pcb_rag.retrieval import RetrievalPipeline, PipelineConfig  # noqa: E402
 from pcb_rag.engine import (  # noqa: E402
     AnswerResult,
     Evidence,
@@ -49,7 +49,7 @@ def _node(
 
 def _ready_kb(**kwargs) -> KnowledgeBase:
     """构造一个"已就绪"的元件，底层状态用假对象占位。"""
-    kb = KnowledgeBase(auto_init=False, **kwargs)
+    kb = KnowledgeBase(auto_init=False, pipeline=RetrievalPipeline(PipelineConfig(graph_enabled=True)), **kwargs)
     kb._state = lambda: {  # type: ignore[method-assign]
         "index": object(),
         "bm25_index": object(),
@@ -90,7 +90,7 @@ SPEC_TEXT = "特性阻抗采用时域反射法测量，探头上升时间应不�
 
 class TestHealth:
     def test_reports_all_degraded_when_uninitialized(self):
-        kb = KnowledgeBase(auto_init=False)
+        kb = KnowledgeBase(auto_init=False, pipeline=RetrievalPipeline(PipelineConfig(graph_enabled=True)))
         kb._state = lambda: {}  # type: ignore[method-assign]
         health = kb.health()
         assert health["ready"] is False
@@ -107,9 +107,7 @@ class TestHealth:
 class TestRetrieve:
     def test_returns_structured_evidence(self, monkeypatch):
         kb = _ready_kb()
-        monkeypatch.setattr(
-            dify_external_api, "_retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)]
-        )
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
 
         result = kb.retrieve("阻抗怎么测", top_k=5)
 
@@ -136,7 +134,7 @@ class TestRetrieve:
         def boom(**kw):
             raise RuntimeError("Milvus 断开")
 
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", boom)
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", boom)
         result = kb.retrieve("任意问题")
 
         assert result.evidence == []
@@ -145,14 +143,20 @@ class TestRetrieve:
     def test_degraded_flags_propagate(self, monkeypatch):
         """图不可用要传到结果里，agent 才知道少了一路证据。"""
         kb = _ready_kb()
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
+        from pcb_rag.runtime import current_control
+
+        def retrieve(**kwargs):
+            current_control().degraded.append("graph_unavailable")
+            return [_node(SPEC_TEXT)]
+
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", retrieve)
 
         result = kb.retrieve("阻抗怎么测")
         assert "graph_unavailable" in result.degraded
 
     def test_full_text_omitted_when_disabled(self, monkeypatch):
         kb = _ready_kb(include_full_text=False)
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
 
         result = kb.retrieve("阻抗怎么测")
         ev = result.evidence[0]
@@ -167,7 +171,7 @@ class TestRetrieve:
             return []
 
         kb = _ready_kb()
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", fake)
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", fake)
         kb.retrieve("问题", top_k=7, score_threshold=0.3)
 
         assert captured["top_k"] == 7
@@ -177,7 +181,7 @@ class TestRetrieve:
         import json
 
         kb = _ready_kb()
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
         payload = kb.retrieve("阻抗怎么测").to_dict()
 
         json.dumps(payload, ensure_ascii=False)  # 不抛异常即通过
@@ -188,7 +192,7 @@ class TestRetrieve:
 class TestAnswer:
     def test_no_evidence_returns_explicit_message(self, monkeypatch):
         kb = _ready_kb()
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", lambda **kw: [])
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", lambda **kw: [])
 
         result = kb.answer("知识库里没有的问题")
         assert isinstance(result, AnswerResult)
@@ -197,7 +201,7 @@ class TestAnswer:
 
     def test_generation_failure_is_reported(self, monkeypatch):
         kb = _ready_kb()
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
 
         class BrokenLLM(_FakeLLM):
             def complete(self, prompt, **kwargs):
@@ -213,7 +217,7 @@ class TestAnswer:
 
     def test_answer_returns_citations(self, monkeypatch):
         kb = _ready_kb()
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
 
         import llama_index.core as li_core
 
@@ -300,7 +304,7 @@ class TestToolSpecs:
 
     def test_search_knowledge_dispatch_drops_context(self, monkeypatch):
         kb = _ready_kb()
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
 
         result = kb.call_tool("search_knowledge", {"query": "阻抗", "top_k": 3})
         assert result["evidence"]
@@ -314,7 +318,7 @@ class TestToolSpecs:
             return []
 
         kb = _ready_kb()
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", fake)
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", fake)
         kb.call_tool("search_knowledge", {"query": "x", "top_k": 999})
 
         assert captured["top_k"] == 30
@@ -325,7 +329,7 @@ class TestAsyncWrappers:
         import asyncio
 
         kb = _ready_kb()
-        monkeypatch.setattr(dify_external_api, "_retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
+        monkeypatch.setattr(kb.pipeline, "retrieve_nodes", lambda **kw: [_node(SPEC_TEXT)])
 
         result = asyncio.run(kb.aretrieve("阻抗怎么测"))
         assert len(result.evidence) == 1

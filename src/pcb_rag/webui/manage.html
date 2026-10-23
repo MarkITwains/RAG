@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PCB 知识库管理</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#182e36;background:#f5f7f8}body{max-width:1100px;margin:0 auto;padding:28px}
+h1{margin-bottom:8px}a{color:#19627b}label{display:block;margin:18px 0 8px}input,button{font:inherit;padding:10px;border:1px solid #b9c9cf;border-radius:6px}
+input{width:min(80%,460px)}button{background:#174c61;color:white;cursor:pointer;margin:8px 8px 8px 0}button:disabled{opacity:.45;cursor:default}
+section{background:white;padding:20px;margin:20px 0;border:1px solid #d5e0e4;border-radius:10px}pre{white-space:pre-wrap;overflow-wrap:anywhere}
+table{border-collapse:collapse;width:100%;text-align:left}th,td{border-bottom:1px solid #dde5e8;padding:10px;overflow-wrap:anywhere}
+.scroll{overflow:auto}#notice{min-height:24px;color:#8b351e}small{color:#49616b}details{margin:12px 0}
+</style>
+<h1>知识库管理</h1><p>查看文档处理进度、发布版本与失败阶段。<a href="/ui">返回问答</a></p>
+<label for="token">访问令牌</label><input id="token" type="password" autocomplete="off" placeholder="输入管理员 Bearer Token">
+<button id="refresh">刷新</button><p id="notice" role="status" aria-live="polite"></p>
+<section><h2>发布与处理状态</h2><pre id="overview">点击刷新读取状态。</pre>
+<button id="retry" disabled>重试未完成的入库</button><small>重试会继续原任务，已完成阶段会复用；源文件或处理配置变化时会停止。</small>
+<details><summary>阶段详情</summary><pre id="stages"></pre></details></section>
+<section><h2>文档</h2><p id="count"></p><div class="scroll"><table><thead><tr><th>来源</th><th>状态</th><th>版本</th><th>处理阶段</th></tr></thead><tbody id="docs"></tbody></table></div>
+<button id="previous" disabled>上一页</button><button id="next" disabled>下一页</button></section>
+<section><h2>图谱证据定位</h2><label for="entity">实体名称</label><input id="entity" placeholder="如：镀金层厚度"><button id="graph">查看来源</button><pre id="graphResult"></pre></section>
+<script>
+let offset=0;const $=id=>document.getElementById(id);
+async function request(path,method='GET'){
+ const response=await fetch(path,{method,headers:{Authorization:'Bearer '+$('token').value.trim()}});
+ const data=await response.json();if(!response.ok)throw Error(data.detail||('请求失败 '+response.status));return data;
+}
+async function refresh(){
+ $('notice').textContent='正在读取…';
+ try{const [state,list]=await Promise.all([request('/api/admin/status'),request('/api/admin/documents?offset='+offset+'&limit=50')]);
+ $('overview').textContent='当前集合：'+(state.collection||'旧版集合')+'\n已发布版本：'+state.revision+'\n文档数：'+state.documents+'\n待完成版本：'+(state.pending_revision||'无')+'\n后台任务：'+state.job.status;
+ $('stages').textContent=JSON.stringify({storage_revisions:state.storage_revisions,stages:state.stages},null,2);
+ $('retry').disabled=!state.retry_available||state.job.status==='running';$('docs').replaceChildren();
+ for(const doc of list.documents){const row=document.createElement('tr');for(const value of [doc.source_path,doc.status,doc.revision||'待发布',JSON.stringify(doc.stages)]){const cell=document.createElement('td');cell.textContent=value;row.append(cell)}$('docs').append(row)}
+ $('count').textContent='共 '+list.total+' 份，当前显示 '+list.documents.length+' 份';$('previous').disabled=offset===0;$('next').disabled=offset+50>=list.total;$('notice').textContent='状态已更新。';
+ }catch(error){$('notice').textContent=error.message}
+}
+$('refresh').onclick=()=>refresh();$('previous').onclick=()=>{offset=Math.max(0,offset-50);refresh()};$('next').onclick=()=>{offset+=50;refresh()};
+$('retry').onclick=async()=>{try{$('retry').disabled=true;await request('/api/admin/retry','POST');await refresh()}catch(error){$('notice').textContent=error.message}};
+$('graph').onclick=async()=>{try{$('graphResult').textContent=JSON.stringify(await request('/api/graph/neighbors?entity='+encodeURIComponent($('entity').value)),null,2)}catch(error){$('notice').textContent=error.message}};
+</script>
+</html>

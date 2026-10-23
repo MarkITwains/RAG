@@ -279,8 +279,7 @@ class TestFusionAndExpansion:
         fused = fuse_with_graph(base, graph_nodes, graph_weight=0.35)
         order = [item.node.text for item in fused]
         assert order[:3] == ["base0", "base1", "base2"], (
-            "主结果（RRF 分约 0.02）必须排在图表征（规则分约 1.0）之前，"
-            f"实际顺序: {order}"
+            f"主结果（RRF 分约 0.02）必须排在图表征（规则分约 1.0）之前，实际顺序: {order}"
         )
 
     def test_graph_only_nodes_are_marked_as_evidence(self):
@@ -338,8 +337,7 @@ class TestEntitySemantics:
     def test_type_is_normalized_from_llm_label(self):
         graph = KnowledgeGraph()
         graph.add_triple(
-            Triple(head="沉金", relation="属于", tail="表面处理",
-                   head_type="Process", tail_type="Concept")
+            Triple(head="沉金", relation="属于", tail="表面处理", head_type="Process", tail_type="Concept")
         )
         assert graph.nodes["沉金"].type == "process"
         assert graph.nodes["表面处理"].type == "concept"
@@ -351,26 +349,15 @@ class TestEntitySemantics:
 
     def test_unknown_type_falls_back_to_pattern(self):
         graph = KnowledgeGraph()
-        graph.add_triple(
-            Triple(head="GB/T 4677", relation="规定", tail="镀金层厚度", head_type="WeirdType")
-        )
+        graph.add_triple(Triple(head="GB/T 4677", relation="规定", tail="镀金层厚度", head_type="WeirdType"))
         # 类型无法识别时退回实体名模式匹配
         assert graph.nodes["GB/T 4677"].type == "standard"
 
     def test_descriptions_accumulate_without_duplicates(self):
         graph = KnowledgeGraph()
-        graph.add_triple(
-            Triple(head="镀金层厚度", relation="r", tail="A",
-                   head_desc="金层的最小厚度指标")
-        )
-        graph.add_triple(
-            Triple(head="镀金层厚度", relation="r2", tail="B",
-                   head_desc="金层的最小厚度指标")
-        )
-        graph.add_triple(
-            Triple(head="镀金层厚度", relation="r3", tail="C",
-                   head_desc="用于评估镀层耐蚀性")
-        )
+        graph.add_triple(Triple(head="镀金层厚度", relation="r", tail="A", head_desc="金层的最小厚度指标"))
+        graph.add_triple(Triple(head="镀金层厚度", relation="r2", tail="B", head_desc="金层的最小厚度指标"))
+        graph.add_triple(Triple(head="镀金层厚度", relation="r3", tail="C", head_desc="用于评估镀层耐蚀性"))
         desc = graph.nodes["镀金层厚度"].desc
         assert desc.count("最小厚度指标") == 1
         assert "耐蚀性" in desc
@@ -379,16 +366,14 @@ class TestEntitySemantics:
         graph = KnowledgeGraph()
         for i in range(20):
             graph.add_triple(
-                Triple(head="实体X", relation=f"r{i}", tail=f"T{i}",
-                       head_desc=f"这是第{i}条描述" + "补充" * 10)
+                Triple(head="实体X", relation=f"r{i}", tail=f"T{i}", head_desc=f"这是第{i}条描述" + "补充" * 10)
             )
         assert len(graph.nodes["实体X"].desc) <= 240
 
     def test_relation_description_accumulates(self):
         graph = KnowledgeGraph()
         graph.add_triple(
-            Triple(head="GB/T 4677", relation="规定", tail="镀金层厚度",
-                   relation_desc="规定了镀层厚度测试要求")
+            Triple(head="GB/T 4677", relation="规定", tail="镀金层厚度", relation_desc="规定了镀层厚度测试要求")
         )
         edge = graph.edges[("GB/T 4677", "规定", "镀金层厚度")]
         assert edge["rd"] == "规定了镀层厚度测试要求"
@@ -402,10 +387,16 @@ class TestEntitySemantics:
     def test_save_load_preserves_semantics(self, tmp_path):
         graph = KnowledgeGraph()
         graph.add_triple(
-            Triple(head="GB/T 4677", relation="规定", tail="镀金层厚度",
-                   head_type="Standard", head_desc="印制板测试方法国家标准",
-                   tail_type="Parameter", tail_desc="金层最小厚度指标",
-                   relation_desc="规定了镀层厚度测试要求")
+            Triple(
+                head="GB/T 4677",
+                relation="规定",
+                tail="镀金层厚度",
+                head_type="Standard",
+                head_desc="印制板测试方法国家标准",
+                tail_type="Parameter",
+                tail_desc="金层最小厚度指标",
+                relation_desc="规定了镀层厚度测试要求",
+            )
         )
         target = tmp_path / "kg.json"
         graph.save(str(target))
@@ -417,11 +408,11 @@ class TestEntitySemantics:
 
     def test_merge_keeps_descriptions(self):
         a = KnowledgeGraph()
-        a.add_triple(Triple(head="沉金", relation="适用于", tail="HDI板",
-                            head_desc="化学镀镍金工艺", head_type="Process"))
+        a.add_triple(
+            Triple(head="沉金", relation="适用于", tail="HDI板", head_desc="化学镀镍金工艺", head_type="Process")
+        )
         b = KnowledgeGraph()
-        b.add_triple(Triple(head="沉金", relation="属于", tail="表面处理",
-                            head_desc="一种表面处理方式"))
+        b.add_triple(Triple(head="沉金", relation="属于", tail="表面处理", head_desc="一种表面处理方式"))
         a.merge(b)
         assert a.nodes["沉金"].desc.startswith("化学镀镍金工艺")
         assert "表面处理" in a.nodes["沉金"].desc or "表面处理" in a.nodes
@@ -431,16 +422,29 @@ class TestNeighborhoodText:
     def _graph(self):
         graph = KnowledgeGraph()
         graph.add_triple(
-            Triple(head="GB/T 4677", relation="规定", tail="镀金层厚度",
-                   head_type="Standard", head_desc="印制板测试方法国家标准",
-                   tail_type="Parameter", tail_desc="金层最小厚度指标",
-                   relation_desc="规定了镀层厚度测试要求",
-                   evidence="镀金层厚度应不小于0.05μm", chunk_id="c1")
+            Triple(
+                head="GB/T 4677",
+                relation="规定",
+                tail="镀金层厚度",
+                head_type="Standard",
+                head_desc="印制板测试方法国家标准",
+                tail_type="Parameter",
+                tail_desc="金层最小厚度指标",
+                relation_desc="规定了镀层厚度测试要求",
+                evidence="镀金层厚度应不小于0.05μm",
+                chunk_id="c1",
+            )
         )
         graph.add_triple(
-            Triple(head="镀金层厚度", relation="测试方法为", tail="X射线荧光法",
-                   tail_type="Method", tail_desc="无损测厚方法",
-                   evidence="采用X射线荧光法测量", chunk_id="c2")
+            Triple(
+                head="镀金层厚度",
+                relation="测试方法为",
+                tail="X射线荧光法",
+                tail_type="Method",
+                tail_desc="无损测厚方法",
+                evidence="采用X射线荧光法测量",
+                chunk_id="c2",
+            )
         )
         return graph
 

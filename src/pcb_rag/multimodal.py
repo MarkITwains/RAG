@@ -36,10 +36,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import os
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
     "MULTIMODAL_ENABLED",

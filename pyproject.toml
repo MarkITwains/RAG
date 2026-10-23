@@ -10,26 +10,52 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-# 开发 / CI 依赖：只包含测试与静态检查所需，刻意不引入 requirements.txt 中的
-# 重型运行时依赖（torch、llama-index、pymilvus 等），保证 CI 轻量快速。
+# The runtime profile covers API models, ingestion, HTTP and Milvus clients.
+# Model weights and local torch rerankers remain separately installable.
+runtime = [
+    "llama-index-core>=0.14.25,<0.15",
+    "llama-index-vector-stores-milvus>=1.2,<2",
+    "llama-index-readers-file>=0.7,<0.8",
+    "llama-index-llms-openai-like>=0.8.1,<0.9",
+    "llama-index-embeddings-openai>=0.7,<0.8",
+    "pymilvus>=2.6.17,<2.7",
+    "fastapi>=0.150,<0.151",
+    "uvicorn[standard]>=0.54,<0.55",
+    "pydantic>=2.14,<3",
+    "httpx>=0.28,<0.29",
+    "requests>=2.34,<3",
+    "nest-asyncio>=1.6,<2",
+    "chardet>=5,<8",
+    "numpy>=1.26,<3",
+    "tqdm>=4.67,<5",
+    "jieba>=0.42.1,<0.43",
+    "pypdf>=6,<7",
+    "pymupdf>=1.28,<2",
+    "python-docx>=1.2,<2",
+]
+ollama = [
+    "llama-index-llms-ollama>=0.6,<1",
+    "llama-index-embeddings-ollama>=0.4,<1",
+]
+local_models = [
+    "torch>=2.4,<3",
+    "transformers>=4.45,<5",
+    "sentence-transformers>=3,<4",
+    "huggingface-hub>=0.25,<1",
+]
 dev = [
-    "pytest>=7.0",
-    "pytest-cov>=5.0",
-    "ruff>=0.6",
-    "chardet>=5.0",
+    "pytest>=8,<10",
+    "pytest-cov>=5,<8",
+    "ruff>=0.17.2,<0.18",
+    "build>=1.6,<2",
+    "chardet>=5,<8",
 ]
 
-# 「让关键回归测试真的跑起来」所需的最小依赖。
-#
-# 问题背景：`ACL 过滤合并`（security.merge_filters）是曾经出过真实权限 bug 的地方，
-# 它的回归测试用 pytest.importorskip("llama_index.core") 守卫 —— 没装依赖时
-# **静默跳过**，而 skipped 不会让流水线变红。"CI 全绿"于是可能意味着"这条测试根本没跑"。
-# 这里只装过滤器所需的最小集合（llama-index-core + Milvus 过滤器编译器），
-# 不涉及 torch / 模型权重 / Milvus 服务，安装量可控。
+# Compatibility extra for older setup commands. The full suite uses runtime.
 test_llama = [
-    "llama-index-core>=0.11",
-    "llama-index-vector-stores-milvus>=0.2",
-    "llama-index-embeddings-openai>=0.3",
+    "llama-index-core>=0.14.25,<0.15",
+    "llama-index-vector-stores-milvus>=1.2,<2",
+    "llama-index-embeddings-openai>=0.7,<0.8",
 ]
 
 [tool.setuptools]
@@ -55,14 +81,10 @@ target-version = "py310"
 select = ["E4", "E7", "E9", "F"]
 
 [tool.ruff.lint.per-file-ignores]
-# 存量模块的技术债豁免（新增文件不受影响），逐条清理后可删除对应项：
-#   E402：导入刻意位于 venv / proxy bootstrap 之后，属于设计需要
-#   F401 / F811：历史遗留的未使用导入与重复导入
-#   F541：历史遗留的无占位符 f-string
-#   F841：历史遗留的未使用局部变量
-#   F821：字符串类型注解引用了仅在函数内导入的 np / torch（运行时不求值，仅影响类型检查）
-"src/pcb_rag/*.py" = ["E402", "F401", "F811", "F541", "F841", "F821"]
-"eval/*.py" = ["F401"]
+# These entry points load the deployment environment before model imports.
+"src/pcb_rag/query.py" = ["E402"]
+"src/pcb_rag/ingest.py" = ["E402"]
+"src/pcb_rag/dify_external_api.py" = ["E402"]
 
 # ---------------------------------------------------------------------------
 # Pytest —— 单元测试（对应 Go 项目的 go test）
@@ -73,3 +95,4 @@ testpaths = ["tests"]
 # 让 src/ 与仓库根都可导入，使 pcb_rag 与 eval 两个包在未安装时也能被测试引用
 pythonpath = ["src", "."]
 addopts = "-ra --strict-markers --strict-config"
+markers = ["integration: requires an explicitly enabled local Milvus service"]

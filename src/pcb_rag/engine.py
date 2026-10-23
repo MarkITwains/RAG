@@ -1,35 +1,4 @@
-"""面向 Agent 的知识库元件。
-
-定位
-----
-本模块是**程序接口**，不是 HTTP 服务。两者分工：
-
-- :mod:`pcb_rag.dify_external_api` —— HTTP 层。FastAPI 端点、Dify 协议适配、
-  Bearer 鉴权、会话管理。
-- 本模块 —— 元件层。供自研 agent 直接 ``import`` 调用，返回结构化对象。
-
-二者共用同一套检索实现与同一个索引实例（``_app_state``），因此不会重复建索引、
-不会出现两份词法索引互相不一致。
-
-为什么返回值是 dataclass 而不是字符串
---------------------------------------
-agent 需要自己做决策：这条证据够不够、要不要再检索一轮、引用要不要展示给用户。
-把上下文拼成一个字符串交给 agent，等于把"是否足够"的判断锁死在元件内部。
-因此 :meth:`KnowledgeBase.retrieve` 返回逐条证据，``context`` 作为可选字段单独提供。
-
-``degraded`` 字段是刻意保留的：检索链路有多处降级（图缺失、精排失败、词法索引
-不可用），静默降级会让 agent 误以为"没有更多证据"，而实际是"某条路没跑起来"。
-
-与 HTTP 模块的耦合
-------------------
-本模块复用 ``dify_external_api`` 的 ``_app_state`` 与 ``_retrieve_nodes``，这是
-**过渡态而非终态**：检索编排有 400 余行（多路召回、融合、精排、chunk 扩展、图增强、
-权限复核），整体搬迁会在没有集成测试的环境里引入难以定位的回归。
-
-演进方向：把 ``_retrieve_nodes`` 及其依赖下沉到独立的 retrieval 层，``engine`` 与
-HTTP 层都只依赖那一层。届时本模块的 ``import`` 全部改为指向新的 retrieval 层，
-对外接口不变。
-"""
+"""Structured knowledge-base SDK backed by the independent retrieval pipeline."""
 
 from __future__ import annotations
 
@@ -88,12 +57,23 @@ class RetrievalResult:
     elapsed_ms: int = 0
     degraded: List[str] = field(default_factory=list)
 
+    revision: str = "legacy"
+    routes: Dict[str, str] = field(default_factory=dict)
+    timings: Dict[str, float] = field(default_factory=dict)
+    budget: Dict[str, Any] = field(default_factory=dict)
+    usage: List[Dict[str, Any]] = field(default_factory=list)
+
     @property
     def is_empty(self) -> bool:
         return not self.evidence
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "revision": self.revision,
+            "routes": self.routes,
+            "timings": self.timings,
+            "budget": self.budget,
+            "usage": self.usage,
             "query": self.query,
             "rewritten_query": self.rewritten_query,
             "evidence": [e.to_dict() for e in self.evidence],
@@ -115,8 +95,21 @@ class AnswerResult:
     elapsed_ms: int = 0
     degraded: List[str] = field(default_factory=list)
 
+    invalid_citations: List[int] = field(default_factory=list)
+    budget: Dict[str, Any] = field(default_factory=dict)
+    revision: str = "legacy"
+    routes: Dict[str, str] = field(default_factory=dict)
+    timings: Dict[str, float] = field(default_factory=dict)
+    usage: List[Dict[str, Any]] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "invalid_citations": self.invalid_citations,
+            "budget": self.budget,
+            "revision": self.revision,
+            "routes": self.routes,
+            "timings": self.timings,
+            "usage": self.usage,
             "query": self.query,
             "answer": self.answer,
             "evidence": [e.to_dict() for e in self.evidence],
@@ -170,6 +163,7 @@ class KnowledgeBase:
         auto_init: bool = True,
         include_full_text: bool = True,
         include_context: bool = False,
+        pipeline=None,
     ) -> None:
         """
         Args:
@@ -179,6 +173,9 @@ class KnowledgeBase:
             include_context: ``retrieve`` 是否同时返回拼装好的上下文。
                 只有当 agent 想把整块上下文直接喂给模型时才需要。
         """
+        from pcb_rag.retrieval import get_pipeline
+
+        self.pipeline = pipeline or get_pipeline()
         self.include_full_text = include_full_text
         self.include_context = include_context
         self._ready = False
@@ -191,12 +188,8 @@ class KnowledgeBase:
     def ready(self) -> bool:
         return self._ready and self._state_ready()
 
-    @staticmethod
-    def _state() -> Dict[str, Any]:
-        """取底层共享状态（延迟导入，避免在无 HTTP 需求的进程里拉起 FastAPI）。"""
-        from pcb_rag import dify_external_api as _api
-
-        return _api._app_state
+    def _state(self) -> Dict[str, Any]:
+        return self.pipeline.state
 
     def _state_ready(self) -> bool:
         try:
@@ -205,23 +198,12 @@ class KnowledgeBase:
             return False
 
     def ensure_ready(self) -> None:
-        """确保索引与模型已就绪。幂等。
-
-        若同进程内 HTTP 服务已初始化过，这里直接复用，不会重复建索引。
-        """
         if self.ready:
             return
-
         with self._init_lock:
-            if self.ready:
-                return
-
-            from pcb_rag import dify_external_api as _api
-
-            if "index" not in _api._app_state:
-                logger.info("[KB] 初始化检索组件（首次调用，耗时较长）")
-                _api._initialize_retrieval_engine()
-            self._ready = True
+            if not self.ready:
+                self.pipeline.initialize()
+                self._ready = True
 
     def health(self) -> Dict[str, Any]:
         """返回各组件就绪状态与降级原因。agent 可据此决定是否先提示用户。"""
@@ -230,7 +212,7 @@ class KnowledgeBase:
         except Exception as exc:
             return {"ready": False, "error": str(exc), "degraded": ["init_failed"]}
 
-        index_ok = "index" in state
+        index_ok = state.get("index") is not None
         bm25_ok = state.get("bm25_index") is not None
         rerank_ok = state.get("rerank") is not None
         graph_ok = state.get("graph") is not None
@@ -238,11 +220,11 @@ class KnowledgeBase:
         degraded: List[str] = []
         if not index_ok:
             degraded.append("vector_index_missing")
-        if not bm25_ok:
+        if self.pipeline.config.lexical_enabled and not bm25_ok:
             degraded.append("lexical_index_missing")
-        if not rerank_ok:
+        if self.pipeline.config.rerank_enabled and not rerank_ok:
             degraded.append("rerank_unavailable")
-        if not graph_ok:
+        if self.pipeline.config.graph_enabled and not graph_ok:
             degraded.append("graph_unavailable")
 
         return {
@@ -255,9 +237,6 @@ class KnowledgeBase:
             "degraded": degraded,
         }
 
-    def _collect_degraded(self) -> List[str]:
-        return list(self.health().get("degraded", []))
-
     # ---- 内部：NodeWithScore → Evidence --------------------------------
     def _to_evidence(self, item: Any, index: int) -> Optional[Evidence]:
         node = getattr(item, "node", item)
@@ -266,12 +245,7 @@ class KnowledgeBase:
         source_path = metadata.get("source_path", "") or ""
         source_name = Path(source_path).stem if source_path else ""
 
-        section = (
-            metadata.get("parent_title")
-            or metadata.get("chunk_section")
-            or metadata.get("section")
-            or ""
-        )
+        section = metadata.get("parent_title") or metadata.get("chunk_section") or metadata.get("section") or ""
 
         text = ""
         try:
@@ -307,68 +281,70 @@ class KnowledgeBase:
 
     # ---- 检索 -----------------------------------------------------------
     def retrieve(
-        self,
-        query: str,
-        *,
-        top_k: int = 10,
-        score_threshold: float = 0.0,
-        with_context: Optional[bool] = None,
+        self, query: str, *, top_k: int = 10, score_threshold: float = 0.0, with_context: Optional[bool] = None
     ) -> RetrievalResult:
-        """检索证据，不生成答案。
+        from pcb_rag.query import build_context_bundle
+        from pcb_rag.runtime import request_scope
 
-        Args:
-            query: 用户查询
-            top_k: 返回证据条数
-            score_threshold: 精排分数阈值，0 表示不过滤
-            with_context: 是否同时返回拼装好的上下文；默认取构造参数
-        """
-        started = time.time()
+        started = time.monotonic()
         if not query or not query.strip():
-            return RetrievalResult(query=query or "", elapsed_ms=0, degraded=["empty_query"])
-
+            return RetrievalResult(query=query or "", degraded=["empty_query"])
         self.ensure_ready()
-
-        from pcb_rag.dify_external_api import _retrieve_nodes
-
-        degraded = self._collect_degraded()
-
+        degraded: List[str] = []
+        want_context = self.include_context if with_context is None else bool(with_context)
         try:
-            nodes = _retrieve_nodes(
-                user_query=query.strip(),
-                top_k=int(top_k),
-                score_threshold=float(score_threshold),
-            )
+            with request_scope(self.pipeline.config.timeout) as control:
+                nodes = self.pipeline.retrieve_nodes(
+                    user_query=query.strip(), top_k=int(top_k), score_threshold=float(score_threshold)
+                )
+                bundle = build_context_bundle(nodes)
+                # Every SDK evidence index matches the optional prompt context.
+                evidence = self._bundle_evidence(bundle)
+                degraded.extend(control.degraded)
         except Exception as exc:
-            logger.exception("[KB] 检索失败")
             return RetrievalResult(
                 query=query,
-                elapsed_ms=int((time.time() - started) * 1000),
-                degraded=degraded + [f"retrieval_error:{exc}"],
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                revision=control.revision,
+                routes=dict(control.routes),
+                timings=dict(control.timings),
+                usage=list(control.usage),
+                degraded=list(dict.fromkeys(control.degraded + [f"retrieval_error:{exc}"])),
             )
-
-        evidence: List[Evidence] = []
-        for i, item in enumerate(nodes or [], 1):
-            ev = self._to_evidence(item, i)
-            if ev is not None:
-                evidence.append(ev)
-
-        want_context = self.include_context if with_context is None else bool(with_context)
-        context: Optional[str] = None
-        if want_context and nodes:
-            from pcb_rag.query import build_context_with_sources
-
-            try:
-                context, _ = build_context_with_sources(nodes)
-            except Exception as exc:
-                degraded.append(f"context_build_error:{exc}")
-
         return RetrievalResult(
             query=query,
             evidence=evidence,
-            context=context,
-            elapsed_ms=int((time.time() - started) * 1000),
-            degraded=degraded,
+            context=bundle.context if want_context else None,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            degraded=list(dict.fromkeys(degraded)),
+            revision=control.revision,
+            routes=dict(control.routes),
+            timings=dict(control.timings),
+            budget=bundle.budget,
+            usage=list(control.usage),
         )
+
+    def _bundle_evidence(self, bundle):
+        evidence = []
+        for row in bundle.entries:
+            metadata = row["metadata"]
+            evidence.append(
+                Evidence(
+                    index=row["index"],
+                    source_path=row["source_path"],
+                    source_name=row["source_name"],
+                    section=row["section"],
+                    chunk_id=row["chunk_id"],
+                    score=row["score"],
+                    tokens=row["tokens"],
+                    snippet=row["snippet"],
+                    text=row["text"] if self.include_full_text else "",
+                    truncated=row["truncated"],
+                    doc_type=str(metadata.get("doc_type", "")),
+                    source_type=str(metadata.get("source_type", "")),
+                )
+            )
+        return evidence
 
     def answer(
         self,
@@ -378,118 +354,75 @@ class KnowledgeBase:
         score_threshold: float = 0.0,
         history: Optional[Iterable[Dict[str, str]]] = None,
     ) -> AnswerResult:
-        """检索并生成答案，返回答案与引用。
+        from pcb_rag.conversation import generate_answer_with_history, rewrite_query_with_history
+        from pcb_rag.runtime import request_scope
 
-        Args:
-            history: 形如 ``[{"role": "user", "content": ...}, ...]`` 的对话历史。
-                元件本身不保存会话状态 —— 多轮上下文由 agent 自己管理并传入。
-        """
-        started = time.time()
+        started = time.monotonic()
         if not query or not query.strip():
             return AnswerResult(query=query or "", answer="", degraded=["empty_query"])
-
         self.ensure_ready()
-
-        from pcb_rag.dify_external_api import (
-            _MAX_HISTORY_TURNS,
-            _RAG_PROMPT_WITH_HISTORY,
-            _retrieve_nodes,
-            _rewrite_query_with_history,
-        )
-        from pcb_rag.query import RAG_PROMPT_TEMPLATE, build_context_with_sources, extract_citations
-
-        degraded = self._collect_degraded()
+        degraded: List[str] = []
         raw_query = query.strip()
-
-        history_list = [dict(m) for m in (history or [])]
-        search_query = raw_query
-        if history_list:
+        history = [dict(message) for message in history or []]
+        with request_scope(self.pipeline.config.timeout) as control:
             try:
-                search_query = _rewrite_query_with_history(raw_query, history_list)
+                search_query = (
+                    rewrite_query_with_history(raw_query, history, self.pipeline.llm) if history else raw_query
+                )
+                nodes = self.pipeline.retrieve_nodes(
+                    user_query=search_query, top_k=int(top_k), score_threshold=float(score_threshold)
+                )
             except Exception as exc:
-                degraded.append(f"query_rewrite_failed:{exc}")
-
-        try:
-            nodes = _retrieve_nodes(
-                user_query=search_query,
-                top_k=int(top_k),
-                score_threshold=float(score_threshold),
-            )
-        except Exception as exc:
-            logger.exception("[KB] 检索失败")
+                return AnswerResult(
+                    query=raw_query,
+                    answer="",
+                    revision=control.revision,
+                    routes=dict(control.routes),
+                    timings=dict(control.timings),
+                    usage=list(control.usage),
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    degraded=list(dict.fromkeys(control.degraded + [f"retrieval_error:{exc}"])),
+                )
+            if not nodes:
+                return AnswerResult(
+                    query=raw_query,
+                    answer="根据现有文档未检索到相关内容。",
+                    revision=control.revision,
+                    routes=dict(control.routes),
+                    timings=dict(control.timings),
+                    usage=list(control.usage),
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    degraded=list(dict.fromkeys(control.degraded + ["no_evidence"])),
+                )
+            try:
+                result = generate_answer_with_history(raw_query, nodes, history, self.pipeline.llm)
+                bundle = result["evidence_bundle"]
+            except Exception as exc:
+                return AnswerResult(
+                    query=raw_query,
+                    answer="",
+                    revision=control.revision,
+                    routes=dict(control.routes),
+                    timings=dict(control.timings),
+                    usage=list(control.usage),
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    degraded=list(dict.fromkeys(control.degraded + [f"generation_error:{exc}"])),
+                )
+            degraded.extend(control.degraded)
             return AnswerResult(
                 query=raw_query,
-                answer="",
-                elapsed_ms=int((time.time() - started) * 1000),
-                degraded=degraded + [f"retrieval_error:{exc}"],
+                answer=result["answer"],
+                evidence=self._bundle_evidence(bundle),
+                citations=result["citations"],
+                invalid_citations=result["invalid_citations"],
+                budget=bundle.budget,
+                revision=control.revision,
+                routes=dict(control.routes),
+                timings=dict(control.timings),
+                usage=list(control.usage),
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                degraded=list(dict.fromkeys(degraded)),
             )
-
-        evidence: List[Evidence] = []
-        for i, item in enumerate(nodes or [], 1):
-            ev = self._to_evidence(item, i)
-            if ev is not None:
-                evidence.append(ev)
-
-        if not nodes:
-            return AnswerResult(
-                query=raw_query,
-                answer="根据现有文档未检索到相关内容。",
-                evidence=[],
-                elapsed_ms=int((time.time() - started) * 1000),
-                degraded=degraded + ["no_evidence"],
-            )
-
-        context, _sources_info = build_context_with_sources(nodes)
-
-        if history_list:
-            recent = history_list[-_MAX_HISTORY_TURNS:]
-            lines = []
-            for msg in recent:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                if role == "user":
-                    lines.append(f"用户：{content}")
-                elif role == "assistant":
-                    truncated = content[:300] + "..." if len(content) > 300 else content
-                    lines.append(f"助手：{truncated}")
-            prompt = _RAG_PROMPT_WITH_HISTORY.format(
-                n=len(recent),
-                history="\n".join(lines),
-                context=context,
-                query=raw_query,
-            )
-        else:
-            prompt = RAG_PROMPT_TEMPLATE.format(context=context, query=raw_query)
-
-        from llama_index.core import Settings
-
-        try:
-            response = Settings.llm.complete(prompt)
-            answer = getattr(response, "text", None) or str(response)
-        except Exception as exc:
-            logger.exception("[KB] 生成失败")
-            return AnswerResult(
-                query=raw_query,
-                answer="",
-                evidence=evidence,
-                elapsed_ms=int((time.time() - started) * 1000),
-                degraded=degraded + [f"generation_error:{exc}"],
-            )
-
-        citations: List[Dict[str, Any]] = []
-        try:
-            citations = extract_citations(answer, nodes)
-        except Exception as exc:
-            degraded.append(f"citation_error:{exc}")
-
-        return AnswerResult(
-            query=raw_query,
-            answer=answer,
-            evidence=evidence,
-            citations=citations,
-            elapsed_ms=int((time.time() - started) * 1000),
-            degraded=degraded,
-        )
 
     # ---- 图 -------------------------------------------------------------
     def graph_neighbors(self, entity: str, *, max_edges: int = 12) -> GraphNeighborhood:
@@ -505,6 +438,24 @@ class KnowledgeBase:
         graph = state.get("graph")
         if graph is None:
             return GraphNeighborhood(entity=entity, found=False, degraded=["graph_unavailable"])
+
+        from pcb_rag import security
+
+        if security.ACL_ENABLED or state.get("active"):
+            from pcb_rag.graph_semantic import authorized_graph
+            from pcb_rag.runtime import request_scope, run_stage
+
+            try:
+                with request_scope(self.pipeline.config.timeout):
+                    graph = authorized_graph(
+                        graph,
+                        lambda ids: run_stage("graph_sources", self.pipeline._fetch, ids, state),
+                        lambda nodes: self.pipeline._allowed(nodes, state, parents=True),
+                    )
+            except Exception as exc:
+                return GraphNeighborhood(
+                    entity=entity, found=False, degraded=["graph_source_error:" + type(exc).__name__]
+                )
 
         from pcb_rag.graph_rag import build_neighborhood_text, normalize_entity
 
@@ -533,6 +484,13 @@ class KnowledgeBase:
                     "relation_description": edge.get("rd", ""),
                     "weight": float(edge.get("w", 0.0) or 0.0),
                     "evidence": edge.get("e", ""),
+                    "sources": [
+                        {
+                            key: source.get(key, "")
+                            for key in ("doc_id", "chunk_id", "revision", "source_path", "qualifiers")
+                        }
+                        for source in edge.get("contributions", [])
+                    ],
                 }
             )
 
@@ -669,14 +627,23 @@ class KnowledgeBase:
     # ---- 异步包装 --------------------------------------------------------
     async def aretrieve(self, query: str, **kwargs: Any) -> RetrievalResult:
         """``retrieve`` 的异步版本（检索是阻塞 IO，放到线程池执行）。"""
-        return await asyncio.to_thread(self.retrieve, query, **kwargs)
+        from pcb_rag.runtime import request_scope
+
+        with request_scope(self.pipeline.config.timeout) as control:
+            return await asyncio.wait_for(asyncio.to_thread(self.retrieve, query, **kwargs), control.remaining())
 
     async def aanswer(self, query: str, **kwargs: Any) -> AnswerResult:
         """``answer`` 的异步版本。"""
-        return await asyncio.to_thread(self.answer, query, **kwargs)
+        from pcb_rag.runtime import request_scope
+
+        with request_scope(self.pipeline.config.timeout) as control:
+            return await asyncio.wait_for(asyncio.to_thread(self.answer, query, **kwargs), control.remaining())
 
     async def acall_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return await asyncio.to_thread(self.call_tool, name, arguments)
+        from pcb_rag.runtime import request_scope
+
+        with request_scope(self.pipeline.config.timeout) as control:
+            return await asyncio.wait_for(asyncio.to_thread(self.call_tool, name, arguments), control.remaining())
 
 
 _default_kb: Optional[KnowledgeBase] = None

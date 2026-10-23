@@ -114,7 +114,7 @@ def main() -> int:
         print("数据集为空")
         return 1
 
-    print(f"[init] _initialize_retrieval_engine() ...", flush=True)
+    print("[init] _initialize_retrieval_engine() ...", flush=True)
     api._initialize_retrieval_engine()
 
     collector = _Collector()
@@ -164,7 +164,6 @@ def main() -> int:
         run_one(row)
     print(f"[done] {len(results)} 题耗时 {time.time() - t_start:.0f}s", flush=True)
 
-    n = max(len(results), 1)
     timing_keys: set[str] = set()
     for r in results:
         timing_keys.update(r["timing"])

@@ -9,6 +9,7 @@
   - Milvus 连通性
 """
 
+import argparse
 import json
 import os
 import sys
@@ -142,7 +143,45 @@ def check_milvus() -> bool:
         return True
 
 
-def main() -> int:
+def required_modules():
+    modules = [
+        "llama_index.core",
+        "llama_index.vector_stores.milvus",
+        "llama_index.readers.file",
+        "pymilvus",
+        "fastapi",
+        "pydantic",
+        "httpx",
+        "jieba",
+        "fitz",
+        "docx",
+    ]
+    modules.append(
+        "llama_index.llms.openai_like" if _env("LLM_BACKEND", "local").lower() == "api" else "llama_index.llms.ollama"
+    )
+    modules.append(
+        "llama_index.embeddings.openai"
+        if _env("EMBED_BACKEND", "local").lower() == "api"
+        else "llama_index.embeddings.ollama"
+    )
+    if _env("RERANK_ENABLED", "1").lower() not in {"0", "false"} and _env(
+        "RERANK_BACKEND", "qwen3reranker"
+    ).lower() not in {
+        "api",
+        "none",
+        "off",
+        "disabled",
+    }:
+        modules.extend(["torch", "transformers", "sentence_transformers"])
+    return modules
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dependencies-only", action="store_true", help="check imports without network or corpus access"
+    )
+    args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
     load_env(root / ".env")
 
@@ -153,22 +192,11 @@ def main() -> int:
     else:
         print(f"[OK] Python {sys.version.split()[0]}")
 
-    for module in [
-        "llama_index",
-        "pymilvus",
-        "fastapi",
-        "pydantic",
-        "jieba",
-    ]:
+    for module in required_modules():
         ok = check_import(module) and ok
 
-    # 按后端校验可选依赖
-    if _env("LLM_BACKEND", "local").lower() == "api" or _env("EMBED_BACKEND", "local").lower() == "api":
-        for module in ["llama_index.llms.openai_like", "llama_index.embeddings.openai"]:
-            check_import(module)
-    if _env("LLM_BACKEND", "local").lower() == "local" or _env("EMBED_BACKEND", "local").lower() == "local":
-        check_import("llama_index.llms.ollama")
-        check_import("llama_index.embeddings.ollama")
+    if args.dependencies_only:
+        return 0 if ok else 1
 
     if (root / ".env").exists():
         print("[OK] .env 存在")
@@ -183,10 +211,10 @@ def main() -> int:
         print(f"[FAIL] 数据目录不存在: {data_dir}")
         ok = False
 
-    check_llm()
-    check_embed()
-    check_rerank()
-    check_milvus()
+    ok = check_llm() and ok
+    ok = check_embed() and ok
+    ok = check_rerank() and ok
+    ok = check_milvus() and ok
 
     return 0 if ok else 1
 

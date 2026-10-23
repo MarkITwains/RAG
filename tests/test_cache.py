@@ -239,7 +239,7 @@ class TestScopeIsolation:
         cache_mod._unscoped_warned = False
         try:
             cache = SemanticCache()
-            cache.set("q", "v")           # 未传 scope
+            cache.set("q", "v")  # 未传 scope
             assert cache_mod._unscoped_warned is True
         finally:
             cache_mod._unscoped_warned = original

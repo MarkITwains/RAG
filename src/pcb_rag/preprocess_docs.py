@@ -14,9 +14,7 @@
 
 import os
 import re
-import sys
 import argparse
-import shutil
 from pathlib import Path
 from typing import Optional, Tuple, List
 
@@ -539,12 +537,12 @@ def print_summary(results: List[dict]):
     print(f"成功处理: {success}")
     print(f"处理失败: {total - success}")
     
-    print(f"\n📝 编码分布:")
+    print("\n📝 编码分布:")
     for enc, count in sorted(encoding_stats.items(), key=lambda x: -x[1]):
         print(f"  - {enc}: {count} 个文件")
     
     if high_garbage:
-        print(f"\n⚠️  高乱码率文件 (>10%):")
+        print("\n⚠️  高乱码率文件 (>10%):")
         for r in high_garbage[:10]:
             print(f"  - {Path(r['input']).name}: {r['garbage_ratio_before']:.1%}")
         if len(high_garbage) > 10:

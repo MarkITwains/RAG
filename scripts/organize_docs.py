@@ -3,7 +3,11 @@
 整理 data/clear_docs 与 data/nonFixed_docs -> data/pcb_docs_clean
 只读原目录，不删除、不修改任何原始文件。
 """
-import os, re, json, collections, shutil
+import os
+import re
+import json
+import collections
+import shutil
 
 ROOT = r"D:/myProject/rag_v1-main/rag_v1/data"
 OUT = os.path.join(ROOT, "pcb_docs_clean")

@@ -24,6 +24,16 @@ REQUIRE = os.getenv("REQUIRE_LLAMA_INDEX", "") not in {"", "0", "false", "False"
 REQUIRED_FOR_REGRESSION = [
     "llama_index.core",
     "llama_index.core.vector_stores.types",
+    "llama_index.vector_stores.milvus",
+    "llama_index.readers.file",
+    "llama_index.embeddings.openai",
+    "llama_index.llms.openai_like",
+    "fastapi",
+    "httpx",
+    "fitz",
+    "docx",
+    "pymilvus",
+    "jieba",
 ]
 
 
@@ -41,7 +51,7 @@ class TestRegressionDependencies:
         for name in REQUIRED_FOR_REGRESSION:
             assert _importable(name), (
                 f"{name} 缺失 → test_security.py::TestMergeFilters 会被 importorskip "
-                "静默跳过。请安装 `pip install -e '.[dev,test_llama]'`。"
+                "静默跳过。请安装 `pip install -e '.[dev,runtime]'`。"
             )
 
     def test_merge_filters_does_not_skip(self):

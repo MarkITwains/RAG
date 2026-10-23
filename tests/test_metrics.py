@@ -215,8 +215,8 @@ class TestJudgeFailureAccounting:
     def test_evaluate_case_overall_ignores_failures(self):
         """部分失败时，overall 只对有效分数求均值（不把失败当 0）。"""
         payloads = [
-            {"statements": [{"text": "a", "supported": True}]},   # faithfulness = 1.0
-            "不是 JSON",                                          # relevancy → None
+            {"statements": [{"text": "a", "supported": True}]},  # faithfulness = 1.0
+            "不是 JSON",  # relevancy → None
         ]
         result = evaluate_case(
             "问题", "回答", ["c1"], "参考答案", FakeLLM(*payloads), metrics=["faithfulness", "answer_relevancy"]

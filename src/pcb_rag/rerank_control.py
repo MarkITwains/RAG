@@ -166,6 +166,10 @@ class RerankControl:
         return state
 
     def check(self) -> None:
+        from pcb_rag.runtime import current_control
+        request = current_control()
+        if request:
+            request.remaining()
         with self.connect() as db:
             reason = db.execute("SELECT circuit_reason FROM budgets WHERE scope=?", (self.scope,)).fetchone()[0]
         if reason:
@@ -248,6 +252,7 @@ class RerankControl:
         return Ticket(request_id, scheduled, estimate)
 
     def wait(self, ticket: Ticket) -> None:
+        from pcb_rag.runtime import DeadlineExceeded
         try:
             while True:
                 self.check()
@@ -255,7 +260,7 @@ class RerankControl:
                 if remaining <= 0:
                     return
                 time.sleep(min(remaining, 0.25))
-        except RerankStopped:
+        except (RerankStopped, DeadlineExceeded):
             self.finish(ticket, status="cancelled", actual_tokens=0, usage_source="not_sent")
             raise
 

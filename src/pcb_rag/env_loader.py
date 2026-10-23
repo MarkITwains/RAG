@@ -53,6 +53,8 @@ def load_project_env(path: Optional[Union[str, Path]] = None) -> int:
         path: 显式指定的 ``.env`` 路径；默认使用仓库根目录下的 ``.env``。
     """
 
+    if path is None and os.getenv("PCB_RAG_LOAD_DOTENV", "1").lower() in {"0", "false", "no"}:
+        return 0
     env_path = Path(path) if path is not None else project_root() / ".env"
     if not env_path.is_file():
         return 0
