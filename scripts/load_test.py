@@ -15,6 +15,7 @@ import argparse
 import json
 import random
 import os
+import sys
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +24,10 @@ from pathlib import Path
 import requests
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from pcb_rag.env_loader import load_project_env  # noqa: E402
+
+load_project_env()
 
 
 def _pctl(vals, p):
@@ -32,7 +37,7 @@ def _pctl(vals, p):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default=f"http://127.0.0.1:{os.getenv('API_PORT', '8000')}")
     ap.add_argument("--endpoint", choices=["retrieval", "ask"], required=True)
     ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument("--total", type=int, default=60)

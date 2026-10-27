@@ -22,6 +22,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from pcb_rag.env_loader import load_project_env  # noqa: E402
+
+load_project_env()
 sys.path.insert(0, str(ROOT))
 from scripts.experiment_common import (  # noqa: E402
     assert_frozen_inputs,
@@ -185,6 +189,7 @@ def apply_switch(config: dict, previous: Path, run: Path, parallel: int, probe: 
             formal_started_at=now(),
             status="ready",
             private_env_path=str(private_env),
+            private_env_sha256=digest(private_env),
             env=public_config(frozen),
             protocol_sha256=digest(ROOT / "TestRule.md"),
             max_parallel_steps=parallel,

@@ -1,6 +1,8 @@
 """Reproducible experiment records must preserve failures and provenance."""
 
-from scripts.experiment_common import percentile, public_config, summarize_retrieval
+import pytest
+
+from scripts.experiment_common import digest, percentile, public_config, summarize_retrieval
 from scripts.experiment_aux import parallel_judge
 
 
@@ -17,6 +19,43 @@ def test_public_configuration_keeps_token_limits_but_not_secrets():
         }
     )
     assert result == {"COLLECTION": "frozen", "LLM_MAX_TOKENS": "8192", "LLM_MODEL": "test"}
+
+
+def test_bm25_parameters_are_recorded_in_experiment_provenance():
+    result = public_config({"BM25_K1": "2.4", "BM25_B": "0.35"})
+
+    assert result == {"BM25_K1": "2.4", "BM25_B": "0.35"}
+
+
+def test_experiment_provenance_covers_effective_config_families_without_secrets():
+    result = public_config(
+        {
+            "OLLAMA_TIMEOUT": "300",
+            "HF_RERANK_MODEL": "model",
+            "COMPRESSION_BUDGET_CHARS": "12000",
+            "CONTEXT_DEDUPE_THRESHOLD": "0.85",
+            "MULTIMODAL_VLM_MODEL": "vision",
+            "TABLE_MIN_ROWS": "2",
+            "STEPBACK_ROUTE_WEIGHT": "0.7",
+            "DECOMPOSE_MAX_SUB_QUERIES": "3",
+            "CITATION_ENABLED": "1",
+            "MULTIMODAL_VLM_API_KEY": "secret",
+            "DIFY_API_TOKEN": "secret",
+            "UNRELATED_HOST_SETTING": "do-not-record",
+        }
+    )
+
+    assert "MULTIMODAL_VLM_API_KEY" not in result and "DIFY_API_TOKEN" not in result
+    assert "UNRELATED_HOST_SETTING" not in result
+    assert result["OLLAMA_TIMEOUT"] == "300"
+    assert result["HF_RERANK_MODEL"] == "model"
+    assert result["COMPRESSION_BUDGET_CHARS"] == "12000"
+    assert result["CONTEXT_DEDUPE_THRESHOLD"] == "0.85"
+    assert result["MULTIMODAL_VLM_MODEL"] == "vision"
+    assert result["TABLE_MIN_ROWS"] == "2"
+    assert result["STEPBACK_ROUTE_WEIGHT"] == "0.7"
+    assert result["DECOMPOSE_MAX_SUB_QUERIES"] == "3"
+    assert result["CITATION_ENABLED"] == "1"
 
 
 def record(rank, wall, error=None, fallback=0):
@@ -143,6 +182,35 @@ def test_frozen_workers_do_not_fall_back_to_production_dotenv(monkeypatch):
     assert calls == ["explicit.env"]
 
 
+def test_frozen_base_env_does_not_inherit_unfrozen_project_settings(monkeypatch):
+    from scripts.experiment_queue import frozen_base_env
+
+    monkeypatch.setenv("RECALL_TOP_K", "999")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid")
+
+    env = frozen_base_env({"LLM_MODEL": "frozen"})
+
+    assert env["LLM_MODEL"] == "frozen"
+    assert "RECALL_TOP_K" not in env
+    assert env["PATH"] == "/usr/bin"
+    assert env["HTTPS_PROXY"] == "http://proxy.invalid"
+
+
+def test_frozen_env_digest_is_required_on_resume(tmp_path):
+    from scripts.experiment_common import digest
+    from scripts.experiment_queue import load_frozen_env
+
+    path = tmp_path / "private.json"
+    path.write_text('{"LLM_MODEL":"frozen"}', encoding="utf-8")
+    expected = digest(path)
+    assert load_frozen_env(path, expected)["LLM_MODEL"] == "frozen"
+    with pytest.raises(RuntimeError, match="environment"):
+        load_frozen_env(path, "different")
+    with pytest.raises(RuntimeError, match="digest"):
+        load_frozen_env(path, None)
+
+
 def test_parallel_scheduler_limits_capacity_and_keeps_timing_stages_exclusive():
     from scripts.experiment_queue import can_start
 
@@ -209,6 +277,7 @@ def test_queue_runs_three_workers_together_then_an_exclusive_worker(tmp_path):
             "run_id": "scheduler-integration",
             "status": "ready",
             "private_env_path": str(private),
+            "private_env_sha256": digest(private),
             "max_parallel_steps": 3,
             "plan_complete": True,
             "steps": steps,
@@ -268,6 +337,7 @@ def test_queue_halts_all_workers_when_the_shared_rerank_circuit_opens(tmp_path):
             "run_id": "halt-integration",
             "status": "ready",
             "private_env_path": str(private),
+            "private_env_sha256": digest(private),
             "max_parallel_steps": 3,
             "plan_complete": True,
             "steps": [

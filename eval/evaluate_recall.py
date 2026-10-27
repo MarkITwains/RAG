@@ -979,6 +979,7 @@ class _RRFRetriever:
         use_union: bool = False,
         num_queries: int = 1,
         fusion_mode: str = "rrf",
+        rrf_k: int = 60,
     ):
         self._vector = vector_retriever
         self._bm25 = bm25_retriever
@@ -987,6 +988,7 @@ class _RRFRetriever:
         self._use_union = bool(use_union)
         self._num_queries = max(1, int(num_queries))
         self._fusion_mode = str(fusion_mode)
+        self._rrf_k = int(rrf_k)
 
     def retrieve(self, query: str) -> list[Any]:
         queries = _build_query_variants(query, self._num_queries)
@@ -1012,7 +1014,7 @@ class _RRFRetriever:
             except Exception:
                 weights = (0.5, 0.5)
             return _score_fuse(vec_nodes, bm25_nodes, topn=self._topn, weights=weights, allowed_ids=allowed_ids)
-        return _rrf_fuse(vec_nodes, bm25_nodes, topn=self._topn, allowed_ids=allowed_ids)
+        return _rrf_fuse(vec_nodes, bm25_nodes, topn=self._topn, k=self._rrf_k, allowed_ids=allowed_ids)
 
 
 class _ScoreFusionRetriever:
@@ -1044,6 +1046,7 @@ class _FusionEnhancedRetriever:
         use_hyde: bool = True,
         use_query2doc: bool = False,
         llm=None,
+        rrf_k: int | None = None,
     ):
         self._vector = vector_retriever
         self._bm25 = bm25_retriever
@@ -1052,6 +1055,7 @@ class _FusionEnhancedRetriever:
         self._use_hyde = bool(use_hyde)
         self._use_query2doc = bool(use_query2doc)
         self._llm = llm
+        self._rrf_k = rrf_k
 
     def retrieve(self, query: str) -> list[Any]:
         # 向量侧：原始查询 + HyDE 增强查询（两路）
@@ -1089,7 +1093,7 @@ class _FusionEnhancedRetriever:
             vec_weight, bm25_weight = (1.0, 1.0)
         hyde_scale = float(getattr(rag_query, "HYDE_ROUTE_WEIGHT", 0.7))
         hyde_weight = vec_weight * hyde_scale
-        rrf_k = int(getattr(rag_query, "FUSION_RRF_K", 60))
+        rrf_k = self._rrf_k if self._rrf_k is not None else int(getattr(rag_query, "FUSION_RRF_K", 60))
 
         use_hyde_route = bool(self._use_hyde and vec_query and vec_query != query)
         if use_hyde_route:
@@ -1455,6 +1459,7 @@ def _build_retriever(
             use_union=False,
             num_queries=1,
             fusion_mode="rrf",
+            rrf_k=rrf_k,
         )
 
     if mode == "union_rrf":
@@ -1486,6 +1491,7 @@ def _build_retriever(
             use_hyde=True,
             use_query2doc=False,
             llm=llm,
+            rrf_k=rrf_k,
         )
 
     # 向后兼容旧模式名
@@ -1500,6 +1506,7 @@ def _build_retriever(
             use_hyde=True,
             use_query2doc=False,
             llm=llm,
+            rrf_k=rrf_k,
         )
 
     # fusion / fusion_rerank / fusion_expand
@@ -1508,12 +1515,14 @@ def _build_retriever(
         num_q = max(3, int(getattr(rag_query, "FUSION_NUM_QUERIES", 3)))
     else:
         num_q = 3
-    return rag_query.QueryFusionRetriever(
-        retrievers=[vector_retriever, lexical_retriever],
-        similarity_top_k=recall_k,
+    return _RRFRetriever(
+        vector_retriever,
+        lexical_retriever,
+        recall_k,
+        topn=recall_k,
         num_queries=num_q,
-        mode=rag_query.FUSION_MODES.RECIPROCAL_RANK,
-        use_async=False,
+        fusion_mode="rrf",
+        rrf_k=rrf_k,
     )
 
 
@@ -1996,7 +2005,7 @@ def main() -> int:
     ap.add_argument("--chunk-expand", action="store_true", help="Enable chunk context expansion (neighbors + parent)")
     # Phase 3.1 新增参数
     ap.add_argument("--colbert-candidates", type=int, default=50, help="ColBERT rerank candidate count")
-    ap.add_argument("--rrf-k", type=int, default=60, help="RRF fusion smoothing parameter k")
+    ap.add_argument("--rrf-k", type=int, default=int(os.getenv("FUSION_RRF_K", "60")), help="RRF fusion smoothing parameter k")
     # Phase 3.3 新增参数
     ap.add_argument("--use-hyde", action="store_true", help="Enable HyDE query enhancement (for multipath modes)")
     ap.add_argument("--use-query2doc", action="store_true", help="Enable Query2Doc enhancement (for multipath modes)")

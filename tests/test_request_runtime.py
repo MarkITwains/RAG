@@ -47,6 +47,30 @@ def test_nested_stages_share_control_and_do_not_deadlock():
         assert run_stage("outer", lambda: run_stage("inner", lambda: current_control() is control))
 
 
+def test_llm_transport_timeout_is_capped_by_client_and_request_deadline():
+    from pcb_rag.usage import _call_options
+
+    class LLM:
+        timeout = 12.0
+        __module__ = "llama_index.llms.openai.base"
+
+    with request_scope(30):
+        assert _call_options(LLM(), "query", {})["timeout"] <= 12.0
+    with request_scope(0.01):
+        assert _call_options(LLM(), "query", {})["timeout"] <= 0.01
+
+
+def test_explicit_llm_timeout_is_not_replaced_by_request_deadline():
+    from pcb_rag.usage import _call_options
+
+    class LLM:
+        timeout = 12.0
+        __module__ = "llama_index.llms.openai.base"
+
+    with request_scope(30):
+        assert _call_options(LLM(), "query", {"timeout": 4.0})["timeout"] == 4.0
+
+
 def test_model_budget_is_enforced_before_transport_and_actual_usage_is_distinct(tmp_path, monkeypatch):
     monkeypatch.setenv("RAG_MAX_MODEL_CALLS", "1")
     monkeypatch.setenv("RAG_USAGE_LEDGER", str(tmp_path / "usage.jsonl"))

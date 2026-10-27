@@ -33,7 +33,9 @@ from typing import Any, Optional, Sequence
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
-SEMANTIC_CACHE_ENABLED = os.getenv("SEMANTIC_CACHE_ENABLED", "1") not in {"0", "false", "False"}
+from pcb_rag.config import env_bool
+
+SEMANTIC_CACHE_ENABLED = env_bool("SEMANTIC_CACHE_ENABLED", True)
 SEMANTIC_CACHE_MAX_SIZE = int(os.getenv("SEMANTIC_CACHE_MAX_SIZE", "512"))
 SEMANTIC_CACHE_TTL_SECONDS = int(os.getenv("SEMANTIC_CACHE_TTL_SECONDS", "3600"))
 SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.95"))
@@ -185,12 +187,12 @@ class SemanticCache:
                 best_key: Optional[str] = None
                 best_score = 0.0
                 for k in reversed(self._store.keys()):
-                    probe += 1
-                    if probe > SEMANTIC_CACHE_MAX_PROBE:
-                        break
                     cand = self._store[k]
                     if cand.scope != scope or cand.embedding is None:
                         continue
+                    probe += 1
+                    if probe > SEMANTIC_CACHE_MAX_PROBE:
+                        break
                     score = cosine_similarity(embedding, cand.embedding)
                     if score > best_score:
                         best_score = score

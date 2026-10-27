@@ -4,7 +4,8 @@
 #       必须用新供应商重嵌入；块文本/node id 不变（内容派生），回归集继续有效。
 set -uo pipefail
 cd /root/rag_v1
-set -a; source .env.eval; set +a
+source scripts/env_defaults.sh
+pcb_rag_load_env_defaults .env.eval
 export PYTHONUNBUFFERED=1
 mkdir -p logs eval/reports
 
@@ -19,17 +20,23 @@ grep -E "Ingest done" "logs/reingest_${TS}.log" | tail -1
 echo "==== [2/3] 校验：row_count 与维度 ===="
 OK=$(.venv/bin/python - <<'PYEOF'
 import os
+from pathlib import Path
 from pymilvus import MilvusClient
+from pcb_rag.revisions import RevisionStore, state_path
 c = MilvusClient(uri=os.getenv("MILVUS_URI", "http://127.0.0.1:19530"))
-c.flush("pcb_kb")
-n = c.get_collection_stats("pcb_kb").get("row_count")
-d = c.describe_collection("pcb_kb")["fields"]
-dim = next((f["params"].get("dim") for f in d if f["name"] == "embedding"), None)
-print("1" if int(n or 0) == 5680 and int(dim or 0) == 2048 else "0")
+collection = os.environ["COLLECTION"]
+field = os.getenv("MILVUS_EMBEDDING_FIELD", "embedding")
+c.flush(collection)
+n = c.get_collection_stats(collection).get("row_count")
+d = c.describe_collection(collection)["fields"]
+dim = next((f["params"].get("dim") for f in d if f["name"] == field), None)
+active = RevisionStore(state_path(collection)).read().get("active", {})
+expected = sum(1 for line in Path(active["artifacts"]["chunks"]).open(encoding="utf-8") if line.strip())
+print("1" if int(n or 0) == expected and int(dim or 0) == int(os.environ["EMBED_DIM"]) else "0")
 PYEOF
 )
 [ "$OK" = "1" ] || { echo "  ✗ 校验失败（条数/维度不符），中止"; exit 1; }
-echo "  ✓ 5680 chunks / dim 2048"
+echo "  ✓ chunks 与当前发布快照一致 / dim 与 EMBED_DIM 一致"
 
 echo "==== [3/3] 重跑第 1 组基线（两条路径） ===="
 bash scripts/run_r1_baseline.sh

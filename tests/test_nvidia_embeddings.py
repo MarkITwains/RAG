@@ -73,6 +73,30 @@ def test_modes_reach_http_body_for_all_paths(kind, is_async):
     assert model.additional_kwargs == {}
 
 
+def test_async_embedding_retries_retryable_failures(monkeypatch):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503, json={"error": "temporary"})
+        return responder(request)
+
+    model = make_model(handler)
+    sleeps = []
+    monkeypatch.setattr("asyncio.sleep", lambda seconds: _async_sleep(sleeps, seconds))
+
+    result = asyncio.run(model.aget_query_embedding("query"))
+
+    assert result
+    assert len(calls) == 2
+    assert sleeps == [1.5]
+
+
+async def _async_sleep(records, seconds):
+    records.append(seconds)
+
+
 def test_concurrent_query_and_document_modes_do_not_leak():
     model = make_model(responder)
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -110,6 +134,52 @@ def test_factory_automatically_selects_nvidia_for_official_host(monkeypatch):
     monkeypatch.setattr(api_clients, "EMBED_MODEL", "nvidia/test-embedding")
     monkeypatch.setattr(api_clients, "EMBED_API_PROVIDER", "auto")
     assert isinstance(api_clients.build_embed_model(backend="api"), NvidiaApiEmbedding)
+
+
+def test_configured_dimension_is_sent_as_a_real_request_parameter():
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return responder(request)
+
+    make_model(handler).get_query_embedding("q")
+    assert bodies[0]["dimensions"] == 2
+
+
+def test_native_dimension_is_requested_without_dimensions():
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return responder(request)
+
+    model = NvidiaApiEmbedding(
+        model_name="nvidia/test-embedding",
+        api_base="https://embedding.invalid/v1",
+        api_key="test-key",
+        expected_dimension=0,
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    model.get_query_embedding("q")
+    assert "dimensions" not in bodies[0]
+
+
+def test_factory_rejects_unsupported_truncate_and_dimensions(monkeypatch):
+    monkeypatch.setattr(api_clients, "EMBED_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    monkeypatch.setattr(api_clients, "EMBED_MODEL", "nvidia/nemotron-3.5-embed-8b")
+    monkeypatch.setattr(api_clients, "EMBED_API_PROVIDER", "nvidia")
+
+    monkeypatch.setattr(api_clients, "EMBED_TRUNCATE", "START")
+    monkeypatch.setattr(api_clients, "EMBED_DIM", 4096)
+    with pytest.raises(ValueError, match="END or NONE"):
+        api_clients.build_embed_model(backend="api")
+
+    monkeypatch.setattr(api_clients, "EMBED_TRUNCATE", "END")
+    monkeypatch.setattr(api_clients, "EMBED_DIM", 4097)
+    with pytest.raises(ValueError, match="4096"):
+        api_clients.build_embed_model(backend="api")
 
 
 def test_factory_leaves_other_openai_compatible_providers_unchanged(monkeypatch):

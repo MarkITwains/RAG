@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """Re-embed existing Milvus rows into a separate profiled NVIDIA collection.
 
-Keeps IDs, text, dynamic metadata, source vectors and production settings intact.
-Checkpoints permit resuming after an API failure. Reports paired, unfiltered
-vector recall on the frozen regression dataset; it does not change production.
+Keeps IDs, text, dynamic metadata and source vectors intact while the embedding
+model, and its dimension, change. Checkpoints permit resuming after an API
+failure. A paired vector-recall comparison is reported only when the source and
+target dimensions match; across dimensions only the target baseline is written.
 """
 
 from __future__ import annotations
@@ -117,13 +118,16 @@ def main() -> int:
     source_info = client.describe_collection(args.source)
     vector_field = os.getenv("MILVUS_EMBEDDING_FIELD", "embedding")
     source_dim = next(int(field["params"]["dim"]) for field in source_info["fields"] if field["name"] == vector_field)
-    if source_dim != EMBED_DIM:
-        raise RuntimeError("Configured dimensions differ from the source collection")
-    profile = get_embedding_profile(source_dim)
-    if profile["provider"] != "nvidia":
-        raise RuntimeError("This migration requires the NVIDIA query/passage adapter")
     model = build_embed_model(backend="api")
     model.embed_batch_size = args.batch_size
+    # 目标维度由 EMBED_DIM 决定，允许与源集合不同：换 embedding 模型时维度往往一起变，
+    # 强行要求相等会让"只替换向量、保留 id/正文/图谱"这条迁移路径失效。
+    target_dim = EMBED_DIM if EMBED_DIM > 0 else len(model.get_query_embedding("dimension probe"))
+    if target_dim < 1:
+        raise RuntimeError("Could not determine the target embedding dimension")
+    profile = get_embedding_profile(target_dim)
+    if profile["provider"] != "nvidia":
+        raise RuntimeError("This migration requires the NVIDIA query/passage adapter")
     rows = read_rows(client, args.source)
     if not rows:
         raise RuntimeError("Source collection is empty")
@@ -160,7 +164,7 @@ def main() -> int:
             if "max_length" in params:
                 params["max_length"] = int(params["max_length"])
             if "dim" in params:
-                params["dim"] = int(params["dim"])
+                params["dim"] = target_dim
             schema.add_field(
                 field_name=field["name"],
                 datatype=DataType(field["type"]),
@@ -177,9 +181,9 @@ def main() -> int:
     if state["completed"] and not vector_path.exists():
         raise RuntimeError("Checkpoint vectors are missing")
     vectors = np.lib.format.open_memmap(
-        vector_path, mode="r+" if vector_path.exists() else "w+", dtype="float32", shape=(len(rows), source_dim)
+        vector_path, mode="r+" if vector_path.exists() else "w+", dtype="float32", shape=(len(rows), target_dim)
     )
-    if vectors.shape != (len(rows), source_dim) or not 0 <= state["completed"] <= len(rows):
+    if vectors.shape != (len(rows), target_dim) or not 0 <= state["completed"] <= len(rows):
         raise RuntimeError("Checkpoint shape or completed count is invalid")
     start_time = time.monotonic()
     previous_request = 0.0
@@ -209,7 +213,7 @@ def main() -> int:
         raise RuntimeError("Source corpus changed during the migration")
     print("[verified] source and target IDs, text, metadata match exactly", flush=True)
 
-    legacy = OpenAIEmbedding(model_name=EMBED_MODEL, api_base=EMBED_BASE_URL, api_key=EMBED_API_KEY)
+    same_space = target_dim == source_dim
     query_path = checkpoint / "queries.json"
     questions = [row["query"] for row in dataset]
     question_hash = hashlib.sha256(json.dumps(questions, ensure_ascii=False).encode()).hexdigest()
@@ -217,46 +221,72 @@ def main() -> int:
         query_cache = json.loads(query_path.read_text(encoding="utf-8"))
         if query_cache["question_sha256"] != question_hash:
             raise RuntimeError("Query checkpoint belongs to a different regression dataset")
+        if same_space and "legacy" not in query_cache:
+            raise RuntimeError("Query checkpoint lacks the legacy vectors required for a paired comparison")
     else:
-        legacy_queries, fixed_queries = [], []
+        legacy = OpenAIEmbedding(model_name=EMBED_MODEL, api_base=EMBED_BASE_URL, api_key=EMBED_API_KEY)
+        legacy_queries = [] if same_space else None
+        fixed_queries = []
         for start in range(0, len(questions), args.batch_size):
             batch = questions[start : start + args.batch_size]
-            legacy_queries.extend(legacy._get_text_embeddings(batch))
-            time.sleep(args.min_interval)
+            if legacy_queries is not None:
+                legacy_queries.extend(legacy._get_text_embeddings(batch))
+                time.sleep(args.min_interval)
             fixed_queries.extend(model._embed(batch, "query"))
             time.sleep(args.min_interval)
-        query_cache = {"question_sha256": question_hash, "legacy": legacy_queries, "fixed": fixed_queries}
+        query_cache = {"question_sha256": question_hash, "fixed": fixed_queries}
+        if legacy_queries is not None:
+            query_cache["legacy"] = legacy_queries
         write_json(query_path, query_cache)
-    old_vectors = np.asarray([row[vector_field] for row in rows], dtype=np.float32)
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": args.source,
         "target": args.target,
         "rows": len(rows),
-        "dimensions": source_dim,
+        "dimensions": {"source": source_dim, "target": target_dim},
         "source_sha256": corpus_hash,
         "profile": profile,
         "profile_sha256": profile_digest(profile),
         "dataset": str(Path(args.dataset).name),
         "dataset_sha256": hashlib.sha256(Path(args.dataset).read_bytes()).hexdigest(),
-        "evaluation_scope": "paired exact IP vector ranking; no metadata filters, reranker, query rewriting, or HyDE",
-        "before": evaluate(old_vectors, query_cache["legacy"], ids, dataset),
-        "query_only": evaluate(old_vectors, query_cache["fixed"], ids, dataset),
         "after": evaluate(vectors, query_cache["fixed"], ids, dataset),
     }
-    before = report["before"]["summary"]["mrr@20"]
-    after = report["after"]["summary"]["mrr@20"]
-    report["delta_mrr@20"] = round(after - before, 6)
-    report["candidate_improved"] = after > before
+    if same_space:
+        old_vectors = np.asarray([row[vector_field] for row in rows], dtype=np.float32)
+        report["evaluation_scope"] = (
+            "paired exact IP vector ranking; no metadata filters, reranker, query rewriting, or HyDE"
+        )
+        report["before"] = evaluate(old_vectors, query_cache["legacy"], ids, dataset)
+        report["query_only"] = evaluate(old_vectors, query_cache["fixed"], ids, dataset)
+        before = report["before"]["summary"]["mrr@20"]
+        after = report["after"]["summary"]["mrr@20"]
+        report["delta_mrr@20"] = round(after - before, 6)
+        report["candidate_improved"] = after > before
+    else:
+        # 维度不同即向量空间不同，跨空间点积没有意义，只留目标侧基线供后续对比。
+        report["evaluation_scope"] = (
+            f"target-only exact IP vector ranking; source and target dimensions differ "
+            f"({source_dim} -> {target_dim}), so no paired baseline is computed"
+        )
     write_json(Path(args.report), report)
     state["verified"] = True
     state["report"] = str(Path(args.report))
     write_json(state_path, state)
     print(
-        json.dumps({key: report[key]["summary"] for key in ["before", "query_only", "after"]}, ensure_ascii=False),
+        json.dumps(
+            {key: report[key]["summary"] for key in ["before", "query_only", "after"] if key in report},
+            ensure_ascii=False,
+        ),
         flush=True,
     )
-    print(f"[done] delta_mrr@20={report['delta_mrr@20']:+.6f}; production settings unchanged", flush=True)
+    if "delta_mrr@20" in report:
+        print(f"[done] delta_mrr@20={report['delta_mrr@20']:+.6f}; production settings unchanged", flush=True)
+    else:
+        print(
+            f"[done] target-only baseline written (dimensions {source_dim} -> {target_dim}); "
+            "production settings unchanged",
+            flush=True,
+        )
     client.close()
     return 0
 

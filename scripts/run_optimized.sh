@@ -719,6 +719,10 @@ quick_start() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 main() {
+    if [ -f ".env" ]; then
+        source "$SCRIPT_DIR/env_defaults.sh"
+        pcb_rag_load_env_defaults .env
+    fi
     set_defaults
     
     # 支持命令行参数

@@ -79,6 +79,7 @@ def run_ingestion(
     graph_build=None,
     graph_vectors=None,
     store: RevisionStore | None = None,
+    force_rebuild: bool = False,
 ):
     """Callbacks separate model/database IO from the recoverable state machine."""
     from pcb_rag.retrieval import read_nodes
@@ -90,6 +91,11 @@ def run_ingestion(
         same_collection = active.get("collection", collection) == collection
         old_docs = active.get("docs", {}) if same_collection else {}
         _, _, current = incremental.diff_documents(documents, {"docs": old_docs}, pipeline=pipeline)
+        if force_rebuild:
+            current = copy.deepcopy(current)
+            rebuild_id = active.get("revision", "initial")
+            for doc_id, doc in current.items():
+                doc["revision"] = fingerprint([doc_id, doc["hash"], pipeline["chunks"], pipeline["vectors"], rebuild_id])[:24]
         expected = os.getenv("INGEST_EXPECTED_REVISION", "")
         candidate = fingerprint({"docs": current, "pipeline": pipeline, "collection": collection})[:24]
         if expected and candidate != expected:
@@ -113,7 +119,8 @@ def run_ingestion(
         changed = {
             doc_id
             for doc_id, doc in current.items()
-            if old_docs.get(doc_id, {}).get("hash") != doc["hash"]
+            if force_rebuild
+            or old_docs.get(doc_id, {}).get("hash") != doc["hash"]
             or old_docs.get(doc_id, {}).get("pipeline", {}).get("chunks") != pipeline["chunks"]
         }
 

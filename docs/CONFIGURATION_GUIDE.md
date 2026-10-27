@@ -55,6 +55,14 @@ EOF
 source .env
 ```
 
+### 环境文件加载与优先级
+
+生产默认读取 `.env`，实验脚本读取 `.env.eval`，两者独立，不相互隐式补值。可用 `PCB_RAG_ENV_FILE` 显式指定其他文件；`PCB_RAG_LOAD_DOTENV=0` 禁止自动加载，冻结实验使用 `PCB_RAG_EXPERIMENT_FROZEN=1` 隔离宿主配置。
+
+优先级为：**显式 CLI/preset/实验行覆盖 > 调用者已导出的环境变量 > 选定的环境文件 > 代码默认值**。直接导入 `pcb_rag` 子模块也会先加载配置，不要求先导入 `query.py`。修改 `.env` 后需要重启查询/API 进程；入库相关参数按指纹决定是否重建对应阶段。
+
+可用 `python scripts/check_env.py --config-only --strict-config` 离线检查未识别键、重复键、外部覆盖及 legacy 参数。`FUSION_MODE`、`CHUNK_GROUP_BY_DOC`、`GRAPH_EXPAND_MAX` 是旧接口兼容项，不代表共享管道会改变相应算法或证据分组。
+
 ---
 
 ## 🔧 服务配置
@@ -77,7 +85,7 @@ source .env
 | `LLM_MODEL` | 空 | API 模型名（api） |
 | `LLM_TIMEOUT` | `180` | API 请求超时（秒，api） |
 | `LLM_MAX_TOKENS` | `2048` | 单次生成上限（api） |
-| `LLM_TEMPERATURE` | `0.7` | 采样温度（api） |
+| `LLM_TEMPERATURE` | `0.7` | 默认采样温度（api / local；显式函数参数优先） |
 | `LLM_CONTEXT_WINDOW` | `8192` | 上下文窗口（api） |
 
 **Embedding**
@@ -245,6 +253,8 @@ export RECALL_TOP_K=50
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `LEXICAL_ENABLED` | `1` | 是否启用 BM25 检索 |
+| `BM25_K1` | `1.5` | BM25+ 词频饱和参数 |
+| `BM25_B` | `0.75` | 文档长度归一化强度（`0`=关闭，`1`=完全归一化） |
 | `LEXICAL_CACHE_PATH` | `./data/lexical_corpus.jsonl` | 词法索引缓存路径 |
 | `LEXICAL_MAX_BYTES` | `8000` | 单文档最大字节数 |
 | `LEXICAL_EXPORT_BATCH` | `2000` | 导出批次大小 |
@@ -503,6 +513,10 @@ API 后端：确认 `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` 正确，且网
 - `RERANK_BACKEND=api`：必须配置 `RERANK_API_URL`，否则启动时会记录 `[RERANK] API 精排初始化失败`。
 - `RERANK_BACKEND=hf/qwen3reranker`：需要本地显存，显存不足会自动回退为仅召回。
 - 不需要精排时可设 `RERANK_BACKEND=none`。
+- 返回 400 且报 `extra_forbidden`：请求体格式与服务商不符。NIM 的
+  `/retrieval/<model>/reranking` 与 Jina 兼容的 `/v1/rerank` 不是同一种线路格式，
+  须设 `RERANK_API_PROVIDER=nvidia`；`auto` 仅在官方域名加 `/reranking` 后缀时自动识别，
+  自建 NIM 网关必须显式声明。
 
 #### 3. 显存不足
 ```bash

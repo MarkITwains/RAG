@@ -65,3 +65,127 @@ def test_request_budget_includes_prompt_history_question_and_output():
 def test_body_truncation_has_no_minimum_character_budget_overrun():
     rows = fit_evidence(["罕见𠮷铜厚" * 200], str, 125, min_chunk_tokens=10)
     assert sum(row["tokens"] for row in rows) <= 125
+
+
+def test_configured_minimum_chunk_size_stops_tiny_truncated_tail():
+    bundle = build_evidence_bundle([doc("A", "证据" * 100), doc("B")], 160, min_chunk_tokens=60)
+
+    assert [row["chunk_id"] for row in bundle.entries] == ["A"]
+    assert bundle.entries[0]["truncated"]
+
+
+def test_minimum_chunk_limit_is_enforced_on_truncated_body_not_just_total_budget():
+    bundle = build_evidence_bundle([doc("A", "证据" * 100), doc("B")], 160, min_chunk_tokens=60)
+
+    assert all(row["tokens"] >= 60 for row in bundle.entries)
+
+
+def test_minimum_chunk_limit_rejects_too_short_body_with_large_locator():
+    bundle = build_evidence_bundle([doc("A", "证据" * 100, source_path="长路径" * 50)], 160, min_chunk_tokens=60)
+
+    assert bundle.entries == ()
+
+
+def test_zero_context_budget_uses_documented_legacy_document_limits(monkeypatch):
+    from pcb_rag import query
+
+    monkeypatch.setattr(query, "RAG_CONTEXT_MAX_TOKENS", 0)
+    monkeypatch.setattr(query, "RAG_TOP_DOCS", 2)
+    monkeypatch.setattr(query, "RAG_DOC_MAX_CHARS", 5)
+    docs = [doc("A", "abcdefghij"), doc("B", "klmnopqrst"), doc("C", "uvwxyz")]
+
+    bundle = query.build_context_bundle(docs)
+
+    assert [row["chunk_id"] for row in bundle.entries] == ["A", "B"]
+    assert [row["text"] for row in bundle.entries] == ["abcde...", "klmno..."]
+    assert bundle.budget["legacy"] is True
+
+
+def test_legacy_bundle_supports_sdk_evidence_mapping(monkeypatch):
+    from pcb_rag import query
+    from pcb_rag.engine import KnowledgeBase
+
+    monkeypatch.setattr(query, "RAG_CONTEXT_MAX_TOKENS", 0)
+    monkeypatch.setattr(query, "RAG_TOP_DOCS", 1)
+    monkeypatch.setattr(query, "RAG_DOC_MAX_CHARS", 5)
+    bundle = query.build_context_bundle([doc("A", "abcdefghij")])
+
+    evidence = KnowledgeBase(auto_init=False, pipeline=object())._bundle_evidence(bundle)[0]
+
+    assert evidence.text == "abcde..."
+    assert evidence.tokens > 0
+    assert evidence.truncated is True
+
+
+def test_generation_uses_the_same_legacy_fallback(monkeypatch):
+    from pcb_rag import query
+
+    monkeypatch.setattr(query, "RAG_CONTEXT_MAX_TOKENS", 0)
+    monkeypatch.setattr(query, "RAG_TOP_DOCS", 2)
+    monkeypatch.setattr(query, "RAG_DOC_MAX_CHARS", 5)
+    docs = [doc("A", "abcdefghij"), doc("B", "klmnopqrst"), doc("C", "uvwxyz")]
+    llm = SimpleNamespace(tokenizer=None, model="test")
+
+    request = query.prepare_generation("问题", docs, llm)
+
+    assert [row["chunk_id"] for row in request.evidence.entries] == ["A", "B"]
+    assert request.evidence.context in request.prompt
+    assert "uvwxyz" not in request.prompt
+
+
+def test_legacy_fallback_still_fits_a_smaller_model_window(monkeypatch):
+    from pcb_rag import query
+
+    monkeypatch.setattr(query, "RAG_CONTEXT_MAX_TOKENS", 0)
+    monkeypatch.setattr(query, "RAG_TOP_DOCS", 2)
+    monkeypatch.setattr(query, "RAG_DOC_MAX_CHARS", 5000)
+    monkeypatch.setattr(query, "RAG_MIN_CHUNK_TOKENS", 0)
+    llm = SimpleNamespace(tokenizer=None, model="test")
+
+    request = query.prepare_generation("问题", [doc("A", "证据" * 500)], llm)
+
+    assert request.evidence.entries
+    assert request.evidence.context in request.prompt
+    assert request.evidence.budget["request_tokens"] <= request.evidence.budget["request_limit"]
+
+
+def test_legacy_fallback_rejects_a_window_too_small_for_prompt(monkeypatch):
+    from pcb_rag import query
+
+    monkeypatch.setattr(query, "RAG_CONTEXT_MAX_TOKENS", 0)
+    bundle = query.build_context_bundle([doc("A", "证据" * 500)])
+
+    with pytest.raises(ValueError, match="window"):
+        build_generation_request(
+            [doc("A")],
+            "{context}{query}",
+            query="问题" * 100,
+            context_budget=0,
+            request_limit=100,
+            output_reserve=30,
+            bundle=bundle,
+        )
+
+
+def test_legacy_fallback_is_trimmed_when_full_form_exceeds_window(monkeypatch):
+    from pcb_rag import query
+
+    monkeypatch.setattr(query, "RAG_CONTEXT_MAX_TOKENS", 0)
+    monkeypatch.setattr(query, "RAG_TOP_DOCS", 2)
+    monkeypatch.setattr(query, "RAG_DOC_MAX_CHARS", 5000)
+    monkeypatch.setattr(query, "RAG_MIN_CHUNK_TOKENS", 0)
+    bundle = query.build_context_bundle([doc("A", "证据" * 500)])
+
+    request = build_generation_request(
+        [doc("A", "证据" * 500)],
+        "{context}{query}",
+        query="q",
+        context_budget=0,
+        request_limit=800,
+        output_reserve=30,
+        bundle=bundle,
+    )
+
+    assert request.evidence.entries
+    assert len(request.evidence.context) < len(bundle.context)
+    assert request.evidence.budget["request_tokens"] <= 800

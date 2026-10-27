@@ -46,8 +46,10 @@ def _call_options(llm, prompt, kwargs):
     if "openai" in type(llm).__module__:
         kwargs["max_tokens"] = min(int(kwargs.get("max_tokens") or output), output)
         control = current_control()
-        if control:
-            kwargs.setdefault("timeout", control.remaining())
+        if control and "timeout" not in kwargs:
+            remaining = control.remaining()
+            configured = getattr(llm, "timeout", None)
+            kwargs["timeout"] = min(float(configured), remaining) if configured else remaining
     return kwargs
 
 

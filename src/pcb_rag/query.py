@@ -2,6 +2,7 @@ import os
 
 # 先加载仓库根目录的 .env：直接 `python -m pcb_rag.query` 时也能读到配置
 # （必须早于下方任何环境变量读取）
+from pcb_rag.config import env_bool
 from pcb_rag.usage import model_complete
 from pcb_rag.env_loader import load_project_env
 
@@ -216,14 +217,14 @@ DEFAULT_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "300"))
 LEXICAL_CACHE_PATH = os.getenv("LEXICAL_CACHE_PATH", "./data/lexical_corpus.jsonl")
 LEXICAL_EXPORT_BATCH = int(os.getenv("LEXICAL_EXPORT_BATCH", "2000"))
 LEXICAL_EXPORT_LIMIT = int(os.getenv("LEXICAL_EXPORT_LIMIT", "-1"))
-LEXICAL_ENABLED = os.getenv("LEXICAL_ENABLED", "1") not in {"0", "false", "False"}
+LEXICAL_ENABLED = env_bool("LEXICAL_ENABLED", True)
 LEXICAL_MAX_BYTES = int(os.getenv("LEXICAL_MAX_BYTES", "8000"))
 
 # 层次化 Chunk 检索参数（group + expand 策略）
-CHUNK_EXPAND_ENABLED = os.getenv("CHUNK_EXPAND_ENABLED", "1") not in {"0", "false", "False"}
+CHUNK_EXPAND_ENABLED = env_bool("CHUNK_EXPAND_ENABLED", True)
 CHUNK_EXPAND_NEIGHBORS = int(os.getenv("CHUNK_EXPAND_NEIGHBORS", "1"))  # 扩展的邻居数量（前后各N个）
-CHUNK_EXPAND_PARENT = os.getenv("CHUNK_EXPAND_PARENT", "1") not in {"0", "false", "False"}  # 是否扩展父chunk（默认启用）
-CHUNK_GROUP_BY_DOC = os.getenv("CHUNK_GROUP_BY_DOC", "1") not in {"0", "false", "False"}  # 按文档分组
+CHUNK_EXPAND_PARENT = env_bool("CHUNK_EXPAND_PARENT", True)  # 是否扩展父chunk（默认启用）
+CHUNK_GROUP_BY_DOC = env_bool("CHUNK_GROUP_BY_DOC", True)  # 按文档分组
 
 # Milvus 中，LlamaIndex 会把 Node 的 metadata 展平为“动态字段”（不是一个名为 `metadata` 的 JSON 列）。
 # 为了让本地 BM25/评测能够使用到这些元信息，这里显式列出我们关心的字段并在导出时打包为 dict。
@@ -245,7 +246,7 @@ LEXICAL_METADATA_KEYS: list[str] = [
 ]
 
 # Rerank: 先高召回，再用 cross-encoder 精排，减少“看起来相关但其实不对”的段落
-RERANK_ENABLED = os.getenv("RERANK_ENABLED", "1") not in {"0", "false", "False"}
+RERANK_ENABLED = env_bool("RERANK_ENABLED", True)
 RERANK_MODEL = os.getenv("RERANK_MODEL", "Qwen/Qwen3-Reranker-4B")
 RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "10"))  # 精排返回条数；API 输入另受候选上限约束
 # rerank 后端：
@@ -266,7 +267,7 @@ HF_RERANK_DTYPE = os.getenv("HF_RERANK_DTYPE", "auto").strip().lower()  # auto|f
 # 控制 HuggingFace 下载进度条刷新频率（秒）
 HF_DOWNLOAD_MIN_INTERVAL = float(os.getenv("HF_DOWNLOAD_MIN_INTERVAL", "1"))
 # 对大模型（如 Qwen3-Reranker）是否先 snapshot 预下载（进度可控、可续传）
-HF_PREFETCH_SNAPSHOT = os.getenv("HF_PREFETCH_SNAPSHOT", "1") not in {"0", "false", "False"}
+HF_PREFETCH_SNAPSHOT = env_bool("HF_PREFETCH_SNAPSHOT", True)
 
 # Qwen3 reranker（Qwen/Qwen3-Reranker-*）参数
 QWEN3_RERANK_INSTRUCTION = os.getenv(
@@ -354,7 +355,7 @@ QUERY_EXPANSION_DICT = {
     "标志": ["mark", "标记", "标识", "marking"],
     "颜色": ["color", "色标"],
 }
-QUERY_EXPANSION_ENABLED = os.getenv("QUERY_EXPANSION_ENABLED", "1") not in {"0", "false", "False"}
+QUERY_EXPANSION_ENABLED = env_bool("QUERY_EXPANSION_ENABLED", True)
 QUERY_EXPANSION_MAX_TERMS = int(os.getenv("QUERY_EXPANSION_MAX_TERMS", "6"))  # 最大扩展词数（增加覆盖面）
 
 # =============================================================================
@@ -375,17 +376,17 @@ FUSION_WEIGHTS = [float(x) for x in os.getenv("FUSION_WEIGHTS", "0.45,0.55").spl
 # 查询改写/扩展数量：多扩展查询核心参数，默认 4（平衡速度和召回覆盖）
 FUSION_NUM_QUERIES = int(os.getenv("FUSION_NUM_QUERIES", "4"))
 # 多扩展查询启用开关（默认启用，增加召回多样性）
-MULTI_EXPAND_ENABLED = os.getenv("MULTI_EXPAND_ENABLED", "1") not in {"0", "false", "False"}
+MULTI_EXPAND_ENABLED = env_bool("MULTI_EXPAND_ENABLED", True)
 # LLM 查询改写启用开关（使用 LLM 生成高质量查询变体）
-LLM_QUERY_REWRITE_ENABLED = os.getenv("LLM_QUERY_REWRITE_ENABLED", "0") not in {"0", "false", "False"}
+LLM_QUERY_REWRITE_ENABLED = env_bool("LLM_QUERY_REWRITE_ENABLED", False)
 
 # =============================================================================
 # MultiPath Retriever + Late Interaction 配置 (Phase 3.1)
 # =============================================================================
 # 是否启用多路召回 + Late Interaction 模式（默认关闭，使用 Fusion+Expand+Rerank）
-MULTIPATH_ENABLED = os.getenv("MULTIPATH_ENABLED", "0") not in {"0", "false", "False"}
+MULTIPATH_ENABLED = env_bool("MULTIPATH_ENABLED", False)
 # ColBERT 风格 Late Interaction reranker（注意：不适用于生成式模型如 Qwen3-Reranker）
-COLBERT_RERANK_ENABLED = os.getenv("COLBERT_RERANK_ENABLED", "0") not in {"0", "false", "False"}
+COLBERT_RERANK_ENABLED = env_bool("COLBERT_RERANK_ENABLED", False)
 # 注意：ColBERT 需要真正的 late-interaction 模型（如 jinaai/jina-colbert-v2、colbert-ir/colbertv2.0）；
 # cross-encoder 类模型（bge-reranker 等）输出单个相关性分数而非 token 级向量，不适用于本实现，
 # 这类需求请改用 RERANK_BACKEND=api 或 hf。
@@ -402,7 +403,7 @@ MULTIPATH_RRF_K = int(os.getenv("MULTIPATH_RRF_K", "60"))  # RRF 融合参数 k
 # HyDE + Query2Doc 查询增强配置 (Phase 3.3)
 # =============================================================================
 # 是否启用 HyDE (Hypothetical Document Embedding) 查询增强
-HYDE_ENABLED = os.getenv("HYDE_ENABLED", "1") not in {"0", "false", "False"}  # 默认启用
+HYDE_ENABLED = env_bool("HYDE_ENABLED", True)  # 默认启用
 # HyDE 假设文档最大长度（字符数）
 HYDE_MAX_LENGTH = int(os.getenv("HYDE_MAX_LENGTH", "300"))
 # HyDE 路降权系数（用于三路 RRF 融合：原始向量=1.0，HyDE向量=HYDE_ROUTE_WEIGHT）
@@ -417,7 +418,7 @@ FUSION_RRF_K = int(os.getenv("FUSION_RRF_K", "40"))
 # 拿到 w/(k+rank)，把另一路的真实信号挤出榜单（实测 BM25 单路 0.4891 > 融合 0.4811）。
 # 配额制先给每路分配保底名额（轮转取数），剩余再按 RRF 分补齐 —— 与 LightRAG
 # hybrid 模式 round-robin 的"名额隔离"同构，同时保留分数区分度。
-FUSION_QUOTA_ENABLED = os.getenv("FUSION_QUOTA_ENABLED", "1") not in {"0", "false", "False"}
+FUSION_QUOTA_ENABLED = env_bool("FUSION_QUOTA_ENABLED", True)
 # 每路保底条数（未显式配置 FUSION_QUOTAS 时生效）
 FUSION_MIN_PER_ROUTE = int(os.getenv("FUSION_MIN_PER_ROUTE", "1"))
 # 显式配额，按 routes 顺序，逗号分隔；留空则按 FUSION_MIN_PER_ROUTE 均分
@@ -442,16 +443,16 @@ def _parse_fusion_quotas(n_routes: int) -> Optional[list[int]]:
     return quotas
 
 # HyDE few-shot 开关
-HYDE_FEWSHOT_ENABLED = os.getenv("HYDE_FEWSHOT_ENABLED", "1") not in {"0", "false", "False"}
+HYDE_FEWSHOT_ENABLED = env_bool("HYDE_FEWSHOT_ENABLED", True)
 # 是否启用 Query2Doc 查询增强
-QUERY2DOC_ENABLED = os.getenv("QUERY2DOC_ENABLED", "0") not in {"0", "false", "False"}  # 默认关闭（按当前策略禁用）
+QUERY2DOC_ENABLED = env_bool("QUERY2DOC_ENABLED", False)  # 默认关闭（按当前策略禁用）
 # Query2Doc 关键信息点最大数量
 QUERY2DOC_MAX_POINTS = int(os.getenv("QUERY2DOC_MAX_POINTS", "5"))
 # 短查询阈值（低于此长度才使用 HyDE/Query2Doc）
 # 设置较高值使大多数查询都能受益于 HyDE 增强
 SHORT_QUERY_THRESHOLD = int(os.getenv("SHORT_QUERY_THRESHOLD", "120"))
 # 查询增强是否对所有查询生效（默认开启；关闭后仅短查询启用）
-QUERY_ENHANCE_ALL = os.getenv("QUERY_ENHANCE_ALL", "1") not in {"0", "false", "False"}
+QUERY_ENHANCE_ALL = env_bool("QUERY_ENHANCE_ALL", True)
 
 
 def _gpu_free_mib() -> dict[int, int]:
@@ -477,7 +478,8 @@ def _try_build_reranker():
             reranker = build_api_reranker(top_n=RERANK_TOP_N)
             print(
                 f"[RERANK] API 精排就绪: url={RERANK_API_URL}, "
-                f"model={RERANK_API_MODEL or '(service default)'}, top_n={RERANK_TOP_N}"
+                f"model={RERANK_API_MODEL or '(service default)'}, top_n={RERANK_TOP_N}, "
+                f"wire={type(reranker).__name__}"
             )
             return reranker
         except Exception as e:
@@ -1648,7 +1650,7 @@ RAG_PROMPT_TEMPLATE = """你是 PCB 电路板领域的技术专家。请根据�
 回答："""
 
 # 环境变量控制引用功能
-CITATION_ENABLED = os.getenv("CITATION_ENABLED", "1") not in {"0", "false", "False"}
+CITATION_ENABLED = env_bool("CITATION_ENABLED", True)
 # 用于生成答案的最大文档数（仅在关闭预算模式时作为硬上限）
 RAG_TOP_DOCS = int(os.getenv("RAG_TOP_DOCS", "5"))
 # 每个文档内容的最大字符数（仅在关闭预算模式时生效）
@@ -1670,7 +1672,7 @@ RAG_MIN_CHUNK_TOKENS = int(os.getenv("RAG_MIN_CHUNK_TOKENS", "120"))
 # 中文 token 估算系数（字/token）。qwen 系中文约 1.5~1.7，取 1.5 偏保守
 RAG_CHARS_PER_TOKEN = float(os.getenv("RAG_CHARS_PER_TOKEN", "1.5"))
 # 低信息密度块（入库时 CHUNK_QUALITY_MODE=flag 标记的 low_value）是否降权到末尾
-RAG_DEMOTE_LOW_VALUE = os.getenv("RAG_DEMOTE_LOW_VALUE", "1") not in {"0", "false", "False"}
+RAG_DEMOTE_LOW_VALUE = env_bool("RAG_DEMOTE_LOW_VALUE", True)
 
 # 预算分配与三段式组装已下沉到 pcb_rag/context_budget.py（纯逻辑、可单测）。
 # 这里只保留配置与适配层：把 NodeWithScore 规范化成 context_budget 期望的字典。
@@ -1696,13 +1698,13 @@ def _extract_fact_sentences(text: str, limit: int = 2, max_chars: int = 220) -> 
 # Self-RAG (自反思 RAG) 配置
 # =============================================================================
 # 是否启用 Self-RAG 自反思机制
-SELF_RAG_ENABLED = os.getenv("SELF_RAG_ENABLED", "0") not in {"0", "false", "False"}
+SELF_RAG_ENABLED = env_bool("SELF_RAG_ENABLED", False)
 # 最大迭代次数（防止无限循环）
 SELF_RAG_MAX_ITERATIONS = int(os.getenv("SELF_RAG_MAX_ITERATIONS", "3"))
 # 自评分阈值（低于此分数触发重新检索，1-5 分）
 SELF_RAG_THRESHOLD = float(os.getenv("SELF_RAG_THRESHOLD", "3.0"))
 # 是否在详细模式下显示自反思过程
-SELF_RAG_VERBOSE = os.getenv("SELF_RAG_VERBOSE", "1") not in {"0", "false", "False"}
+SELF_RAG_VERBOSE = env_bool("SELF_RAG_VERBOSE", True)
 
 # Self-RAG 自评估 Prompt
 SELF_RAG_EVALUATE_PROMPT = """你是一个严格的答案质量评估专家。请评估以下 RAG 系统的回答质量。
@@ -1766,12 +1768,19 @@ def _doc_dedupe(retrieved_docs: list) -> list:
 
 
 def build_context_bundle(retrieved_docs: list, max_total_tokens: int = None):
-    from pcb_rag.evidence import build_evidence_bundle
+    from pcb_rag.evidence import build_evidence_bundle, build_legacy_evidence_bundle
+
+    if max_total_tokens is None and RAG_CONTEXT_MAX_TOKENS == 0:
+        return build_legacy_evidence_bundle(
+            retrieved_docs or [], max_docs=RAG_TOP_DOCS, max_chars=RAG_DOC_MAX_CHARS,
+            demote_low_value=RAG_DEMOTE_LOW_VALUE,
+        )
     return build_evidence_bundle(
         retrieved_docs or [],
         RAG_CONTEXT_MAX_TOKENS if max_total_tokens is None else max_total_tokens,
         facts_ratio=RAG_FACTS_BUDGET_RATIO,
         demote_low_value=RAG_DEMOTE_LOW_VALUE,
+        min_chunk_tokens=RAG_MIN_CHUNK_TOKENS,
     )
 
 
@@ -1788,7 +1797,8 @@ def prepare_generation(query: str, retrieved_docs: list, llm=None, *, template=N
         retrieved_docs, template or RAG_PROMPT_TEMPLATE, query=query,
         context_budget=RAG_CONTEXT_MAX_TOKENS, request_limit=request_limit,
         output_reserve=reserve, values=values, facts_ratio=RAG_FACTS_BUDGET_RATIO,
-        demote_low_value=RAG_DEMOTE_LOW_VALUE, **options,
+        demote_low_value=RAG_DEMOTE_LOW_VALUE, min_chunk_tokens=RAG_MIN_CHUNK_TOKENS,
+        bundle=build_context_bundle(retrieved_docs) if RAG_CONTEXT_MAX_TOKENS == 0 else None, **options,
     )
 
 
@@ -2338,7 +2348,7 @@ def format_self_rag_result(result: dict, show_history: bool = False) -> str:
 # =============================================================================
 # 查询意图理解与分类系统
 # =============================================================================
-QUERY_ROUTING_ENABLED = os.getenv("QUERY_ROUTING_ENABLED", "1") not in {"0", "false", "False"}
+QUERY_ROUTING_ENABLED = env_bool("QUERY_ROUTING_ENABLED", True)
 
 # 查询类型配置：不同类型查询使用不同检索策略
 QUERY_TYPES = {
@@ -2516,8 +2526,8 @@ def _get_retrieval_weights(query_type: str) -> tuple[float, float]:
 
 # rule = 纯规则（与原行为一致）；llm = 始终调 LLM；hybrid = 规则落到 general 时才调 LLM
 QUERY_UNDERSTANDING_MODE = os.getenv("QUERY_UNDERSTANDING_MODE", "hybrid").strip().lower()
-QUERY_DECOMPOSE_ENABLED = os.getenv("QUERY_DECOMPOSE_ENABLED", "1") not in {"0", "false", "False"}
-QUERY_STEP_BACK_ENABLED = os.getenv("QUERY_STEP_BACK_ENABLED", "1") not in {"0", "false", "False"}
+QUERY_DECOMPOSE_ENABLED = env_bool("QUERY_DECOMPOSE_ENABLED", True)
+QUERY_STEP_BACK_ENABLED = env_bool("QUERY_STEP_BACK_ENABLED", True)
 DECOMPOSE_MAX_SUB_QUERIES = int(os.getenv("DECOMPOSE_MAX_SUB_QUERIES", "3"))
 # Step-back 路由在 RRF 融合中的权重系数（相对原始向量权重）
 STEPBACK_ROUTE_WEIGHT = float(os.getenv("STEPBACK_ROUTE_WEIGHT", "0.7"))
@@ -3663,8 +3673,9 @@ class _Bm25Index:
     # k1：控制 tf 的饱和速度。注意在 tf 已被压缩为 1 的语料上它不起作用
     #     （tf=1 且 dl=avgdl 时 tf_component ≡ 1），此时它只影响长度惩罚曲线的陡度。
     #     词频修好后（_tokenize 保留 cut_words 的重复），它才真正是"词频饱和"参数。
-    k1: float = 1.5
-    b: float = 0.75  # 长度归一化强度：0=不归一化，1=完全按 dl/avgdl（继承 BM25 惯用默认值）
+    k1: float = field(default_factory=lambda: float(os.getenv("BM25_K1", "1.5")))
+    # 长度归一化强度：0=不归一化，1=完全按 dl/avgdl（继承 BM25 惯用默认值）
+    b: float = field(default_factory=lambda: float(os.getenv("BM25_B", "0.75")))
     delta: float = 1.0  # BM25+ 的 delta 参数，防止长文档过度惩罚
     # 倒排索引：term -> 候选文档下标，把检索从 O(全部文档) 降到 O(候选文档)
     inverted: dict = field(default_factory=dict)

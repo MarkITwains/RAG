@@ -314,7 +314,7 @@ def is_vision_configured() -> bool:
     if not MULTIMODAL_ENABLED:
         return False
     base = MULTIMODAL_VLM_BASE_URL or os.getenv("LLM_BASE_URL", "").strip().rstrip("/")
-    model = MULTIMODAL_VLM_MODEL or os.getenv("VLM_MODEL", "").strip()
+    model = _vision_endpoint()[2]
     return bool(base and model)
 
 

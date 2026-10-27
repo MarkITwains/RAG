@@ -156,3 +156,15 @@ evaluate_recall.py 2030 行左右会强行把 SHORT_QUERY_THRESHOLD 改成 100 �
 - 同一冻结 80 题、无业务过滤/重排/改写/HyDE 的精确 IP 对照：旧 MRR@20=0.068966；只修查询=0.096103；两端配对修正并重建=0.393509。Hit@5 从 0.1000 提升到 0.5875；Hit@200 从 0.4000 提升到 0.9375。独立矩阵排名与 Milvus FLAT/IP 实际排名一致。
 - `.env` 与 `.env.eval` 已切换到新集合；新集合记录模型、接口地址、维度及输入模式，查询与入库校验配置，避免混用向量。
 - 这是向量检索的同题对照，不能当作完整生成质量或真人问题集的指标。详细过程、报告位置与回退要求见 `docs/EMBEDDING_FIX.md`。
+
+### 双模型切换（2026-10-23）
+
+- embed: `nvidia/nemotron-3-embed-1b`（2048 维）→ `nvidia/nemotron-3.5-embed-8b`（原生 4096 维）。
+- rerank: SiliconFlow `BAAI/bge-reranker-v2-m3` → `nvidia/nemotron-3.5-rerank-8b`。
+- 接口契约实测：embeddings 原生 4096 维、`dimensions` 可取 1~4096、`truncate` 仅 `END`/`NONE`（`START` 返回 400）；rerank 走 `/v1/retrieval/<model>/reranking`，`query` 与 `passages` 均为对象，不接受 `top_n`，返回 `rankings[].logit`（可为负），passages 上限 512。
+- 因此 `EMBED_DIM` 在本模型下是真实下发参数，不再只是建表期望值；rerank 适配层把 logit 按 sigmoid 归一到 0~1，以维持 `sources[].score` 的对外量纲。
+- 新集合 `pcb_kb_nv35_embed8b_20261023`，块文本与 id 不变；`scripts/repair_embeddings.py` 已放开「目标维度必须等于源维度」的限制，可直接做 2048→4096 的只换向量迁移。
+- 本机实调结果（生产工厂 + 真实接口）：query/passage 均返回 4096 维，相关文本余弦 0.742；重排三选一命中金标准，分值 0.206 / 0.038 / 0.032。
+- 新旧指标不构成可比序列：向量空间、维度、重排模型与分值量纲四项同时变化，消融表须在新集合上重测后再下结论。详细步骤见 `docs/MODEL_SWITCH_20261023.md`。
+- 迁移结果（2026-10-23，5680 行 / 47 分 27 秒，ids 与正文逐条校验一致）：向量单路 80 题 MRR@20 0.3935 → **0.4463**，Hit@1 0.2375 → 0.3000，Hit@5 0.5875 → 0.6375，Hit@200 0.9375 → 0.9500。语料文本与评测口径相同，属跨报告对照，非严格配对实验。
+- 本次迁移的语料仍是 10-20 那批 60 个 `clear_docs` 文件；当日整理的 66 文件（含 `04_工程语料/` 20 篇）未入库。chunk id 由文件路径派生，换目录后 id 全变，只能全量重建、不能增量覆盖。

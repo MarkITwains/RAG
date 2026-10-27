@@ -6,6 +6,9 @@
 
 from types import SimpleNamespace
 
+import json
+import pytest
+
 from pcb_rag.graph_rag import (
     GraphRetriever,
     KnowledgeGraph,
@@ -500,3 +503,27 @@ class TestTripleParsing:
 
     def test_garbage_returns_empty(self):
         assert _parse_triple_json("抱歉，我无法处理") == []
+
+
+def test_evidence_quote_tolerates_line_break_normalisation(monkeypatch):
+    """跨行引用被模型压成单行时不应判为杜撰；真正的杜撰仍须报错。"""
+
+    from pcb_rag import graph_rag as g
+
+    monkeypatch.setattr(g, "GRAPH_LLM_GLEANING", 0)
+    text = "阻焊开窗应比焊盘单边大 0.05mm，\n防止焊盘边缘露铜。"
+    good = [
+        {
+            "head": "阻焊开窗",
+            "relation": "应大于",
+            "tail": "焊盘",
+            "evidence": "阻焊开窗应比焊盘单边大 0.05mm，防止焊盘边缘露铜。",
+        }
+    ]
+    llm = SimpleNamespace(complete=lambda prompt: SimpleNamespace(text=json.dumps(good)))
+    assert len(g.extract_triples_llm(text, llm, strict=True)) == 1
+
+    bad = [{"head": "A", "relation": "r", "tail": "B", "evidence": "原文里没有这句话"}]
+    llm_bad = SimpleNamespace(complete=lambda prompt: SimpleNamespace(text=json.dumps(bad)))
+    with pytest.raises(ValueError, match="exact source quote"):
+        g.extract_triples_llm(text, llm_bad, strict=True)

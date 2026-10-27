@@ -11,9 +11,8 @@ elif [ -f ".venv/bin/activate" ]; then
 fi
 
 if [ -f ".env" ]; then
-  set -a
-  source .env
-  set +a
+  source "$(dirname "${BASH_SOURCE[0]}")/env_defaults.sh"
+  pcb_rag_load_env_defaults .env
 fi
 
 # --loop asyncio：uvloop 与 query.py 的 nest_asyncio/run_until_complete 不兼容，

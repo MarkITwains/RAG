@@ -111,7 +111,7 @@ def main() -> int:
             use_hyde=args.path == "evalscript",
             use_query2doc=False,
             colbert_candidates=50,
-            rrf_k=40,
+            rrf_k=int(os.getenv("FUSION_RRF_K", "40")),
             llm=rag.Settings.llm,
         )
         rerank = rag._try_build_reranker() if args.path == "evalscript" else None

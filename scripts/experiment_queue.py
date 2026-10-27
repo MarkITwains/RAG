@@ -20,6 +20,40 @@ sys.path.insert(0, str(ROOT))
 from scripts.experiment_common import now, write_json  # noqa: E402
 
 
+_PROXY_KEYS = {
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+}
+
+
+def frozen_base_env(frozen_env):
+    """Keep host runtime essentials, never unfrozen project configuration."""
+    from scripts.experiment_common import public_config
+
+    project_keys = set(public_config(os.environ)) | {
+        key for key in os.environ
+        if key.startswith(("PCB_RAG_", "INGEST_", "SESSION_", "TRACE_", "OBSERVABILITY_"))
+        or any(part in key for part in ("API_KEY", "API_TOKEN", "AUTH_TOKEN", "PASSWORD", "SECRET", "CREDENTIAL"))
+    }
+    base = {key: value for key, value in os.environ.items() if key not in project_keys or key in _PROXY_KEYS}
+    base.update(frozen_env)
+    base["PCB_RAG_EXPERIMENT_FROZEN"] = "1"
+    return base
+
+
+def load_frozen_env(path, expected_digest):
+    from scripts.experiment_common import digest
+
+    if not expected_digest:
+        raise RuntimeError("Frozen environment digest is required; refusing to inherit project defaults")
+    if digest(path) != expected_digest:
+        raise RuntimeError("Frozen environment changed; refusing to resume with different configuration")
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError("Frozen environment must be a JSON object")
+    return value
+
+
 def export_progress(run, manifest):
     output = {
         "run_id": manifest["run_id"],
@@ -115,9 +149,18 @@ def probe_model(run, name, env, cache):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--register-frozen-env", action="store_true", help="record the digest of an existing frozen env")
     args = parser.parse_args()
     run = Path(args.run_dir).resolve()
     manifest_path = run / "manifest.json"
+    if args.register_frozen_env:
+        from scripts.experiment_common import digest
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["private_env_sha256"] = digest(Path(manifest["private_env_path"]))
+        write_json(manifest_path, manifest)
+        print("Registered the existing frozen environment digest; configuration was not changed")
+        return 0
     lock = (run / "queue.lock").open("w")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -125,13 +168,13 @@ def main() -> int:
         raise RuntimeError("This run was superseded; use its replacement run instead")
     if manifest.get("preflight_pilot_path") and manifest.get("pilot_status") != "complete":
         raise RuntimeError("The required small-sample pilot has not passed; formal queue refused")
+    frozen_env = load_frozen_env(Path(manifest["private_env_path"]), manifest.get("private_env_sha256"))
     for job in manifest["steps"]:
         if job["status"] == "running":
             job.update(status="interrupted", interruption_note="Supervisor restarted; per-query checkpoint retained.")
     manifest["status"] = "running"
     write_json(manifest_path, manifest)
-    frozen_env = json.loads(Path(manifest["private_env_path"]).read_text(encoding="utf-8"))
-    base_env = {**os.environ, **frozen_env}
+    base_env = frozen_base_env(frozen_env)
     availability = {}
     active = {}
     maximum = max(1, int(manifest.get("max_parallel_steps", 1)))

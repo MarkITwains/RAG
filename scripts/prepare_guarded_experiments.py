@@ -58,7 +58,7 @@ def scaffold(run: Path, manifest: dict, env: dict, source: Path):
     for path in (source / "datasets").glob("regression_v1*"):
         shutil.copy2(path, run / "datasets" / path.name)
     write_private(private, env)
-    manifest.update(private_env_path=str(private), env=public_config(env))
+    manifest.update(private_env_path=str(private), private_env_sha256=digest(private), env=public_config(env))
     write_json(run / "manifest.json", manifest)
     write_json(run / "heartbeat.json", {"updated_at": now(), "status": "ready", "active_steps": []})
     export_progress(run, manifest)

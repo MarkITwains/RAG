@@ -93,6 +93,7 @@ def build_evidence_bundle(
     *,
     facts_ratio: float = 0.22,
     demote_low_value: bool = True,
+    min_chunk_tokens: int = 0,
     count: Callable[[str], int] = estimate_tokens,
     counter_name: str = "utf8_bytes_upper_bound",
 ) -> EvidenceBundle:
@@ -116,10 +117,14 @@ def build_evidence_bundle(
             selected.append(row)
             continue
         original = row["text"]
-        lo, hi = 0, len(original)
         # Removing summaries can rescue a first large passage with long locators.
         if not selected:
             facts_budget = 0
+        previous_tokens = count(render_sections(selected, facts_budget))
+        remaining = max(0, budget - previous_tokens)
+        if min_chunk_tokens > 0 and remaining < int(min_chunk_tokens):
+            break
+        lo, hi = 0, len(original)
         while lo < hi:
             mid = (lo + hi + 1) // 2
             row["text"] = original[:mid].rstrip() + "…"
@@ -157,6 +162,38 @@ def build_evidence_bundle(
     )
 
 
+def build_legacy_evidence_bundle(items, *, max_docs: int, max_chars: int, demote_low_value: bool = True) -> EvidenceBundle:
+    """Preserve the explicit fixed-count fallback without token-budget truncation."""
+    rows = [_entry(item) for item in items]
+    rows = dedupe_by_key(rows, lambda row: row["chunk_id"] or id(row["item"]))
+    rows = [row for row in rows if row["text"]]
+    if demote_low_value:
+        rows.sort(key=lambda row: bool(row["metadata"].get("low_value")))
+    rows = rows[: max(0, max_docs)]
+    for index, row in enumerate(rows, 1):
+        if len(row["text"]) > max(0, max_chars):
+            row["text"] = row["text"][: max(0, max_chars)] + "..."
+            row["truncated"] = True
+        row.update(
+            index=index,
+            citation_id=index,
+            tokens=estimate_tokens(row["text"]),
+            char_count=len(row["text"]),
+            snippet=row["text"][:200],
+        )
+    context = "\n\n---\n\n".join(
+        f"[{row['index']}] {row['source_name']}"
+        + (f" · {row['section']}" if row["section"] else "")
+        + f"\n{row['text']}"
+        for row in rows
+    )
+    return EvidenceBundle(
+        context,
+        tuple(rows),
+        {"legacy": True, "context_tokens": estimate_tokens(context), "counter": "utf8_bytes_upper_bound"},
+    )
+
+
 @dataclass(frozen=True)
 class GenerationRequest:
     prompt: str
@@ -173,6 +210,7 @@ def build_generation_request(
     output_reserve: int,
     values: dict[str, Any] | None = None,
     count: Callable[[str], int] = estimate_tokens,
+    bundle: EvidenceBundle | None = None,
     **bundle_options: Any,
 ) -> GenerationRequest:
     """Budget the exact template, query, history and output reserve together.
@@ -185,13 +223,26 @@ def build_generation_request(
     available = int(request_limit) - max(0, int(output_reserve)) - count(fixed)
     if available < 0:
         raise ValueError("question/history and output reserve exceed the request window")
-    allowed = min(max(0, context_budget), available)
-    bundle = build_evidence_bundle(items, allowed, count=count, **bundle_options)
+    legacy_fallback = bundle is not None and bundle.budget.get("legacy", False)
+    allowed = available if legacy_fallback else min(max(0, context_budget), available)
+    if legacy_fallback:
+        bundle = build_evidence_bundle(
+            [row["item"] for row in bundle.entries], allowed, count=count, **bundle_options
+        )
+    else:
+        bundle = bundle if bundle is not None else build_evidence_bundle(items, allowed, count=count, **bundle_options)
     prompt = template.format(**dict(values, context=bundle.context))
     # Some tokenizers merge across context/template boundaries differently.
     while count(prompt) + output_reserve > request_limit and bundle.entries:
         allowed = max(0, allowed - max(1, count(prompt) + output_reserve - request_limit))
-        bundle = build_evidence_bundle(items, allowed, count=count, **bundle_options)
+        if legacy_fallback:
+            # Fixed-count mode keeps the selected documents; trim only the tail
+            # to the exact window, using the same budgeted evidence structure.
+            bundle = build_evidence_bundle(
+                [row["item"] for row in bundle.entries], allowed, count=count, **bundle_options
+            )
+        else:
+            bundle = build_evidence_bundle(items, allowed, count=count, **bundle_options)
         prompt = template.format(**dict(values, context=bundle.context))
     if count(prompt) + output_reserve > request_limit:
         raise ValueError("serialized request exceeds the model window")

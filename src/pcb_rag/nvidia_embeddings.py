@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Any, List
 
 from llama_index.core.bridge.pydantic import Field
 from llama_index.embeddings.openai import OpenAIEmbedding
+from openai import APIConnectionError, APIStatusError, APITimeoutError
+
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+def _retryable(error: BaseException) -> bool:
+    """仅对网关抖动类错误重试；参数/鉴权错误应立即暴露。"""
+    if isinstance(error, (APITimeoutError, APIConnectionError)):
+        return True
+    if isinstance(error, APIStatusError):
+        return getattr(error, "status_code", 0) in _RETRY_STATUS
+    return False
 
 
 class NvidiaApiEmbedding(OpenAIEmbedding):
@@ -25,13 +38,19 @@ class NvidiaApiEmbedding(OpenAIEmbedding):
         return "NvidiaApiEmbedding"
 
     def _payload(self, texts: List[str], input_type: str) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "model": self.model_name,
             # Match the existing OpenAIEmbedding newline normalization.
             "input": [text.replace("\n", " ") for text in texts],
             "encoding_format": "float",
             "extra_body": {"input_type": input_type, "truncate": self.truncate},
         }
+        # The API accepts 1..native dimensions and re-normalizes shortened vectors.
+        # Sending it explicitly keeps the request, the stored profile and the
+        # Milvus field width in one place instead of relying on the model default.
+        if self.expected_dimension > 0:
+            payload["dimensions"] = self.expected_dimension
+        return payload
 
     def _vectors(self, response: Any, count: int) -> List[List[float]]:
         rows = sorted(response.data, key=lambda item: item.index)
@@ -63,14 +82,23 @@ class NvidiaApiEmbedding(OpenAIEmbedding):
             if control:
                 payload["timeout"] = min(float(self.timeout), control.remaining())
             response = None
-            try:
-                response = self._get_client().embeddings.create(**payload)
-                result = self._vectors(response, len(texts))
-            except BaseException:
-                finish_usage(ticket, response, error=True)
-                raise
-            finish_usage(ticket, response)
-            return result
+            attempts = 0
+            while True:
+                try:
+                    response = self._get_client().embeddings.create(**payload)
+                    result = self._vectors(response, len(texts))
+                except BaseException as error:
+                    attempts += 1
+                    # 上游网关偶发超时/5xx：有限退避重试，不改变检索语义，仅提高长跑成功率。
+                    if attempts >= 3 or not _retryable(error):
+                        finish_usage(ticket, response, error=True)
+                        raise
+                    if control:
+                        control.remaining()
+                    time.sleep(1.5 * attempts)
+                    continue
+                finish_usage(ticket, response)
+                return result
         return run_stage("embedding", invoke)
 
     async def _aembed(self, texts: List[str], input_type: str) -> List[List[float]]:
@@ -82,18 +110,26 @@ class NvidiaApiEmbedding(OpenAIEmbedding):
         ticket = reserve_usage("embedding", texts, self.model_name)
         control = current_control()
         response = None
-        try:
-            payload = self._payload(texts, input_type)
-            if control:
-                payload["timeout"] = min(float(self.timeout), control.remaining())
-            call = self._get_aclient().embeddings.create(**payload)
-            response = await asyncio.wait_for(call, control.remaining()) if control else await call
-            result = self._vectors(response, len(texts))
-        except BaseException:
-            finish_usage(ticket, response, error=True)
-            raise
-        finish_usage(ticket, response)
-        return result
+        attempts = 0
+        payload = self._payload(texts, input_type)
+        if control:
+            payload["timeout"] = min(float(self.timeout), control.remaining())
+        while True:
+            try:
+                call = self._get_aclient().embeddings.create(**payload)
+                response = await asyncio.wait_for(call, control.remaining()) if control else await call
+                result = self._vectors(response, len(texts))
+            except BaseException as error:
+                attempts += 1
+                if attempts >= 3 or not _retryable(error):
+                    finish_usage(ticket, response, error=True)
+                    raise
+                if control:
+                    control.remaining()
+                await asyncio.sleep(1.5 * attempts)
+                continue
+            finish_usage(ticket, response)
+            return result
 
     def _get_query_embedding(self, query: str) -> List[float]:
         return self._embed([query], "query")[0]

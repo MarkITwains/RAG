@@ -7,7 +7,8 @@ set -uo pipefail
 cd /root/rag_v1
 
 # 生产配置唯一基准；env_loader 为 setdefault 语义，source 的值优先于 .env
-set -a; source .env.eval; set +a
+source scripts/env_defaults.sh
+pcb_rag_load_env_defaults .env.eval
 export PYTHONUNBUFFERED=1
 mkdir -p eval/reports logs
 

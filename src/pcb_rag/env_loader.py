@@ -41,9 +41,20 @@ def _unquote(value: str) -> str:
     """去掉值外层的引号；未加引号时剥离 `` #`` 之后的行尾注释。"""
 
     stripped = value.strip()
+    quote = ""
+    for index, char in enumerate(stripped):
+        if char in {"'", '"'}:
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+        elif char == "#" and not quote and index > 0 and stripped[index - 1].isspace():
+            stripped = stripped[:index].rstrip()
+            break
+    stripped = stripped.strip()
     if len(stripped) >= 2 and stripped[0] in {"'", '"'} and stripped[-1] == stripped[0]:
         return stripped[1:-1]
-    return stripped.split(" #", 1)[0].strip()
+    return stripped
 
 
 def load_project_env(path: Optional[Union[str, Path]] = None) -> int:
@@ -55,7 +66,12 @@ def load_project_env(path: Optional[Union[str, Path]] = None) -> int:
 
     if path is None and os.getenv("PCB_RAG_LOAD_DOTENV", "1").lower() in {"0", "false", "no"}:
         return 0
-    env_path = Path(path) if path is not None else project_root() / ".env"
+    if path is None and os.getenv("PCB_RAG_EXPERIMENT_FROZEN") == "1" and not os.getenv("PCB_RAG_ENV_FILE"):
+        return 0
+    selected = os.getenv("PCB_RAG_ENV_FILE", "").strip()
+    env_path = Path(path) if path is not None else Path(selected) if selected else project_root() / ".env"
+    if path is None and selected and not env_path.is_absolute():
+        env_path = project_root() / env_path
     if not env_path.is_file():
         return 0
 
