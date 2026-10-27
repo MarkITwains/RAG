@@ -243,8 +243,10 @@ def main() -> int:
     )
     parser.add_argument("--limit", type=int, default=0, help="评测条数上限（0=全部）")
     parser.add_argument("--top-k", type=int, default=5, help="最终返回的上下文条数")
-    parser.add_argument("--recall-k", type=int, default=50, help="精排前召回条数")
-    parser.add_argument("--no-rerank", action="store_true", help="关闭精排")
+    parser.add_argument("--recall-k", type=int, default=None, help="精排前召回条数（默认 RECALL_TOP_K）")
+    parser.add_argument("--rerank", dest="rerank", action="store_true", help="启用精排（覆盖 RERANK_ENABLED）")
+    parser.add_argument("--no-rerank", dest="rerank", action="store_false", help="关闭精排（覆盖 RERANK_ENABLED）")
+    parser.set_defaults(rerank=None)
     parser.add_argument("--retrieval-only", action="store_true", help="只评检索，不评生成")
     parser.add_argument(
         "--metrics",
@@ -264,8 +266,8 @@ def main() -> int:
         out_path=Path(args.out),
         limit=args.limit,
         top_k=args.top_k,
-        recall_k=args.recall_k,
-        use_rerank=not args.no_rerank,
+        recall_k=args.recall_k if args.recall_k is not None else int(os.getenv("RECALL_TOP_K", "200")),
+        use_rerank=args.rerank if args.rerank is not None else os.getenv("RERANK_ENABLED", "1").lower() not in {"0", "false", "no", "off"},
         retrieval_only=args.retrieval_only,
         metrics=metrics,
     )

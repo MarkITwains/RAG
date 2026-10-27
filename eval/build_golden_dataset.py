@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -171,8 +172,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="构建 RAG 评测黄金数据集")
     parser.add_argument(
         "--corpus",
-        default=str(ROOT / "data" / "lexical_corpus.jsonl"),
-        help="语料文件（JSONL，默认 data/lexical_corpus.jsonl）",
+        default=os.getenv("LEXICAL_CACHE_PATH", str(ROOT / "data" / "lexical_corpus.jsonl")),
+        help="语料文件（JSONL，默认 LEXICAL_CACHE_PATH）",
     )
     parser.add_argument(
         "--out",

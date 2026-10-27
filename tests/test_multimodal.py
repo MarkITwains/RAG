@@ -128,6 +128,28 @@ class TestDescribeImage:
         monkeypatch.setattr(multimodal, "MULTIMODAL_VLM_MODEL", "")
         assert is_vision_configured() is False
 
+    def test_llm_model_fallback_passes_vision_preflight(self, monkeypatch):
+        monkeypatch.setattr(multimodal, "MULTIMODAL_ENABLED", True)
+        monkeypatch.setattr(multimodal, "MULTIMODAL_VLM_BASE_URL", "")
+        monkeypatch.setattr(multimodal, "MULTIMODAL_VLM_MODEL", "")
+        monkeypatch.setenv("VLM_MODEL", "")
+        monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
+        monkeypatch.setenv("LLM_MODEL", "configured-vlm")
+        requests = []
+
+        def fake_post(url, **kwargs):
+            requests.append((url, kwargs))
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"choices": [{"message": {"content": "图片描述"}}]},
+            )
+
+        monkeypatch.setattr("requests.post", fake_post)
+
+        assert is_vision_configured() is True
+        assert describe_image(b"fake-bytes") == "图片描述"
+        assert requests[0][1]["json"]["model"] == "configured-vlm"
+
 
 class TestAugmentDocuments:
     def test_tables_converted_when_multimodal_disabled(self, monkeypatch):

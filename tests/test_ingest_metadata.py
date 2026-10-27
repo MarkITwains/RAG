@@ -15,6 +15,7 @@ pytest.importorskip("llama_index.core")
 from pcb_rag.ingest import (  # noqa: E402
     _infer_source_type,
     enhance_chunk_metadata,
+    vector_insert_metadata,
 )
 
 
@@ -113,3 +114,24 @@ class TestEnhanceChunkMetadata:
             file_path="a.txt",
         )
         assert meta["section"] == "3.1.16 预制内层覆铜板"
+
+
+def test_vector_insert_metadata_drops_graph_only_fields_and_restores():
+    """pcb_facts 单块可达 40 KB，两份序列化会超过 Milvus 64 KiB 动态字段上限。"""
+
+    from llama_index.core.schema import TextNode
+
+    facts = [{"evidence": "阻焊开窗应比焊盘单边大 0.05mm" * 20}]
+    node = TextNode(id_="n1", text="正文", metadata={"pcb_facts": facts, "file_name": "a.txt"})
+
+    with vector_insert_metadata([node]):
+        assert "pcb_facts" not in node.metadata
+        assert node.metadata["file_name"] == "a.txt"
+
+    assert node.metadata["pcb_facts"] == facts
+
+    with pytest.raises(RuntimeError):
+        with vector_insert_metadata([node]):
+            raise RuntimeError("write failed")
+
+    assert node.metadata["pcb_facts"] == facts

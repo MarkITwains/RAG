@@ -396,6 +396,7 @@ class RetrievalPipeline:
                 float(weights[0]) * cfg.hyde_weight,
                 lambda: vector.retrieve(q.hyde_expand_query(clean, llm=self.llm)),
             )
+            hyde_deadline = time.monotonic() + max(0.0, float(os.getenv("HYDE_WAIT_BUDGET", "30")))
         if cfg.query2doc and enhance:
             submit("query2doc", float(weights[0]), lambda: vector.retrieve(q.query2doc_expand(clean, llm=self.llm)))
         if understanding.get("need_step_back"):
@@ -406,7 +407,17 @@ class RetrievalPipeline:
             )
         for name, weight, future, started in jobs:
             try:
-                nodes = await_work(future, control)
+                if name == "hyde":
+                    try:
+                        nodes = await_work(future, control, timeout=max(0.0, hyde_deadline - time.monotonic()))
+                    except DeadlineExceeded:
+                        if control.deadline - time.monotonic() <= 0:
+                            raise
+                        control.routes[name] = "wait_timeout"
+                        control.degraded.append("hyde_wait_timeout")
+                        continue
+                else:
+                    nodes = await_work(future, control)
                 nodes = self._allowed(copy.deepcopy(nodes), state)
                 nodes = dedupe_by_key(nodes, _key)
                 group_name = name.split(":")[0]

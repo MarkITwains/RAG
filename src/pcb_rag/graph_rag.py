@@ -53,6 +53,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 # 复用上下文压缩模块的轻量词元抽取（纯标准库，不会引入重型依赖）
 from pcb_rag.compression import extract_terms
+from pcb_rag.config import env_bool
 
 __all__ = [
     "GRAPH_RAG_ENABLED",
@@ -556,26 +557,30 @@ class KnowledgeGraph:
     ) -> List[Dict[str, Any]]:
         """收集一组实体邻域内的边，按权重降序返回。"""
 
-        names: Set[str] = set()
-        for entity in entities:
-            normalized = normalize_entity(entity)
-            if normalized in self.nodes:
-                names.add(normalized)
-                names.update(self.neighbors(normalized, hops=hops))
-
-        if not names:
-            return []
-
+        seeds = {normalized for entity in entities if (normalized := normalize_entity(entity)) in self.nodes}
+        visited = set(seeds)
+        frontier = set(seeds)
         collected: List[Dict[str, Any]] = []
         seen_keys: Set[Tuple[str, str, str]] = set()
-        for name in sorted(names):
-            for key in self.incident.get(name, ()):  # type: ignore[union-attr]
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                edge = self.edges.get(key)
-                if edge is not None:
-                    collected.append(edge)
+        for _ in range(max(0, hops)):
+            next_frontier = set()
+            for name in sorted(frontier):
+                for key in self.incident.get(name, ()):  # type: ignore[union-attr]
+                    edge = self.edges.get(key)
+                    if edge is None:
+                        continue
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        collected.append(edge)
+                    other = edge["t"] if edge["h"] == name else edge["h"]
+                    if other not in visited:
+                        visited.add(other)
+                        next_frontier.add(other)
+            frontier = next_frontier
+
+        if not seeds:
+            return []
+
         collected.sort(key=lambda e: (-float(e.get("w", 0.0)), e["h"], e["t"]))
         return collected[:max_edges]
 
@@ -947,6 +952,19 @@ def _parse_triple_json(raw: str, *, strict: bool = False) -> List[Dict[str, Any]
     return triples
 
 
+def _is_source_quote(evidence: str, snippet: str) -> bool:
+    """判断 evidence 是否可追溯到原文。
+
+    模型常把跨行引用压成单行，或把原文的换行/缩进换成空格；而换行在提示词里
+    已被压成单个空格。两侧都删掉全部空白再比较，既容忍排版差异，也不放过
+    真正的杜撰（非空白字符必须逐字出现）。
+    """
+
+    if evidence in snippet:
+        return True
+    return _WS_RE.sub("", evidence) in _WS_RE.sub("", snippet)
+
+
 def extract_triples_llm(
     text: str,
     llm: Any,
@@ -1001,7 +1019,9 @@ def extract_triples_llm(
                 break
 
     evidence = _WS_RE.sub(" ", snippet)[:GRAPH_EVIDENCE_CHARS]
-    if strict and any(item.get("evidence") and item["evidence"] not in snippet for item in records):
+    if strict and any(
+        item.get("evidence") and not _is_source_quote(item["evidence"], snippet) for item in records
+    ):
         raise ValueError("graph extraction evidence is not an exact source quote")
     triples = [
         Triple(
@@ -1011,7 +1031,7 @@ def extract_triples_llm(
             chunk_id=chunk_id,
             doc_id=doc_id,
             source_path=source_path,
-            evidence=item.get("evidence") or evidence,
+            evidence=(item.get("evidence") or evidence)[:GRAPH_EVIDENCE_CHARS],
             weight=1.5,
             head_type=item.get("head_type", ""),
             tail_type=item.get("tail_type", ""),
@@ -1174,21 +1194,44 @@ def _extract_triples_concurrent(
 
     results: List[Triple] = []
     workers = max(1, GRAPH_LLM_WORKERS)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_work, node) for node in nodes]
-        done = 0
-        for future in as_completed(futures):
-            done += 1
-            try:
-                results.extend(future.result())
-            except Exception:
-                if strict:
-                    for pending in futures:
-                        pending.cancel()
-                    raise
-                continue
-            if progress and done % 50 == 0:
-                print(f"[GraphRAG] 抽取进度 {done}/{len(nodes)}")
+    # 容忍模式下单块失败只记账、不中断整篇：模型偶发会返回坏 JSON 或改写引用，
+    # 5,700 块规模下"任一块失败即作废整篇"等于永远跑不完。被接受的三元组仍经过
+    # 严格证据校验，杜撰引用不会进入图谱；失败块重试一次，仍失败则跳过并计数。
+    tolerate = env_bool("GRAPH_TOLERATE_CHUNK_FAILURES", False)
+
+    def _collect(subset):
+        got: List[Triple] = []
+        failed: List[Any] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_work, node): node for node in subset}
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                try:
+                    got.extend(future.result())
+                except Exception:
+                    if strict and not tolerate:
+                        for pending in futures:
+                            pending.cancel()
+                        raise
+                    failed.append(futures[future])
+                if progress and done % 50 == 0:
+                    print(f"[GraphRAG] 抽取进度 {done}/{len(subset)}")
+        return got, failed
+
+    results, failed = _collect(nodes)
+    if failed and tolerate:
+        print(f"[GraphRAG] {len(failed)} 块抽取失败，重试一次")
+        retried, failed = _collect(failed)
+        results.extend(retried)
+    if failed:
+        try:
+            from pcb_rag.observability import counter
+
+            counter("graph.chunk_failures", len(failed))
+        except Exception:
+            pass
+        print(f"[GraphRAG] {len(failed)}/{len(nodes)} 块未产出三元组，已跳过并计数")
 
     return results
 
@@ -1372,16 +1415,32 @@ class GraphRetriever:
         link_scores = {name: score for name, score in linked}
         edges = self.graph.related_edges(entity_names, hops=self.hops)
 
+        # Preserve the nearest query-linked seed for each BFS layer. Filtering
+        # only by seed endpoints silently reduces every multi-hop result to 1 hop.
+        distances = {name: 0 for name in entity_names}
+        queue = deque(entity_names)
+        while queue:
+            current = queue.popleft()
+            depth = distances[current]
+            if depth >= self.hops:
+                continue
+            for neighbor in self.graph.neighbors(current, hops=1):
+                if neighbor not in distances:
+                    distances[neighbor] = depth + 1
+                    queue.append(neighbor)
+        nearest = {}
+        for name, depth in distances.items():
+            seeds = [seed for seed in entity_names if name == seed]
+            if not seeds:
+                seeds = [seed for seed in entity_names if seed in self.graph.neighbors(name, hops=max(1, depth))]
+            if seeds:
+                nearest[name] = min(seeds, key=lambda seed: (-link_scores[seed], seed))
         # 按「种子实体」分组：同一实体的关系聚成一段，读起来更连贯
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for edge in edges:
-            anchor = edge["h"] if edge["h"] in link_scores else edge["t"]
-            if anchor not in link_scores:
-                # 邻域扩展出的边：挂到与其相连的已链接实体上
-                anchor = next((n for n in (edge["h"], edge["t"]) if n in link_scores), "")
-                if not anchor:
-                    continue
-            grouped[anchor].append(edge)
+            candidates = [nearest[name] for name in (edge["h"], edge["t"]) if name in nearest]
+            if candidates:
+                grouped[min(candidates, key=lambda name: (-link_scores[name], name))].append(edge)
 
         passages: List[Dict[str, Any]] = []
         for anchor, group_edges in grouped.items():
@@ -1623,10 +1682,32 @@ def expand_nodes_with_graph(
         return list(nodes)
 
     additions: List[Any] = []
+    seen_edges = set()
     for anchor in anchors[:4]:
-        text = build_neighborhood_text(graph, anchor)
-        if not text:
+        frontier = {anchor}
+        visited = {anchor}
+        edges = []
+        for _ in range(max(1, hops)):
+            next_frontier = set()
+            for entity in sorted(frontier):
+                for edge in graph.edges_of(entity):
+                    key = (edge["h"], edge["r"], edge["t"])
+                    if key in seen_edges:
+                        continue
+                    seen_edges.add(key)
+                    edges.append(edge)
+                    other = edge["t"] if edge["h"] == entity else edge["h"]
+                    if other not in visited:
+                        visited.add(other)
+                        next_frontier.add(other)
+            frontier = next_frontier
+        if not edges:
             continue
+        lines = [f"{edge['h']} --{edge['r']}--> {edge['t']}" for edge in edges[:12]]
+        evidence = [str(edge["e"]) for edge in edges if edge.get("e")][:2]
+        text = f"[知识图谱·邻域] 「{anchor}」\n相关事实：\n" + "\n".join(lines)
+        if evidence:
+            text += "\n原文依据：" + " / ".join(evidence)
 
         try:
             from llama_index.core.schema import NodeWithScore, TextNode

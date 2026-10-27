@@ -52,10 +52,8 @@ if [ ! -f ".env" ]; then
   cp .env.example .env
 fi
 
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
+source "$ROOT_DIR/scripts/env_defaults.sh"
+pcb_rag_load_env_defaults .env
 
 mkdir -p "${DATA_DIR:-./data/clear_docs}" data/raw_docs logs
 

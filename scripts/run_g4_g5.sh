@@ -12,7 +12,8 @@
 set -uo pipefail
 cd /root/rag_v1
 
-set -a; source .env.eval; set +a
+source scripts/env_defaults.sh
+pcb_rag_load_env_defaults .env.eval
 # 本机代理（127.0.0.1:12345）当前不可用且 emoera 可直连，绕过代理；
 # 否则 httpx/requests 会走死代理导致所有 API 调用连接失败
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy

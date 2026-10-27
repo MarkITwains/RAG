@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -113,6 +114,7 @@ from llama_index.readers.file import PyMuPDFReader, DocxReader, RTFReader
 from llama_index.vector_stores.milvus import MilvusVectorStore
 
 # 统一模型客户端工厂：LLM / Embedding 支持 local（Ollama）与 api 双后端
+from pcb_rag.config import env_bool
 from pcb_rag import incremental
 from pcb_rag.chunk_quality import assess_chunk_quality
 from pcb_rag.api_clients import (
@@ -192,7 +194,7 @@ SEMANTIC_BREAKPOINT_THRESHOLD = int(os.getenv("SEMANTIC_BREAKPOINT_THRESHOLD", "
 
 # Transformer 注意力语义切块参数（attention模式）
 ATTENTION_MODEL = os.getenv("ATTENTION_MODEL", "qwen3-embedding:8b-q8_0")  # Ollama 嵌入模型
-ATTENTION_USE_OLLAMA = os.getenv("ATTENTION_USE_OLLAMA", "1") not in {"0", "false", "False"}  # 是否使用 Ollama
+ATTENTION_USE_OLLAMA = env_bool("ATTENTION_USE_OLLAMA", True)  # 是否使用 Ollama
 ATTENTION_MIN_CHUNK_SIZE = int(os.getenv("ATTENTION_MIN_CHUNK_SIZE", "80"))  # 最小chunk大小(字符) - 捕获独立引脚/图号/参数行
 ATTENTION_MAX_CHUNK_SIZE = int(os.getenv("ATTENTION_MAX_CHUNK_SIZE", "1000"))  # 最大chunk大小(字符) - 避免过载
 ATTENTION_THRESHOLD = float(os.getenv("ATTENTION_THRESHOLD", "0.45"))        # 相似度阈值(低于此值切分) - 更积极切分
@@ -201,9 +203,9 @@ ATTENTION_OVERLAP = int(os.getenv("ATTENTION_OVERLAP", "220"))               # �
 ATTENTION_WINDOW_SIZE = int(os.getenv("ATTENTION_WINDOW_SIZE", "6"))         # 滑动窗口大小 - 轻微提升平滑度
 
 # 层次化 Chunk 结构参数（父子/邻接关系）
-CHUNK_HIERARCHY_ENABLED = os.getenv("CHUNK_HIERARCHY_ENABLED", "1") not in {"0", "false", "False"}
+CHUNK_HIERARCHY_ENABLED = env_bool("CHUNK_HIERARCHY_ENABLED", True)
 CHUNK_EXPAND_NEIGHBORS = int(os.getenv("CHUNK_EXPAND_NEIGHBORS", "1"))       # 检索时扩展的邻居数量
-CHUNK_EXPAND_PARENT = os.getenv("CHUNK_EXPAND_PARENT", "1") not in {"0", "false", "False"}  # 是否扩展父chunk
+CHUNK_EXPAND_PARENT = env_bool("CHUNK_EXPAND_PARENT", True)  # 是否扩展父chunk
 
 # 层次化切块参数（hierarchical模式）
 HIERARCHICAL_CHUNK_SIZES = [int(x) for x in os.getenv("HIERARCHICAL_CHUNK_SIZES", "1024,384,128").split(",")]
@@ -214,9 +216,9 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "384"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 
 # 编码修复开关
-AUTO_FIX_ENCODING = os.getenv("AUTO_FIX_ENCODING", "1") not in {"0", "false", "False"}
+AUTO_FIX_ENCODING = env_bool("AUTO_FIX_ENCODING", True)
 # OCR乱码清理开关
-CLEAN_OCR_GARBAGE = os.getenv("CLEAN_OCR_GARBAGE", "1") not in {"0", "false", "False"}
+CLEAN_OCR_GARBAGE = env_bool("CLEAN_OCR_GARBAGE", True)
 
 
 # ================== 编码检测与修复 ==================
@@ -907,13 +909,15 @@ class HierarchicalStructureSplitter:
         semantic_variance_threshold: float = None,
         embed_model_name: str = None,
     ):
-        self.parent_max_size = parent_max_size or PARENT_MAX_SIZE
-        self.parent_min_size = parent_min_size or PARENT_MIN_SIZE
-        self.child_max_size = child_max_size or CHILD_MAX_SIZE
-        self.child_min_size = child_min_size or CHILD_MIN_SIZE
-        self.child_overlap = child_overlap or CHILD_OVERLAP
-        self.semantic_split_threshold = semantic_split_threshold or SEMANTIC_SPLIT_THRESHOLD
-        self.semantic_variance_threshold = semantic_variance_threshold or SEMANTIC_VARIANCE_THRESHOLD
+        self.parent_max_size = PARENT_MAX_SIZE if parent_max_size is None else parent_max_size
+        self.parent_min_size = PARENT_MIN_SIZE if parent_min_size is None else parent_min_size
+        self.child_max_size = CHILD_MAX_SIZE if child_max_size is None else child_max_size
+        self.child_min_size = CHILD_MIN_SIZE if child_min_size is None else child_min_size
+        self.child_overlap = CHILD_OVERLAP if child_overlap is None else child_overlap
+        self.semantic_split_threshold = SEMANTIC_SPLIT_THRESHOLD if semantic_split_threshold is None else semantic_split_threshold
+        self.semantic_variance_threshold = (
+            SEMANTIC_VARIANCE_THRESHOLD if semantic_variance_threshold is None else semantic_variance_threshold
+        )
         self.embed_model_name = embed_model_name or ATTENTION_MODEL
         
         # 延迟加载的语义切分器
@@ -1443,12 +1447,12 @@ class AttentionSemanticSplitter:
         breakpoint_percentile: int = None,
     ):
         self.model_name = model_name or ATTENTION_MODEL
-        self.max_chunk_size = max_chunk_size or ATTENTION_MAX_CHUNK_SIZE
-        self.min_chunk_size = min_chunk_size or ATTENTION_MIN_CHUNK_SIZE
-        self.threshold = threshold or ATTENTION_THRESHOLD
-        self.overlap = overlap or ATTENTION_OVERLAP
-        self.window_size = window_size or ATTENTION_WINDOW_SIZE
-        self.breakpoint_percentile = breakpoint_percentile or ATTENTION_BREAKPOINT_PERCENTILE
+        self.max_chunk_size = ATTENTION_MAX_CHUNK_SIZE if max_chunk_size is None else max_chunk_size
+        self.min_chunk_size = ATTENTION_MIN_CHUNK_SIZE if min_chunk_size is None else min_chunk_size
+        self.threshold = ATTENTION_THRESHOLD if threshold is None else threshold
+        self.overlap = ATTENTION_OVERLAP if overlap is None else overlap
+        self.window_size = ATTENTION_WINDOW_SIZE if window_size is None else window_size
+        self.breakpoint_percentile = ATTENTION_BREAKPOINT_PERCENTILE if breakpoint_percentile is None else breakpoint_percentile
         
         # Embedding 后端：EMBED_BACKEND=api 直接走 API；local 时按模型名判断 Ollama / HF
         self.use_api_embed = EMBED_BACKEND == "api"
@@ -1503,7 +1507,7 @@ class AttentionSemanticSplitter:
                 self._ollama_embed = OllamaEmbedding(
                     model_name=self.model_name,
                     base_url=OLLAMA_BASE,
-                    ollama_additional_kwargs={"num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "2048"))},
+                    ollama_additional_kwargs={"num_ctx": int(os.getenv("EMBED_NUM_CTX", "2048"))},
                 )
                 print("[SemanticSplitter] Ollama 模型初始化完成")
             except Exception as e:
@@ -2726,14 +2730,14 @@ def _normalize_text_for_embed(text: str) -> str:
         t = _clean_ocr_garbage(t)
 
     # 2.1 结构化文本展平（表格/参数行 -> 每行一个自然段）
-    if os.getenv("STRUCTURED_FLATTEN", "1") not in {"0", "false", "False"}:
+    if env_bool("STRUCTURED_FLATTEN", True):
         try:
             t = _flatten_aligned_blocks_to_paragraphs(t)
         except Exception:
             pass
 
     # 2.2 图/表引用锚点增强（复制后续若干行描述到引用附近）
-    if os.getenv("ANCHOR_FIGURE_TABLE", "1") not in {"0", "false", "False"}:
+    if env_bool("ANCHOR_FIGURE_TABLE", True):
         try:
             t = _anchor_figure_table_refs(t)
         except Exception:
@@ -3064,41 +3068,44 @@ def _parent_child_parse(documents) -> list:
             print(f"[Parent-Child] 文档 {file_path} 切块失败: {e}, 使用回退方案")
             chunks = [(text, {"parent_idx": 0, "child_idx": 0, "split_method": "fallback"})]
         
-        # 第一遍：生成所有 node IDs 用于建立邻接关系
-        chunk_node_ids = []
+        # 第一遍：先过滤低价值块，再按保留结果建立父子关系。
+        retained = []
         for idx, (chunk_text, chunk_meta) in enumerate(chunks):
-            node_id = hashlib.md5(f"{fragment_id}-pc-{idx}".encode('utf-8'), usedforsecurity=False).hexdigest()
-            chunk_node_ids.append(node_id)
-        
-        # 预先聚合每个 parent 的子块区间：一次 O(n) 扫描。
-        # 原实现是在下面这层循环里再遍历一遍 chunks 找同 parent 的首尾，
-        # 整体是 O(n²)：1e4 chunk 约 30~60s，1e5 chunk 要跑一小时以上。
-        parent_span: dict = {}
-        for _idx, (_, _meta) in enumerate(chunks):
-            _pidx = _meta.get('parent_idx', 0)
-            _span = parent_span.get(_pidx)
-            if _span is None:
-                parent_span[_pidx] = [_idx, _idx]
-            else:
-                _span[1] = _idx
-
-        # 第二遍：构建节点
-        for idx, (chunk_text, chunk_meta) in enumerate(chunks):
-            node_id = chunk_node_ids[idx]
-            
-            # 构建邻接关系
-            prev_id = chunk_node_ids[idx - 1] if idx > 0 else None
-            next_id = chunk_node_ids[idx + 1] if idx < len(chunks) - 1 else None
-            
-            # 同一 parent 内的位置信息（O(1) 查表）
-            current_parent_idx = chunk_meta.get('parent_idx', 0)
-            parent_first_child, parent_last_child = parent_span.get(current_parent_idx, [idx, idx])
-
-            parent_id = hashlib.md5(f"{fragment_id}-parent-{current_parent_idx}".encode(), usedforsecurity=False).hexdigest()
             parent_text = chunk_meta.get("_parent_text") or text
             from pcb_rag.pcb_facts import enrich_table_child
-            chunk_text, table_metadata = enrich_table_child(chunk_text, parent_text)
+            enriched_text, table_metadata = enrich_table_child(chunk_text, parent_text)
             chunk_meta = {key: value for key, value in chunk_meta.items() if key != "_parent_text"}
+            merged_meta = {**doc_metadata, **chunk_meta, **table_metadata}
+            if not merged_meta.get('section'):
+                merged_meta['section'] = merged_meta.get('parent_title') or merged_meta.get('chunk_section') or ''
+            enhanced_meta = enhance_chunk_metadata(enriched_text, merged_meta, text, file_path)
+            if _apply_chunk_quality(enhanced_meta, enriched_text):
+                retained.append((enriched_text, enhanced_meta, parent_text))
+        chunks = retained
+        chunk_node_ids = [
+            hashlib.md5(f"{fragment_id}-pc-{idx}".encode('utf-8'), usedforsecurity=False).hexdigest()
+            for idx in range(len(chunks))
+        ]
+        parent_first = {}
+        parent_last = {}
+        for idx, (_, meta, _) in enumerate(chunks):
+            parent_idx = meta.get('parent_idx', 0)
+            parent_first.setdefault(parent_idx, idx)
+            parent_last[parent_idx] = idx
+
+        # 第二遍：构建节点
+        for idx, (chunk_text, chunk_meta, parent_text) in enumerate(chunks):
+            node_id = chunk_node_ids[idx]
+
+            # 邻接只连接同一 parent 的保留子块，避免跨章节/跨文档扩展。
+            prev_id = chunk_node_ids[idx - 1] if idx > 0 and chunks[idx - 1][1].get('parent_idx') == chunk_meta.get('parent_idx', 0) else None
+            next_id = chunk_node_ids[idx + 1] if idx < len(chunks) - 1 and chunks[idx + 1][1].get('parent_idx') == chunk_meta.get('parent_idx', 0) else None
+
+            current_parent_idx = chunk_meta.get('parent_idx', 0)
+            parent_first_child = parent_first[current_parent_idx]
+            parent_last_child = parent_last[current_parent_idx]
+
+            parent_id = hashlib.md5(f"{fragment_id}-parent-{current_parent_idx}".encode(), usedforsecurity=False).hexdigest()
             if idx == parent_first_child:
                 parent_meta = dict(doc_metadata, **chunk_meta)
                 parent_meta.update(doc_node_id=doc_node_id, node_level="parent", parent_id="", logical_chunk_id=parent_id)
@@ -3113,9 +3120,7 @@ def _parent_child_parse(documents) -> list:
             # 模式下所有 chunk 的 source_type 落到 schema 默认值 unknown ——
             # 按类型过滤全部失效、引用无法定位章节、评测分组统计失真。
             merged_meta = {
-                **doc_metadata,
                 **chunk_meta,
-                **table_metadata,
                 'node_level': 'child',
                 # 邻接关系
                 'prev_id': prev_id or '',
@@ -3123,35 +3128,15 @@ def _parent_child_parse(documents) -> list:
                 'doc_node_id': doc_node_id,
                 # 父块锚点（供 expand_chunks_with_context 做父级扩展）
                 'parent_id': parent_id,
-                
+
                 # Parent 内的位置信息
                 'is_first_in_parent': (idx == parent_first_child),
                 'is_last_in_parent': (idx == parent_last_child),
-                
+
                 # 全局位置
                 'total_chunks_in_doc': len(chunks),
             }
-
-            # 章节字段归一：下游（build_context_with_sources / 引用溯源）
-            # 依次取 parent_title → chunk_section → section，这里统一补一份，
-            # 避免不同切块器的字段命名差异导致章节信息丢失。
-            if not merged_meta.get('section'):
-                merged_meta['section'] = (
-                    merged_meta.get('parent_title')
-                    or merged_meta.get('chunk_section')
-                    or ''
-                )
-            
-            # 增强元数据
-            enhanced_meta = enhance_chunk_metadata(
-                chunk_text=chunk_text,
-                chunk_meta=merged_meta,
-                doc_text=text,
-                file_path=file_path
-            )
-            # 低价值块（裸标签罗列等）：flag 模式打标记，drop 模式跳过
-            if not _apply_chunk_quality(enhanced_meta, chunk_text):
-                continue
+            enhanced_meta = merged_meta
             
             node = TextNode(
                 text=chunk_text,
@@ -3238,12 +3223,27 @@ def _attention_semantic_parse(documents) -> list:
             else:
                 chunk_sections.append(None)
         
-        # 第二遍：构建层次关系
+        # 第二遍：先过滤，再按保留结果构建层次关系
+        chunks = [
+            (
+                chunk_text,
+                enhance_chunk_metadata(chunk_text, {**doc_metadata, **(chunk_meta or {})}, text, file_path),
+                chunk_sections[idx],
+            )
+            for idx, (chunk_text, chunk_meta) in enumerate(chunks)
+            if _apply_chunk_quality(
+                enhance_chunk_metadata(chunk_text, {**doc_metadata, **(chunk_meta or {})}, text, file_path),
+                chunk_text,
+            )
+        ]
         section_stack = []  # 用于追踪父章节 [(section_num, node_id), ...]
         
-        for idx, (chunk_text, chunk_meta) in enumerate(chunks):
+        chunk_node_ids = [
+            hashlib.md5(f"{doc_id}-sem-{idx}".encode('utf-8'), usedforsecurity=False).hexdigest()
+            for idx in range(len(chunks))
+        ]
+        for idx, (chunk_text, chunk_meta, section_info) in enumerate(chunks):
             node_id = chunk_node_ids[idx]
-            section_info = chunk_sections[idx]
             
             # 构建邻接关系
             prev_id = chunk_node_ids[idx - 1] if idx > 0 else None
@@ -3279,8 +3279,8 @@ def _attention_semantic_parse(documents) -> list:
                 'total_chunks': len(chunks),
             }
             
-            # 合并metadata
-            merged_meta = {**doc_metadata}
+            # 合并metadata，保留过滤阶段的质量标记。
+            merged_meta = dict(chunk_meta)
             if chunk_meta:
                 merged_meta['split_method'] = chunk_meta.get('split_method', 'semantic')
                 merged_meta['chunk_idx'] = chunk_meta.get('chunk_idx', idx)
@@ -3302,21 +3302,11 @@ def _attention_semantic_parse(documents) -> list:
                     merged_meta['section_title'] = section_info['section_title']
                     merged_meta['section_level'] = section_info['level']
             
-            # 增强元数据
-            enhanced_meta = enhance_chunk_metadata(
-                chunk_text=chunk_text,
-                chunk_meta=merged_meta,
-                doc_text=text,
-                file_path=file_path
-            )
-            # 低价值块（裸标签罗列等）：flag 模式打标记，drop 模式跳过
-            if not _apply_chunk_quality(enhanced_meta, chunk_text):
-                continue
-            
+            # 元数据增强已在过滤阶段完成；这里只写入最终节点。
             node = TextNode(
                 text=chunk_text,
                 id_=node_id,
-                metadata=enhanced_meta
+                metadata=merged_meta
             )
             nodes.append(node)
             total_chunks += 1
@@ -3337,7 +3327,7 @@ def _attention_semantic_parse(documents) -> list:
 #   - 设 INGEST_INCREMENTAL=0 可退回「每次全量处理」的旧行为
 # =============================================================================
 
-INGEST_INCREMENTAL = os.getenv("INGEST_INCREMENTAL", "1") not in {"0", "false", "False"}
+INGEST_INCREMENTAL = env_bool("INGEST_INCREMENTAL", True)
 INGEST_MANIFEST_PATH = os.getenv("INGEST_MANIFEST_PATH", "./data/ingest_manifest.json")
 
 # 指纹 / 比对 / 清单读写的实现已下沉到 pcb_rag/incremental.py（纯标准库，可单测）。
@@ -3500,6 +3490,12 @@ def _load_ingest_documents(data_dir=None):
         raise FileNotFoundError(f"source directory does not exist: {directory}")
     if not any(path.is_file() for path in directory.rglob("*")):
         return []
+    if AUTO_FIX_ENCODING:
+        if env_bool("INGEST_PLAN_ONLY", False):
+            # Preview must be read-only: diagnose repairs without rewriting sources.
+            _fix_file_encodings(str(directory), write=False)
+        else:
+            _fix_file_encodings(str(directory))
     documents = SimpleDirectoryReader(data_dir or DATA_DIR, recursive=True,
         file_extractor={".pdf": PyMuPDFReader(), ".docx": DocxReader(), ".doc": RTFReader()}).load_data()
     page_counts = {}
@@ -3518,7 +3514,7 @@ def _load_ingest_documents(data_dir=None):
         if ACL_ENABLED:
             for key, value in acl_metadata_for_ingest().items():
                 document.metadata.setdefault(key, value)
-        if os.getenv("NORMALIZE_TEXT", "1").lower() not in {"0", "false"}:
+        if env_bool("NORMALIZE_TEXT", True):
             _set_node_text(document, _normalize_text_for_embed(document.text))
     from pcb_rag.pcb_facts import link_continued_tables
     return link_continued_tables(documents)
@@ -3536,6 +3532,11 @@ def _parse_ingest_documents(documents):
         nodes = _structure_aware_parse(documents)
     else:
         nodes = parser.get_nodes_from_documents(documents, show_progress=True)
+    if parser not in {"parent_child", "attention", None}:
+        nodes = [
+            node for node in nodes
+            if _apply_chunk_quality(node.metadata, node.text)
+        ]
     nodes = _ensure_doc_node_id(nodes, documents)
     parents = [node for node in nodes if node.metadata.get("node_level") == "parent"]
     children = [node for node in nodes if node.metadata.get("node_level") != "parent"]
@@ -3548,7 +3549,72 @@ def _parse_ingest_documents(documents):
         node.metadata["pcb_facts"] = extract_qualified_facts(node.text, node.metadata)
     children = apply_contextual_retrieval(children, documents)
     children = _truncate_text_nodes(children, max_bytes=60000, target_bytes=12000)
+    child_parents = {node.metadata.get("parent_id") for node in children}
+    parents = [node for node in parents if node.id_ in child_parents]
     return parents + children
+
+
+#: 只服务于建图的元数据，写向量库时临时剔除。
+#:
+#: ``pcb_facts`` 单块可达 40 KB 以上；llama-index 还会把整个节点再序列化一份进
+#: ``_node_content``，两份相加会超过 Milvus 的 65536 字节动态字段上限
+#: （实测报错：the length (83990) of dynamic field exceeds max length (65536)）。
+#: 建图阶段从 chunks 快照重新读取节点，元数据完整，因此剔除不影响图谱。
+_VECTOR_INSERT_DROPPED_METADATA: Tuple[str, ...] = ("pcb_facts",)
+
+
+@contextmanager
+def vector_insert_metadata(nodes, keys: Tuple[str, ...] = _VECTOR_INSERT_DROPPED_METADATA):
+    """写入向量库期间临时剔除大体积元数据，退出（含异常）后原样恢复。"""
+
+    saved = []
+    for node in nodes:
+        removed = {key: node.metadata.pop(key) for key in keys if key in node.metadata}
+        if removed:
+            saved.append((node, removed))
+    try:
+        yield nodes
+    finally:
+        for node, removed in saved:
+            node.metadata.update(removed)
+
+
+def embedding_field_name():
+    return os.getenv("MILVUS_EMBEDDING_FIELD", "embedding")
+
+
+def artifact_config(overrides=None):
+    """Configuration for artifact fingerprints, excluding credentials and IO budgets."""
+    import inspect
+    from pcb_rag.api_clients import get_embedding_profile
+    from pcb_rag.graph_rag import _build_gleaning_prompt, _build_triple_prompt
+
+    config = dict(os.environ)
+    config.update(overrides or {})
+    for key in list(config) + [key for key in globals() if key.isupper()]:
+        value = globals().get(key)
+        if isinstance(value, (str, int, float, bool)) and not any(word in key for word in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+            config[key] = value
+    config["PARSER_IMPLEMENTATION"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    config["METADATA_IMPLEMENTATION"] = hashlib.sha256(inspect.getsource(enhance_chunk_metadata).encode()).hexdigest()
+    config["CONTEXTUAL_IMPLEMENTATION"] = hashlib.sha256(inspect.getsource(apply_contextual_retrieval).encode()).hexdigest()
+    config["GRAPH_PROMPT_IMPLEMENTATION"] = hashlib.sha256(
+        (inspect.getsource(_build_triple_prompt) + inspect.getsource(_build_gleaning_prompt)).encode()
+    ).hexdigest()
+    if "EMBEDDING_PROFILE" not in (overrides or {}):
+        config["EMBEDDING_PROFILE"] = get_embedding_profile(document_text="passage_text_only_v2") if EMBED_BACKEND == "api" else {
+            "backend": EMBED_BACKEND, "model": config.get("OLLAMA_EMBED_MODEL"),
+            "dimension": config.get("EMBED_DIM"), "document_text": "passage_text_only_v2",
+        }
+    config["CHUNK_EMBEDDING_PROFILE"] = config["EMBEDDING_PROFILE"]
+    config["METADATA_IMPLEMENTATION"] += hashlib.sha256(Path(__file__).with_name("pcb_facts.py").read_bytes()).hexdigest()
+    config["MULTIMODAL_IMPLEMENTATION"] = hashlib.sha256(Path(__file__).with_name("multimodal.py").read_bytes()).hexdigest()
+    config["CHUNK_QUALITY_IMPLEMENTATION"] = hashlib.sha256(Path(__file__).with_name("chunk_quality.py").read_bytes()).hexdigest()
+    config["LEXICAL_IMPLEMENTATION"] = hashlib.sha256(Path(__file__).with_name("query.py").read_bytes()).hexdigest()
+    config["GRAPH_IMPLEMENTATION"] = hashlib.sha256(
+        Path(__file__).with_name("graph_rag.py").read_bytes() + Path(__file__).with_name("graph_semantic.py").read_bytes()
+    )
+    return config
 
 
 def main():
@@ -3557,31 +3623,9 @@ def main():
     from pcb_rag.graph_semantic import build_graph_vectors
     from pcb_rag.api_clients import get_embedding_profile
     from pcb_rag.embedding_contract import ensure_ingest_embedding_profile
-    import inspect
 
     documents = _load_ingest_documents()
-    config = dict(os.environ)
-    # Include effective defaults and implementation hashes: a code upgrade can
-    # require backfill even when environment and source bytes do not change.
-    for key in list(config) + [key for key in globals() if key.isupper()]:
-        value = globals().get(key)
-        if isinstance(value, (str, int, float, bool)) and not any(word in key for word in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
-            config[key] = value
-    config["PARSER_IMPLEMENTATION"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    config["METADATA_IMPLEMENTATION"] = hashlib.sha256(inspect.getsource(enhance_chunk_metadata).encode()).hexdigest()
-    config["CONTEXTUAL_IMPLEMENTATION"] = hashlib.sha256(inspect.getsource(apply_contextual_retrieval).encode()).hexdigest()
-    from pcb_rag.graph_rag import _build_triple_prompt, _build_gleaning_prompt
-    config["GRAPH_PROMPT_IMPLEMENTATION"] = hashlib.sha256((inspect.getsource(_build_triple_prompt) + inspect.getsource(_build_gleaning_prompt)).encode()).hexdigest()
-    config["EMBEDDING_PROFILE"] = get_embedding_profile(document_text="passage_text_only_v2") if EMBED_BACKEND == "api" else {
-        "backend": EMBED_BACKEND, "model": config.get("OLLAMA_EMBED_MODEL"),
-        "dimension": config.get("EMBED_DIM"), "document_text": "passage_text_only_v2",
-    }
-    config["METADATA_IMPLEMENTATION"] += hashlib.sha256(Path(__file__).with_name("pcb_facts.py").read_bytes()).hexdigest()
-    config["LEXICAL_IMPLEMENTATION"] = hashlib.sha256(Path(__file__).with_name("query.py").read_bytes()).hexdigest()
-    config["GRAPH_IMPLEMENTATION"] = hashlib.sha256(
-        Path(__file__).with_name("graph_rag.py").read_bytes() + Path(__file__).with_name("graph_semantic.py").read_bytes()
-    ).hexdigest()
-    fingerprints = pipeline_fingerprints(config)
+    fingerprints = pipeline_fingerprints(artifact_config())
     store = RevisionStore(state_path(COLLECTION))
     # Preview is read-only and does not initialize a model or connect to Milvus.
     if os.getenv("INGEST_PLAN_ONLY", "0") == "1":
@@ -3596,7 +3640,7 @@ def main():
 
     async def create_store():
         return MilvusVectorStore(uri=MILVUS_URI, collection_name=COLLECTION, overwrite=False,
-                                 upsert_mode=True, dim=dimension, embedding_field="embedding", consistency_level="Strong")
+                                 upsert_mode=True, dim=dimension, embedding_field=embedding_field_name(), consistency_level="Strong")
     vector_store = asyncio.run(create_store())
     if os.getenv("INGEST_REQUIRE_EMPTY_COLLECTION", "0") == "1" and not (
         store.read().get("active") or store.read().get("pending")
@@ -3627,17 +3671,22 @@ def main():
         return build_graph_vectors(graph, Settings.embed_model, path, client=vector_store.client,
                                    collection_prefix=COLLECTION, backend=os.getenv("GRAPH_SEMANTIC_BACKEND", "milvus"))
 
+    def insert_nodes(nodes):
+        # pcb_facts 只用于建图；写向量时剔除，避免动态字段超过 64 KiB 上限。
+        with vector_insert_metadata(nodes):
+            index.insert_nodes(nodes)
+
     active = run_ingestion(documents, pipeline=fingerprints, collection=COLLECTION,
-        parse=_parse_ingest_documents, insert=index.insert_nodes, verify=verify,
+        parse=_parse_ingest_documents, insert=insert_nodes, verify=verify,
         graph_build=graph_build if GRAPH_RAG_ENABLED else None,
-        graph_vectors=graph_vectors if GRAPH_RAG_ENABLED and os.getenv("GRAPH_SEMANTIC_ENABLED", "1") != "0" else None,
-        store=store)
+        graph_vectors=graph_vectors if GRAPH_RAG_ENABLED and env_bool("GRAPH_SEMANTIC_ENABLED", True) else None,
+        store=store, force_rebuild=not INGEST_INCREMENTAL)
     incremental.save_manifest(INGEST_MANIFEST_PATH, active["docs"], pipeline=fingerprints, revision=active["revision"])
     print(f"Ingest published: collection={COLLECTION}, revision={active['revision']}, documents={len(active['docs'])}")
 
 
-def _fix_file_encodings(data_dir: str) -> int:
-    """修复目录下文本文件的编码问题"""
+def _fix_file_encodings(data_dir: str, *, write: bool = True) -> int:
+    """检测文件编码；``write=False`` 时仅诊断，不修改源文件。"""
     fixed_count = 0
     skipped_count = 0
     
@@ -3679,9 +3728,10 @@ def _fix_file_encodings(data_dir: str) -> int:
                         if CLEAN_OCR_GARBAGE:
                             decoded = _clean_ocr_garbage(decoded)
                         
-                        # 写回UTF-8
-                        with open(file_path, 'w', encoding='utf-8') as f:
-                            f.write(decoded)
+                        # 写回 UTF-8（预览模式只报告可修复项，绝不修改源文件）
+                        if write:
+                            with open(file_path, 'w', encoding='utf-8') as f:
+                                f.write(decoded)
                         
                         fixed_count += 1
                         print(f"   ✅ 修复: {filename} ({used_encoding} → UTF-8)")

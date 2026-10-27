@@ -122,6 +122,73 @@ def test_parser_change_rebuilds_content_and_metadata(tmp_path):
     assert list(old["docs"].values())[0]["revision"] != list(current["docs"].values())[0]["revision"]
 
 
+def test_acl_change_reparses_existing_documents(tmp_path, monkeypatch):
+    harness = Harness(tmp_path)
+    old = harness.run([document()])
+    monkeypatch.setattr("pcb_rag.security.ACL_ENABLED", True)
+    monkeypatch.setattr("pcb_rag.ingest.ACL_ENABLED", True)
+    original_parse = harness.parse
+
+    def parse_with_acl(docs):
+        from pcb_rag.security import acl_metadata_for_ingest
+
+        nodes = original_parse(docs)
+        for node in nodes:
+            node.metadata.update(acl_metadata_for_ingest())
+        return nodes
+
+    harness.parse = parse_with_acl
+    current = harness.run([document()], {"ACL_ENABLED": "1"})
+
+    assert current["revision"] != old["revision"]
+    assert harness.parses == 2
+    assert list(current["docs"].values())[0]["revision"] != list(old["docs"].values())[0]["revision"]
+    assert harness.rows[list(harness.rows)[-1]].metadata["visibility"] == "private"
+
+
+def test_force_rebuild_reparses_and_reembeds_unchanged_documents(tmp_path):
+    harness = Harness(tmp_path)
+    old = harness.run([document()])
+    current = run_ingestion(
+        [document()],
+        pipeline=pipeline_fingerprints({}),
+        collection="test",
+        parse=harness.parse,
+        insert=harness.insert,
+        verify=harness.verify,
+        graph_build=harness.graph,
+        store=harness.store,
+        force_rebuild=True,
+    )
+
+    assert current["revision"] != old["revision"]
+    assert list(current["docs"].values())[0]["revision"] != list(old["docs"].values())[0]["revision"]
+    assert harness.parses == 2 and harness.inserts == 2
+    assert current["storage_revisions"]["vectors"] == current["revision"]
+
+
+def test_force_rebuild_twice_does_not_reuse_published_revision(tmp_path):
+    harness = Harness(tmp_path)
+    revisions = []
+    for _ in range(2):
+        revisions.append(
+            run_ingestion(
+                [document()],
+                pipeline=pipeline_fingerprints({}),
+                collection="test",
+                parse=harness.parse,
+                insert=harness.insert,
+                verify=harness.verify,
+                graph_build=harness.graph,
+                store=harness.store,
+                force_rebuild=True,
+            )["revision"]
+        )
+
+    assert len(set(revisions)) == 2
+    assert harness.parses == 2 and harness.inserts == 2 and harness.graphs == 2
+
+
 def test_delete_last_source_publishes_empty_snapshot_and_graph(tmp_path):
     harness = Harness(tmp_path)
     harness.run([document()])

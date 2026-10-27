@@ -93,7 +93,11 @@ def check_embed() -> bool:
             print("[FAIL] EMBED_BACKEND=api 需要配置 EMBED_MODEL（以及 EMBED_BASE_URL 或 LLM_BASE_URL）")
             return False
         dim = _env("EMBED_DIM")
-        print(f"[OK] Embedding API 配置就绪: {base} (model={model}, dim={dim or '自动探测'})")
+        provider = _env("EMBED_API_PROVIDER", "auto") or "auto"
+        print(
+            f"[OK] Embedding API 配置就绪: {base} "
+            f"(model={model}, dim={dim or '自动探测'}, provider={provider})"
+        )
         return True
 
     ollama_base = _env("OLLAMA_BASE", "http://127.0.0.1:11434").rstrip("/")
@@ -122,7 +126,16 @@ def check_rerank() -> bool:
         if not url:
             print("[FAIL] RERANK_BACKEND=api 需要配置 RERANK_API_URL（或设为 none 关闭精排）")
             return False
-        print(f"[OK] Rerank API 配置就绪: {url} (model={_env('RERANK_API_MODEL') or '服务默认'})")
+        provider = _env("RERANK_API_PROVIDER", "auto") or "auto"
+        print(
+            f"[OK] Rerank API 配置就绪: {url} "
+            f"(model={_env('RERANK_API_MODEL') or '服务默认'}, provider={provider})"
+        )
+        if url.rstrip("/").endswith("/reranking") and provider.lower() not in {"nvidia", "auto"}:
+            print(
+                "[WARN] 该地址是 NIM reranking 接口，请求体为 query/passages 对象且返回 rankings[].logit；"
+                "provider 应设为 nvidia，否则按 /v1/rerank 兼容格式发送会被 400 拒绝"
+            )
         return True
 
     print(f"[OK] Rerank 使用本地模型: backend={backend}, model={_env('HF_RERANK_MODEL') or _env('RERANK_MODEL')}")
@@ -181,8 +194,24 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--dependencies-only", action="store_true", help="check imports without network or corpus access"
     )
+    parser.add_argument("--config-only", action="store_true", help="audit dotenv keys without network or model access")
+    parser.add_argument("--strict-config", action="store_true", help="fail on unknown, duplicate, or overridden dotenv keys")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
+    if args.config_only:
+        from pcb_rag.config_audit import audit_dotenv
+
+        report = audit_dotenv(root / ".env", root=root)
+        print(f"[OK] dotenv entries={report['entries']}, known keys={report['known_keys']}")
+        for key in report["duplicates"]:
+            print(f"[FAIL] duplicate dotenv key: {key}")
+        for key in report["unknown"]:
+            print(f"[FAIL] dotenv key has no code consumer: {key}")
+        for key in report["legacy"]:
+            print(f"[WARN] legacy-only dotenv key: {key}")
+        for key in report["overridden"]:
+            print(f"[WARN] external environment overrides dotenv key: {key}")
+        return int(bool(report["duplicates"] or report["unknown"] or (args.strict_config and report["overridden"])))
     load_env(root / ".env")
 
     ok = True

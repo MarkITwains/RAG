@@ -508,7 +508,7 @@ bash scripts/serve_api.sh
 | `GRAPH_WEIGHT` | `0.35` | 图路在 RRF 融合中的权重（独立一路，有独立 rank） |
 | `FUSION_RRF_K` | `40` | 共享管道统一融合平滑参数，包含图来源 |
 | `FUSION_MIN_PER_ROUTE` | `1` | 启用配额融合时每路最低候选数；图来源参与最终 top-k |
-| `GRAPH_EXPAND_MAX` | `2` | 邻域扩展追加的额外事实条数 |
+| `GRAPH_EXPAND_MAX` | `2` | 旧 `_graph_augment` 接口的扩展上限；共享检索管道不执行此扩展 |
 | `GRAPH_COMMUNITY_ENABLED` | `0` | 是否生成社区摘要（面向综述类问题） |
 
 开启图检索前完成新版入库或图补建。图抽取与向量索引是发布校验的一部分，失败时保留旧 revision；实体/关系命中必须回查原文后才进入答案证据。

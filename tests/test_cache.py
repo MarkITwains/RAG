@@ -80,6 +80,17 @@ class TestSemanticMatch:
         cache.set("4 层板阻抗", "答案A", embedding=[1.0, 0.0])
         assert cache.get("4层板阻抗如何控制", embedding=[1.0, 0.001]) == "答案A"
 
+    def test_probe_budget_counts_only_eligible_entries(self, monkeypatch):
+        import pcb_rag.cache as cache_module
+
+        cache = SemanticCache(similarity_threshold=0.95)
+        cache.set("target", "hit", embedding=[1.0, 0.0], scope="acme")
+        cache.set("other", "private", embedding=[1.0, 0.0], scope="other")
+        cache.set("without-vector", "other", scope="acme")
+        monkeypatch.setattr(cache_module, "SEMANTIC_CACHE_MAX_PROBE", 1)
+
+        assert cache.get("new-query", embedding=[1.0, 0.0], scope="acme") == "hit"
+
     def test_far_vector_misses(self):
         cache = SemanticCache(similarity_threshold=0.95)
         cache.set("4 层板阻抗", "答案A", embedding=[1.0, 0.0])

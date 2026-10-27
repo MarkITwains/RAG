@@ -113,6 +113,17 @@ def test_sdk_cli_eval_select_identical_final_evidence(offline_pipeline):
     assert [entry.text for entry in sdk.evidence] == [node.node.text for node in evaluation]
 
 
+def test_sdk_legacy_budget_fallback_returns_evidence(offline_pipeline, monkeypatch):
+    from pcb_rag import query
+
+    monkeypatch.setattr(query, "RAG_CONTEXT_MAX_TOKENS", 0)
+    result = KnowledgeBase(auto_init=False, pipeline=offline_pipeline.pipeline).retrieve("铜厚", with_context=True)
+
+    assert [entry.chunk_id for entry in result.evidence] == ["real", "low"]
+    assert result.context
+    assert all(entry.tokens > 0 for entry in result.evidence)
+
+
 def test_disabled_routes_do_not_report_degradation(offline_pipeline):
     kb = KnowledgeBase(auto_init=False, pipeline=offline_pipeline.pipeline)
     result = kb.retrieve("铜厚")

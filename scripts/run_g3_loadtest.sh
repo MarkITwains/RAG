@@ -4,7 +4,8 @@
 # HyDE 跳过次数与 /metrics 快照。
 set -uo pipefail
 cd /root/rag_v1
-set -a; source .env.eval; set +a
+source scripts/env_defaults.sh
+pcb_rag_load_env_defaults .env.eval
 export PYTHONUNBUFFERED=1
 export SEMANTIC_CACHE_ENABLED=0     # 压测前提：关语义缓存（TestRule §二.3）
 mkdir -p logs eval/reports
@@ -36,6 +37,7 @@ for ep in retrieval ask; do
   for conc in 1 4 8; do
     echo "==== /$ep 并发 $conc × 60 ===="
     $PY scripts/load_test.py --endpoint "$ep" --concurrency "$conc" --total 60 \
+      --base-url "http://127.0.0.1:$PORT" \
       --token "$TOKEN" \
       --out "eval/reports/g3_${ep}_c${conc}.json" \
       > "logs/g3_${ep}_c${conc}.log" 2>&1

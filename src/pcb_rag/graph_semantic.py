@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 from typing import Protocol
 
-from pcb_rag.graph_rag import link_entities
+from pcb_rag.graph_rag import GRAPH_HOP, link_entities
 from pcb_rag.revisions import atomic_json, fingerprint
 
 
@@ -247,7 +247,7 @@ class GraphEvidenceRetriever:
 
         hits = []
         for name, score in link_entities(query, self.graph):
-            for edge in self.graph.related_edges([name]):
+            for edge in self.graph.related_edges([name], hops=GRAPH_HOP):
                 hits.extend(dict(source, score=score, route="entity_name") for source in _source_records(edge))
         if self.semantic_ready:
             vector = self.embed_model.get_query_embedding(query)
@@ -274,4 +274,4 @@ class GraphEvidenceRetriever:
                 continue
             node.metadata = dict(node.metadata, graph_route=hit["route"], graph_qualifiers=hit["qualifiers"])
             results.append(NodeWithScore(node=node, score=hit["score"]))
-        return sorted(results, key=lambda item: -float(item.score))
+        return sorted(results, key=lambda item: (-float(item.score), item.node.id_))[:top_k]

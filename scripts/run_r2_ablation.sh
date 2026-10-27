@@ -5,7 +5,8 @@
 # 每行先跑 2 题热身，结果全空则跳过该行（防废报告，见 2026-09-20 事故）。
 set -uo pipefail
 cd /root/rag_v1
-set -a; source .env.eval; set +a
+source scripts/env_defaults.sh
+pcb_rag_load_env_defaults .env.eval
 export PYTHONUNBUFFERED=1
 export CHUNK_EXPAND_ENABLED=0
 mkdir -p eval/reports logs

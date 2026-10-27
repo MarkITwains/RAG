@@ -29,6 +29,7 @@ import statistics
 import sys
 import time
 from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,17 +38,13 @@ for _p in (str(ROOT / "src"), str(ROOT / "eval"), str(ROOT)):
         sys.path.insert(0, _p)
 
 from pcb_rag.env_loader import load_project_env  # noqa: E402
+from pcb_rag.retrieval import get_pipeline  # noqa: E402
+from scripts.experiment_common import public_config  # noqa: E402
 
 load_project_env()
 
 TIMING_RE = re.compile(r"\[Timing\]\s*([^:：]+?)[:：]\s*([\d.]+)\s*s")
 ROUTE_RE = re.compile(r"\[QueryRoute\]\s+(\w+)")
-ENV_KEYS = (
-    "RECALL_TOP_K", "RERANK_TOP_N", "FUSION_NUM_QUERIES", "FUSION_RRF_K",
-    "HYDE_ENABLED", "CHUNK_EXPAND_ENABLED", "MULTI_EXPAND_ENABLED",
-    "QUERY_ROUTING_ENABLED", "QUERY_DECOMPOSE_ENABLED", "QUERY_STEP_BACK_ENABLED",
-    "QUERY_UNDERSTANDING_MODE",
-)
 KS = (1, 3, 5, 10)
 
 
@@ -182,7 +179,9 @@ def main() -> int:
             for k in sorted(timing_keys)
         },
         "route_counter": dict(Counter(r["route"] for r in results)),
-        "env": {k: os.getenv(k) for k in ENV_KEYS},
+        "env": public_config(dict(os.environ)),
+        "pipeline": asdict(get_pipeline().config),
+        "cli": {"top_k": args.top_k, "warmup": args.warmup, "limit": args.limit},
     }
     empty_n = sum(1 for r in results if not r["got_ids"])
     summary["empty_results"] = empty_n

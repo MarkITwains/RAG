@@ -71,9 +71,12 @@ class Ticket:
 
 
 class RerankControl:
-    def __init__(self, path: str | Path, scope: str, token_budget: int, request_budget: int):
+    def __init__(self, path: str | Path, scope: str, token_budget: int, request_budget: int, reservation_ttl: float = 3600):
         if token_budget < 0 or request_budget < 0:
             raise ValueError("Rerank budgets cannot be negative; zero means unlimited")
+        if reservation_ttl <= 0:
+            raise ValueError("Rerank reservation TTL must be positive")
+        self.reservation_ttl = float(reservation_ttl)
         self.path = Path(path).expanduser()
         self.scope = scope
         self.token_budget = token_budget
@@ -93,7 +96,8 @@ class RerankControl:
                     document_chars INTEGER NOT NULL, estimated_tokens INTEGER NOT NULL,
                     actual_tokens INTEGER, accounted_tokens INTEGER, usage_source TEXT, usage_json TEXT,
                     status TEXT NOT NULL, http_status INTEGER, error_type TEXT, response_meta_json TEXT,
-                    started_at TEXT NOT NULL, finished_at TEXT, scheduled_at REAL NOT NULL
+                    started_at TEXT NOT NULL, finished_at TEXT, scheduled_at REAL NOT NULL,
+                    expires_at REAL NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS requests_scope ON requests(scope);
             """)
@@ -102,6 +106,8 @@ class RerankControl:
                 db.execute("ALTER TABLE requests ADD COLUMN response_meta_json TEXT")
             if "requested_top_n" not in columns:
                 db.execute("ALTER TABLE requests ADD COLUMN requested_top_n INTEGER")
+            if "expires_at" not in columns:
+                db.execute("ALTER TABLE requests ADD COLUMN expires_at REAL NOT NULL DEFAULT 0")
             db.execute(
                 "INSERT OR IGNORE INTO budgets(scope,token_limit,request_limit,updated_at) VALUES(?,?,?,?)",
                 (scope, token_budget, request_budget, utc_now()),
@@ -110,6 +116,43 @@ class RerankControl:
             if stored != (token_budget, request_budget):
                 raise ValueError("Rerank scope budgets differ from the frozen limits; choose a new scope")
         self.path.chmod(0o600)
+        self._reap_expired_reservations()
+
+    def _reap_expired_reservations(self, *, current_time=None):
+        """Release abandoned reservations without fabricating provider usage."""
+        now = time.time() if current_time is None else current_time
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            expired = db.execute(
+                "SELECT request_id,estimated_tokens,scheduled_at,expires_at,status FROM requests WHERE scope=? AND status IN ('reserved','queued','in_flight')",
+                (self.scope,),
+            ).fetchall()
+            for request_id, tokens, scheduled_at, expires_at, status in expired:
+                # Rows written before leases have expires_at=0. Infer their
+                # original lease from scheduled_at, never reap fresh in-flight work.
+                if expires_at:
+                    if now <= expires_at:
+                        continue
+                elif now - float(scheduled_at) <= self.reservation_ttl:
+                    continue
+                potentially_sent = status == "in_flight"
+                db.execute(
+                    "UPDATE requests SET status=?,actual_tokens=NULL,accounted_tokens=?,"
+                    "usage_source='expired_unfinished',finished_at=? WHERE request_id=?",
+                    ("expired_inflight" if potentially_sent else "expired_unsent", tokens if potentially_sent else 0, utc_now(), request_id),
+                )
+                if potentially_sent:
+                    db.execute(
+                        "UPDATE budgets SET reserved_tokens=max(0,reserved_tokens-?),"
+                        "accounted_tokens=accounted_tokens+?,updated_at=? WHERE scope=?",
+                        (tokens, tokens, utc_now(), self.scope),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE budgets SET reserved_tokens=max(0,reserved_tokens-?),"
+                        "attempts=max(0,attempts-1),updated_at=? WHERE scope=?",
+                        (tokens, utc_now(), self.scope),
+                    )
 
     @classmethod
     def from_env(cls, env=None):
@@ -120,6 +163,7 @@ class RerankControl:
             env.get("RERANK_BUDGET_SCOPE", "production:" + utc_now()[:10]),
             int(env.get("RERANK_TOKEN_BUDGET", "0")),
             int(env.get("RERANK_REQUEST_BUDGET", "0")),
+            float(env.get("RERANK_RESERVATION_TTL_SECONDS", "3600")),
         )
 
     @contextmanager
@@ -199,6 +243,7 @@ class RerankControl:
         timestamp = time.time() if current_time is None else current_time
         request_id = uuid.uuid4().hex
         failure = None
+        self._reap_expired_reservations(current_time=timestamp)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             limit, requests, used, reserved, attempts, reason = db.execute(
@@ -230,7 +275,7 @@ class RerankControl:
                 )
                 db.execute(
                     "INSERT INTO requests(request_id,scope,phase,activity,model,candidates,query_chars,document_chars,"
-                    "estimated_tokens,status,started_at,scheduled_at,requested_top_n) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "estimated_tokens,status,started_at,scheduled_at,requested_top_n,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         request_id,
                         self.scope,
@@ -245,20 +290,37 @@ class RerankControl:
                         utc_now(),
                         scheduled,
                         top_n,
+                        timestamp + self.reservation_ttl,
                     ),
                 )
         if failure:
             raise failure
         return Ticket(request_id, scheduled, estimate)
 
+    def _set_lifecycle(self, ticket, status):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE requests SET status=?,expires_at=? WHERE request_id=? AND scope=? AND status IN ('reserved','queued','in_flight')",
+                (status, time.time() + self.reservation_ttl, ticket.request_id, self.scope),
+            )
+
+    def mark_queued(self, ticket):
+        self._set_lifecycle(ticket, "queued")
+
+    def mark_inflight(self, ticket):
+        self._set_lifecycle(ticket, "in_flight")
+
     def wait(self, ticket: Ticket) -> None:
         from pcb_rag.runtime import DeadlineExceeded
+        self.mark_queued(ticket)
         try:
             while True:
                 self.check()
                 remaining = ticket.scheduled_at - time.time()
                 if remaining <= 0:
                     return
+                self.mark_queued(ticket)
                 time.sleep(min(remaining, 0.25))
         except (RerankStopped, DeadlineExceeded):
             self.finish(ticket, status="cancelled", actual_tokens=0, usage_source="not_sent")
@@ -283,7 +345,7 @@ class RerankControl:
             stored = db.execute(
                 "SELECT status FROM requests WHERE request_id=? AND scope=?", (ticket.request_id, self.scope)
             ).fetchone()
-            if stored is None or stored[0] != "reserved":
+            if stored is None or stored[0] not in {"reserved", "queued", "in_flight"}:
                 raise RuntimeError("Rerank request was already settled or belongs to another scope")
             db.execute(
                 "UPDATE requests SET status=?,actual_tokens=?,accounted_tokens=?,usage_source=?,usage_json=?,"

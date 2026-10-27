@@ -29,6 +29,7 @@ import logging
 import math
 import time
 from typing import Any, List, Optional, Sequence
+from urllib.parse import urlsplit
 
 from pcb_rag.embedding_contract import embedding_profile, resolve_embedding_provider
 from pcb_rag.rerank_control import RerankControl, RerankStopped, extract_usage, provider_identity
@@ -113,6 +114,14 @@ RERANK_API_URL = os.getenv("RERANK_API_URL", "").strip()
 RERANK_API_KEY = os.getenv("RERANK_API_KEY", "").strip() or LLM_API_KEY
 RERANK_API_MODEL = os.getenv("RERANK_API_MODEL", "").strip()
 RERANK_API_TIMEOUT = float(os.getenv("RERANK_API_TIMEOUT", "60"))
+#: ``auto`` / ``openai`` / ``nvidia``。``openai`` 指 Jina、硅基流动、DashScope 这类
+#: ``/v1/rerank`` 兼容接口；``nvidia`` 指 NIM 的 ``/retrieval/.../reranking`` 接口，
+#: 两者请求体与返回体都不同，不能混用。
+RERANK_API_PROVIDER = os.getenv("RERANK_API_PROVIDER", "auto").strip().lower()
+RERANK_TRUNCATE = os.getenv("RERANK_TRUNCATE", "END").strip().upper()
+
+#: NIM reranking 接口的 passages 数量上限（服务端硬限制）。
+NVIDIA_RERANK_MAX_PASSAGES = 512
 
 _PLACEHOLDER_KEY = "sk-no-key-required"
 
@@ -147,7 +156,7 @@ def build_llm(
     """构建 LLM 实例（``local`` = Ollama，``api`` = OpenAI 兼容）。"""
 
     backend = (backend or LLM_BACKEND).strip().lower()
-    temp = 0.7 if temperature is None else float(temperature)
+    temp = LLM_TEMPERATURE if temperature is None else float(temperature)
 
     if backend == "api":
         from llama_index.llms.openai_like import OpenAILike
@@ -235,8 +244,11 @@ def build_embed_model(model: Optional[str] = None, *, backend: Optional[str] = N
         if provider == "nvidia":
             from pcb_rag.nvidia_embeddings import NvidiaApiEmbedding
 
-            if EMBED_TRUNCATE not in {"END", "NONE", "START"}:
-                raise ValueError("EMBED_TRUNCATE must be END, START, or NONE")
+            # NIM embeddings accept only END / NONE; START is rejected with HTTP 400.
+            if EMBED_TRUNCATE not in {"END", "NONE"}:
+                raise ValueError("EMBED_TRUNCATE must be END or NONE for the NVIDIA embeddings API")
+            if EMBED_DIM and not 1 <= EMBED_DIM <= 4096:
+                raise ValueError("EMBED_DIM must be between 1 and the model's native 4096 dimensions")
             return NvidiaApiEmbedding(
                 **kwargs,
                 truncate=EMBED_TRUNCATE,
@@ -258,11 +270,25 @@ def build_embed_model(model: Optional[str] = None, *, backend: Optional[str] = N
         pass
 
     # 修复：原先硬编码模型名，导致 OLLAMA_EMBED_MODEL 环境变量完全失效
-    return MeteredOllamaEmbedding(
+    import inspect
+
+    kwargs = {}
+    if "client_kwargs" in inspect.signature(OllamaEmbedding.__init__).parameters:
+        kwargs["client_kwargs"] = {"timeout": OLLAMA_TIMEOUT}
+    embed = MeteredOllamaEmbedding(
         model_name=model or OLLAMA_EMBED_MODEL,
         base_url=OLLAMA_BASE,
         ollama_additional_kwargs={"num_ctx": EMBED_NUM_CTX},
+        **kwargs,
     )
+    if not kwargs:
+        # 0.4.x creates the Ollama clients before a subclass can pass client_kwargs.
+        # httpx requests inherit this default; update both sync and async clients.
+        import httpx
+
+        for client in (embed._client, embed._async_client):
+            client._client._timeout = httpx.Timeout(OLLAMA_TIMEOUT)
+    return embed
 
 
 def get_embedding_profile(dimension: Optional[int] = None, *, document_text="llama_index_metadata_embed_v1") -> dict:
@@ -325,6 +351,40 @@ class ApiReranker(BaseNodePostprocessor):
     def class_name(cls) -> str:
         return "ApiReranker"
 
+    def _wire_payload(self, query: str, documents: Sequence[str], wanted: int) -> dict[str, Any]:
+        """Build the provider-specific request body (Jina / 硅基流动 / DashScope 兼容)."""
+        payload: dict[str, Any] = {
+            "query": query,
+            "documents": list(documents),
+            "top_n": wanted,
+            "return_documents": False,
+        }
+        if self.model:
+            payload["model"] = self.model
+        return payload
+
+    def _parse_scores(
+        self, data: dict[str, Any], documents: Sequence[str], wanted: int
+    ) -> List[Optional[float]]:
+        """Map a provider response onto document positions, rejecting malformed output."""
+        results = data.get("results")
+        if results is None and isinstance(data.get("output"), dict):
+            results = data["output"].get("results")
+        if results is None and isinstance(data.get("data"), list):
+            results = data["data"]
+        if not isinstance(results, list) or len(results) < wanted:
+            raise ValueError("Missing rerank scores")
+        scores: List[Optional[float]] = [None] * len(documents)
+        for item in results:
+            idx = item.get("index")
+            score = float(item.get("relevance_score", item.get("score")))
+            if isinstance(idx, bool) or not isinstance(idx, int) or not 0 <= idx < len(scores):
+                raise ValueError("Invalid rerank index")
+            if scores[idx] is not None or not math.isfinite(score):
+                raise ValueError("Duplicate index or nonfinite rerank score")
+            scores[idx] = score
+        return scores
+
     def _request_scores(self, query: str, documents: Sequence[str]) -> List[Optional[float]]:
         import requests
 
@@ -335,14 +395,7 @@ class ApiReranker(BaseNodePostprocessor):
         query = query[:self.max_query_chars]
         documents = [document[:self.max_document_chars] for document in documents]
         wanted = min(self.top_n, len(documents))
-        payload: dict[str, Any] = {
-            "query": query,
-            "documents": documents,
-            "top_n": wanted,
-            "return_documents": False,
-        }
-        if self.model:
-            payload["model"] = self.model
+        payload = self._wire_payload(query, documents, wanted)
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -381,6 +434,7 @@ class ApiReranker(BaseNodePostprocessor):
                 control.finish(ticket, status="cancelled", actual_tokens=0, usage_source="not_sent")
                 raise
             try:
+                control.mark_inflight(ticket)
                 resp = requests.post(self.api_url, json=payload, headers=headers, timeout=timeout, allow_redirects=False)
             except requests.RequestException as exc:
                 record(ticket, status="transport_error", error_type=type(exc).__name__, stop_reason="transport_error_billing_unknown")
@@ -432,22 +486,7 @@ class ApiReranker(BaseNodePostprocessor):
                     print(f"[Rerank] 429 限流，无剩余重试，Retry-After={resp.headers.get('Retry-After', '')}", flush=True)
                 raise RerankStopped(f"Rerank HTTP {resp.status_code}; circuit opened, no ranking fallback")
             try:
-                results = data.get("results")
-                if results is None and isinstance(data.get("output"), dict):
-                    results = data["output"].get("results")
-                if results is None and isinstance(data.get("data"), list):
-                    results = data["data"]
-                if not isinstance(results, list) or len(results) < wanted:
-                    raise ValueError("Missing rerank scores")
-                scores: List[Optional[float]] = [None] * len(documents)
-                for item in results:
-                    idx = item.get("index")
-                    score = float(item.get("relevance_score", item.get("score")))
-                    if isinstance(idx, bool) or not isinstance(idx, int) or not 0 <= idx < len(scores):
-                        raise ValueError("Invalid rerank index")
-                    if scores[idx] is not None or not math.isfinite(score):
-                        raise ValueError("Duplicate index or nonfinite rerank score")
-                    scores[idx] = score
+                scores = self._parse_scores(data, documents, wanted)
             except (ValueError, TypeError, AttributeError) as exc:
                 record(ticket, status="protocol_error", error_type=type(exc).__name__, stop_reason="invalid_rerank_response", **accounting)
                 raise RerankStopped("Rerank response invalid; circuit opened, no ranking fallback") from exc
@@ -478,24 +517,98 @@ class ApiReranker(BaseNodePostprocessor):
         return sorted(scored, key=lambda x: -x.score)[: self.top_n]
 
 
+class NvidiaApiReranker(ApiReranker):
+    """NIM ``/retrieval/<model>/reranking`` 接口适配。
+
+    与 Jina / 硅基流动兼容接口的三处差异（2026-10-23 实测确认）：
+
+    - ``query`` 与每个 passage 都是对象（``{"text": ...}``），传纯字符串会被 400 拒绝；
+    - 不接受 ``top_n`` / ``documents`` / ``return_documents``，传入即 ``extra_forbidden``；
+      服务端返回全部 passage 的排序，因此裁剪发生在本地；
+    - 返回 ``{"rankings": [{"index": 0, "logit": -1.955}, ...]}``，分值是 logit。
+      为保持与旧 reranker 一致的 0~1 外显语义（sources[].score 直接对外），
+      此处按 ``sigmoid(logit)`` 归一化；排序结果与 logit 完全一致。
+    """
+
+    truncate: str = Field(default="END")
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "NvidiaApiReranker"
+
+    def _wire_payload(self, query: str, documents: Sequence[str], wanted: int) -> dict[str, Any]:
+        if len(documents) > NVIDIA_RERANK_MAX_PASSAGES:
+            raise ValueError(f"NVIDIA reranking accepts at most {NVIDIA_RERANK_MAX_PASSAGES} passages")
+        if self.truncate not in {"END", "NONE"}:
+            raise ValueError("RERANK_TRUNCATE must be END or NONE for the NVIDIA reranking API")
+        payload: dict[str, Any] = {
+            "query": {"text": query},
+            "passages": [{"text": document} for document in documents],
+            "truncate": self.truncate,
+        }
+        if self.model:
+            payload["model"] = self.model
+        return payload
+
+    def _parse_scores(
+        self, data: dict[str, Any], documents: Sequence[str], wanted: int
+    ) -> List[Optional[float]]:
+        rankings = data.get("rankings")
+        if not isinstance(rankings, list) or len(rankings) < len(documents):
+            raise ValueError("Missing rerank scores")
+        scores: List[Optional[float]] = [None] * len(documents)
+        for item in rankings:
+            idx = item.get("index")
+            logit = float(item.get("logit", item.get("score")))
+            if isinstance(idx, bool) or not isinstance(idx, int) or not 0 <= idx < len(scores):
+                raise ValueError("Invalid rerank index")
+            if scores[idx] is not None or not math.isfinite(logit):
+                raise ValueError("Duplicate index or nonfinite rerank score")
+            scores[idx] = 1.0 / (1.0 + math.exp(-logit))
+        return scores
+
+
+def resolve_rerank_provider(setting: str, api_url: str) -> str:
+    """判定 rerank 线路格式（``auto`` / ``openai`` / ``nvidia``）。
+
+    自动识别同时要求官方域名与 ``/reranking`` 路径后缀，避免伪造域名被误判。
+    自建 NIM 网关请显式设置 ``RERANK_API_PROVIDER=nvidia``。
+    """
+
+    provider = setting.strip().lower()
+    if provider not in {"auto", "openai", "nvidia"}:
+        raise ValueError("RERANK_API_PROVIDER must be auto, openai, or nvidia")
+    if provider != "auto":
+        return provider
+    parts = urlsplit(api_url)
+    host = (parts.hostname or "").lower()
+    if host in {"ai.api.nvidia.com", "integrate.api.nvidia.com"} and parts.path.rstrip("/").endswith("/reranking"):
+        return "nvidia"
+    return "openai"
+
+
 def build_api_reranker(top_n: int) -> ApiReranker:
     """构建 API Reranker，缺少必要配置时抛出明确异常。"""
 
     if not RERANK_API_URL:
         raise RuntimeError(
             "RERANK_BACKEND=api 需要配置 RERANK_API_URL"
-            "（例如 https://api.jina.ai/v1/rerank 或 https://api.siliconflow.cn/v1/rerank）"
+            "（例如 https://api.jina.ai/v1/rerank，或 NIM 的 "
+            "https://ai.api.nvidia.com/v1/retrieval/nvidia/nemotron-3.5-rerank-8b/reranking）"
         )
-    return ApiReranker(
-        api_url=RERANK_API_URL,
-        api_key=RERANK_API_KEY,
-        model=RERANK_API_MODEL,
-        top_n=top_n,
-        timeout=RERANK_API_TIMEOUT,
-        max_candidates=int(os.getenv("RERANK_MAX_CANDIDATES", "50")),
-        max_document_chars=int(os.getenv("RERANK_MAX_DOCUMENT_CHARS", "1200")),
-        max_query_chars=int(os.getenv("RERANK_MAX_QUERY_CHARS", "1000")),
-    )
+    common: dict[str, Any] = {
+        "api_url": RERANK_API_URL,
+        "api_key": RERANK_API_KEY,
+        "model": RERANK_API_MODEL,
+        "top_n": top_n,
+        "timeout": RERANK_API_TIMEOUT,
+        "max_candidates": int(os.getenv("RERANK_MAX_CANDIDATES", "50")),
+        "max_document_chars": int(os.getenv("RERANK_MAX_DOCUMENT_CHARS", "1200")),
+        "max_query_chars": int(os.getenv("RERANK_MAX_QUERY_CHARS", "1000")),
+    }
+    if resolve_rerank_provider(RERANK_API_PROVIDER, RERANK_API_URL) == "nvidia":
+        return NvidiaApiReranker(**common, truncate=RERANK_TRUNCATE)
+    return ApiReranker(**common)
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +618,10 @@ def describe_backends() -> dict:
     """返回当前后端配置摘要，便于启动日志与 ``/health`` 展示。"""
 
     embed_provider = resolve_embedding_provider(EMBED_API_PROVIDER, EMBED_BASE_URL) if EMBED_BACKEND == "api" else "local"
+    rerank_backend = os.getenv("RERANK_BACKEND", "qwen3reranker").strip().lower()
+    rerank_provider = (
+        resolve_rerank_provider(RERANK_API_PROVIDER, RERANK_API_URL) if rerank_backend == "api" and RERANK_API_URL else None
+    )
     return {
         "llm_backend": LLM_BACKEND,
         "llm_model": LLM_MODEL if LLM_BACKEND == "api" else OLLAMA_LLM_MODEL,
@@ -518,4 +635,8 @@ def describe_backends() -> dict:
         "embed_base_url": EMBED_BASE_URL if EMBED_BACKEND == "api" else OLLAMA_BASE,
         "embed_configured": bool(EMBED_BASE_URL and EMBED_MODEL) if EMBED_BACKEND == "api" else bool(OLLAMA_BASE),
         "embed_dim": EMBED_DIM or None,
+        "rerank_backend": rerank_backend,
+        "rerank_api_provider": rerank_provider,
+        "rerank_model": RERANK_API_MODEL if rerank_backend == "api" else None,
+        "rerank_api_url": RERANK_API_URL if rerank_backend == "api" else None,
     }
