@@ -1,6 +1,6 @@
 # Voyage Rerank 切换记录
 
-这是历史记录。用户发现高用量后已停止本批次，并要求恢复 SiliconFlow；当前配置及保护机制见 [重排用量保护](RERANK_GUARDS_20261020.md)。旧 Voyage 批次的 42 次 HTTP 402 降级记录不能作为正常重排结果使用。
+这是历史记录。用户发现高用量后已停止本批次，并要求恢复 SiliconFlow；当前配置及保护机制见 [重排用量保护](RERANK_GUARDS_20261020.md)。旧 Voyage 批次的 42 次 HTTP 402 降级记录不能作为正常重排结果使用。本文中的原始文件路径与“保留/保存”均描述当时状态；Voyage 原始实验目录已于 2026-10-27 清理，现仅保留本文摘要。
 
 2026-10-20 按用户要求将生产与评测的重排配置从 SiliconFlow `BAAI/bge-reranker-v2-m3` 切换为 Emrank 提供的 `voyage/rerank-2.5`。
 

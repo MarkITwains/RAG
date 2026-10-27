@@ -64,8 +64,8 @@ API 已切到新集合，健康明细确认 `query` / `passage` 模式；完整�
 
 ## 回退
 
-配置修改前的备份为 `.env.backup-embedding-20261020-151507` 和 `.env.eval.backup-embedding-20261020-151507`。
+配置修改前曾使用 `.env.backup-embedding-20261020-151507` 和 `.env.eval.backup-embedding-20261020-151507`；这两份本地备份已在 2026-10-27 的遗留文件清理中删除，回退不再依赖备份文件。
 
-如需回退，先停止 API，恢复两份配置备份，再将两份文件中的 `EMBED_API_PROVIDER` 显式设为 `openai`，然后启动 API。此处 `openai` 表示恢复原来的通用兼容请求方式；模型仍在 NVIDIA 外部接口。必须同时恢复旧集合和旧请求方式，不能让新的 query 模式查询旧向量。
+如需回退，先停止 API，在 `.env` 与 `.env.eval` 中手工恢复旧集合 `pcb_kb` 及其配套缓存、清单，恢复 `EMBED_MODEL=nvidia/nemotron-3-embed-1b`、`EMBED_DIM=2048`，并将 `EMBED_API_PROVIDER` 显式设为 `openai`，然后启动 API。此处 `openai` 表示恢复原来的通用兼容请求方式；模型仍在 NVIDIA 外部接口。必须同时恢复旧集合和旧请求方式，不能让新的 query 模式查询旧向量。
 
 原集合、原缓存及原增量清单均保留。切换集合后，API 需要重启以重新创建索引、模型客户端和内存缓存。

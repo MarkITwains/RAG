@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""G5 软匹配诊断：检索只跑一次 + 多阈值离线扫描（TestRule §二.5）。
+"""G5 软匹配诊断：检索只跑一次 + 多阈值离线扫描（历史版 TestRule §二.5）。
 
 动机：evaluate_recall.py 的报告只存汇总指标、不存逐题检索结果，
 每换一个 --embed-threshold 就要全量重跑一遍检索（80 题 × HyDE + 精排限速

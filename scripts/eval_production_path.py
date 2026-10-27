@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""第 1 组第二条路径：生产路径基线（TestRule.md §二.1）。
+"""第 1 组第二条路径：生产路径基线（历史版 TestRule.md §二.1）。
 
 与 evaluate_recall.py（评测脚本路径）的差异：直接在 .env.eval 配置下 import
 ``dify_external_api``，调用生产检索函数 :func:`_retrieve_nodes`，取 node id 序列算
@@ -12,10 +12,10 @@
         --top-k 20 --out eval/reports/r1_baseline_production.json
 
 要点：
-- ``CHUNK_EXPAND_ENABLED=0``：按 TestRule 取纯排名（唯一偏离生产的开关，由运行脚本设置）；
+- ``CHUNK_EXPAND_ENABLED=0``：按历史版 TestRule 取纯排名（唯一偏离生产的开关，由运行脚本设置）；
 - 指标函数复用 ``eval/evaluate_recall.py`` 的 ``_ndcg_at_k`` / ``_average_precision``；
 - 分段耗时从 dify logger 的 ``[Timing]`` 行抓取；``[QueryRoute]`` 抓查询类型；
-- ``--warmup N`` 先跑 N 题丢弃（HyDE 30s 预算 + LLM 冷启动，见 TestRule §五）。
+- ``--warmup N`` 先跑 N 题丢弃（HyDE 30s 预算 + LLM 冷启动，见历史版 TestRule §五）。
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def main() -> int:
     args = ap.parse_args()
 
     # 注意顺序：先 import api（按当前 env 定型），再 import evaluate_recall
-    # （后者模块级会强改部分 env，见 TestRule §五 的坑）。
+    # （后者模块级会强改部分 env，见历史版 TestRule §五 的坑）。
     import pcb_rag.dify_external_api as api
     from evaluate_recall import _average_precision, _ndcg_at_k
 
