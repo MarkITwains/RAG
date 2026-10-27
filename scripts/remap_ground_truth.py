@@ -185,7 +185,7 @@ def main() -> int:
         "id_survival_rate": 0.0,
         "id_survival_note": (
             "旧 chunk id 完全不可复现：doc_node_id = md5(绝对路径)，且三种 id 规则 × 4 种候选路径 "
-            "形态扫到 idx=2000 均 0 命中。这与 TestRule.md §五 的猜测一致 —— 语料在 3 月之后重入过库。"
+            "形态扫到 idx=2000 均 0 命中。这与历史版 TestRule.md §五 的猜测一致 —— 语料在 3 月之后重入过库。"
         ),
         "text_locatable_rows": len(remapped),
         "text_locatable_rate": round(len(remapped) / max(len(rows), 1), 4),

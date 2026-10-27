@@ -1,6 +1,6 @@
 # Embedding 修复后的六组实验重跑
 
-本次按 `TestRule.md` 的六组要求及用户明确要求的重排用量保护协议运行，数据保存在：
+本次按当时 `TestRule.md` 的六组协议及用户明确要求的重排用量保护协议运行；现行验收以 v2.0 的 G0～G4 为准。数据保存在：
 
 ```text
 eval/reports/rerun_20261020_siliconflow_guarded/

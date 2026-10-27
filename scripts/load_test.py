@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""第 3 组并发压测（TestRule.md §二.3）。
+"""第 3 组并发压测（历史版 TestRule.md §二.3）。
 
 对指定端点做固定并发压测，输出 p50/p95/p99、吞吐、错误率，写 JSON 报告。
 

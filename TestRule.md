@@ -1,170 +1,298 @@
-事实一：你有三套检索链路实现，指标出自哪一套必须先定。 eval/evaluate_recall.py（2168 行，有自己的 _FusionEnhancedRetriever）、dify_external_api._retrieve_nodes（/api/ask 和 /retrieval 真正走的）、query.py main()（CLI，带那个 HyDE 长文当主查询的 bug）。docx 里的数字来自第一套，用户实际拿到的是第二套。
+# PCB-RAG 评测与发布验收标准
 
-事实二：生产 API 的默认参数和 README 不一样。 dify_external_api.py:37-44 用 setdefault 强制了 RERANK_TOP_N=10、FUSION_NUM_QUERIES=3、HYDE_MAX_LENGTH=200，而 README/docx 写的是 200 / 4 / 300。除非你 .env 里显式写了这几项，否则线上精排只保留 10 条——你之前评测用的 --rerank-top-n 和线上根本不是一个数。
+- 标准版本：2.0
+- 修订日期：2026-10-27
+- 修订依据：`1fa6cc7` 及 2026-10-24 入库批次；每次实际评测必须另记代码 commit 与数据 revision。
+- 适用范围：共享 `RetrievalPipeline`、`EvidenceBundle`、revision 发布、GraphRAG、NVIDIA embedding/rerank，以及 HTTP、SDK、CLI 和评测入口。
+- 本文件是现行标准。文末历史结果只作对照，不是当前生产基线，也不能据此豁免任何闸门。
 
-事实三：你有两个现成数据集，只有一个能用。 eval/eval_dataset.json 100 条，chunk id 是 md5（当前 parent_child 的确定性 id md5(doc_id-pc-idx)），只要切块参数没动、语料没动就仍然有效；eval_dataset_146.json 的 id 是 uuid，对应早期入库，已经作废。另外 eval/reports/ 里有 3 月 8 日的报告：同一个 100 条集上 fusion_hyde_rerank_v2 跑出 MRR 0.870 / Hit@1 0.79 / Hit@5 0.99，比 docx 写的 v1.6（0.785 / 0.704 / 0.908）高一大截。这两组数哪个是真的，重测第一件事就是弄清楚。
+“必须”表示发布硬要求，“应”表示无正当理由不得偏离，“可”表示诊断或探索项。探索结果不得写成发布结论。
 
-一、开测前的三个前提（不做，后面全白测）
+## 一、基本原则
 
-冻结语料快照。 记下 Milvus pcb_kb 当前 row count、data/clear_docs 的文件数和总字节、data/lexical_corpus.jsonl 的行数与 md5。整个重测期间不重新入库；如果你今天修的增量入库 bug 需要验证，另建一个 collection（COLLECTION=pcb_kb_test）去验，别碰主库。
+1. **生产链路是效果事实来源。** 大批量评测可调用共享管线，发布前必须再用 `/retrieval` 与 `/api/ask` 做端到端验收，并覆盖流式响应、SDK/CLI 契约。
+2. **先确认数据有效，再比较指标。** 数据集、语料、revision、模型或实际配置不一致时，不进入质量排名，也不计算“提升”。
+3. **中间排名与最终证据分开报告。** 去重、父子扩展、裁剪后的 `EvidenceBundle` 才是生成和用户引用所见的证据；关闭扩展得到的排名只是诊断。
+4. **执行完成不等于验收通过。** 请求失败、静默降级、判卷失败、样本缺失和阶段中断必须显式进入 verdict。
+5. **质量、性能、可靠性分别验收。** 共享资源下的质量结果可保留，但其耗时不得用于性能结论。
+6. **AI 与人工来源分开。** AI 出题、AI 审核必须标注；AI 拟真集不得称为真人问题集。
 
-冻结回归集。 用 eval_dataset.json 那 100 条，先做一次"存活校验"：对每条 ground_truth_ids 去 Milvus query(filter='id in [...]') 确认还在库里，剔除不在的，剩下的按来源文档分层保留不少于 80 条，另存为 eval/datasets/regression_v1.json，从此不再改。把语料指纹写进同一个文件的头部注释或旁边的 .meta.json。这就是以后所有版本横向对比的唯一基准，也是第一轮第 2 题的答案。
+## 二、统一 verdict 与放行规则
 
-定死一份"生产配置"。 把线上实际生效的值写进 .env.eval：RECALL_TOP_K=200、RERANK_TOP_N=10（或者你决定改成 50，那就先改 README 再测）、FUSION_NUM_QUERIES=3、FUSION_RRF_K=40、RAG_TOP_DOCS=5、RAG_DOC_MAX_CHARS=1000、HYDE_ENABLED=1、QUERY_ROUTING_ENABLED=1、QUERY_DECOMPOSE_ENABLED=1、QUERY_STEP_BACK_ENABLED=1、CHUNK_EXPAND_ENABLED=1、MULTI_EXPAND_ENABLED=1、QUERY_UNDERSTANDING_MODE=hybrid。所有实验用同一份文件起步，每个实验只改一项。注意 query.py 的开关全是 import 时读 env，每个配置必须是独立进程，同一个进程里改 os.environ 不生效。
+每份正式报告必须包含一个机器可读 verdict：
 
-二、要测的六组数据
-第 1 组：回归基线（回答"v1.6 到底是多少"）
+| verdict | 含义 | 能否作为发布通过证据 |
+| --- | --- | --- |
+| `passed` | 必需阶段完整，全部硬门槛通过 | 可以 |
+| `failed` | 执行完整，但质量、性能或可靠性未达门槛 | 不可以 |
+| `invalid` | 数据、配置、请求、判卷或产物无效 | 不可以 |
+| `incomplete` | 阶段未执行、被中断或必需样本缺失 | 不可以 |
+| `inconclusive` | 样本量或置信区间不足以判定非劣/提升 | 不可以，需补样或扩大实验 |
 
-在冻结集上跑两条路径的完整生产配置，各跑一次：
+具体要求：
 
-第一条用现有脚本，保证和 docx 数字同源可比：python eval/evaluate_recall.py --dataset eval/datasets/regression_v1.json --mode fusion_hyde_rerank --recall-k 200 --rerank --rerank-top-n 10 --rrf-k 40 --ks 1,3,5,10 --out eval/reports/r1_baseline_evalscript.json。
+- `passed` 的进程退出码必须为 0；其余 verdict 必须非零退出。调度器的 `complete`、`complete_with_failures` 只是执行状态，必须另映射为 verdict。
+- 正式评测必须满足 `expected_n == attempted_n`；同时分别记录 `evaluated_n`、`failed_n`、`excluded_n`，不得用成功子集替代完整题集。
+- 全功能基线中的请求错误、未解释 rerank 回退和未声明降级必须为 0。故障注入产生的降级进入独立韧性报告，不混入全功能质量基线。
+- 不得删除失败题、超时题、难题或不再存活的题目后仍宣称使用原数据集。排除项必须逐条记录原因，并同时保留原始分母。
+- 豁免必须包含 `scope`、`reason`、`approver`、`issue`、`created_at`、`expires_at`。过期自动失效。
+- 数据无效、跨租户泄漏、revision 不一致、必需测试未执行和伪造/缺失产物不得豁免。任何豁免不得改变原始指标。
 
-第二条走生产路径，这个脚本目前没有，需要写一个百来行的小脚本：在 .env.eval 下 import dify_external_api，手动调一次 _initialize_retrieval_engine()，然后对每个问题调 _retrieve_nodes(q, top_k=20)（CHUNK_EXPAND_ENABLED=0 拿纯排名），取 node id 序列算 MRR、Hit@1/3/5/10、NDCG@10——指标函数直接 from evaluate_recall import _ndcg_at_k, _average_precision 复用。分段耗时不用另外埋点，_retrieve_nodes 已经在 logger 里打 [Timing] 预处理 / 主检索 / HyDE / 精排 / 检索总耗时，挂一个 logging handler 用正则把秒数抓出来即可；[QueryRoute] type 同理抓出查询类型，用于分类型统计。
+## 三、分层门禁与触发条件
 
-要记录的数：两条路径各自的 MRR、Hit@1/3/5/10、NDCG@10，以及两者的差。如果差超过 0.03，说明评测脚本和线上不是一个系统，这本身是个要查的 bug，也是面试可讲的发现。
+| 门禁 | 内容 | 触发时机 |
+| --- | --- | --- |
+| G0 | 数据集、配置、代码与产物有效性 | 所有正式评测之前 |
+| G1 | 静态检查、构建、单元与契约测试 | 每个 PR、每次发布 |
+| G2 | 真实 Milvus、故障恢复、权限与版本发布 | 每日或发布前；入库/图/revision 变更必须执行 |
+| G3 | 生产检索、最终证据、生成与 GraphRAG 效果 | 检索/模型/提示词/语料/切块变更及发布前 |
+| G4 | 延迟、吞吐、错误率与资源用量 | 发布前；性能相关变更必须执行 |
 
-第 2 组：消融矩阵（回答第 16 题"每一路各贡献多少"）
+- 纯文档或纯测试说明变更可只执行文档检查及受影响的 G1。
+- 纯逻辑代码变更至少执行 G0+G1；共享检索、证据、API 或会话变更还必须执行相关 HTTP 契约与 G3 冒烟。
+- embedding、rerank、切块、语料、GraphRAG、入库或发布实现变更必须执行 G0～G4，不能只跑向量单路后放行。
+- 仅新增/修改语料时，必须同时跑稳定回归集和新增语料验收集；不必无条件重复全部参数扫描，但必须覆盖受影响链路和回滚。
 
-全部在冻结集、生产路径上跑，逐级加法，每行只比上一行多开一个开关。每个配置一个进程，用 shell 循环套 env 即可：
+## 四、G0：数据、配置与产物有效性
 
-#	配置名	在上一行基础上改动的 env	回答的问题
-1	vector_only	LEXICAL_ENABLED=0 RERANK_ENABLED=0 HYDE_ENABLED=0 QUERY_EXPANSION_ENABLED=0 QUERY_ROUTING_ENABLED=0 MULTI_EXPAND_ENABLED=0	纯向量底线（对应 v1.0 的 0.22）
-2	vector_rerank	RERANK_ENABLED=1	Rerank 单独值多少
-3	fusion_rerank	LEXICAL_ENABLED=1	BM25 融合本身赚不赚（v1.3 表里是略亏）
-4	+ expansion	QUERY_EXPANSION_ENABLED=1	同义词扩展
-5	+ multi_expand	MULTI_EXPAND_ENABLED=1	查询变体 3 个 vs 1 个
-6	+ routing	QUERY_ROUTING_ENABLED=1 QUERY_DECOMPOSE_ENABLED=0 QUERY_STEP_BACK_ENABLED=0	动态权重（不含分解/step-back）
-7	+ decompose/stepback	QUERY_DECOMPOSE_ENABLED=1 QUERY_STEP_BACK_ENABLED=1	这两个 LLM 调用值不值它的延迟
-8	+ hyde（=生产配置）	HYDE_ENABLED=1	HyDE 的净贡献（docx 说收益有限）
-9	full, recall 50	RECALL_TOP_K=50	200 条召回是否必要，省多少延迟
-10	full, rerank_top_n 50	RERANK_TOP_N=50	线上 10 条会不会截掉正确答案
-11	full, rule 模式	QUERY_UNDERSTANDING_MODE=rule	意图识别的 LLM 调用值不值
-12	full + chunk_expand	CHUNK_EXPAND_ENABLED=1，用 top_k=5 看扩展后正确 chunk 是否还在前 5+5	扩展会不会把正确 chunk 挤出去
+### 4.1 冻结清单
 
-BM25 单路（--mode bm25）用现有 evaluate_recall.py 补一行，生产路径没有纯 BM25 分支。每行记录 MRR、Hit@1/5/10、NDCG@10、平均和 p95 总耗时、各分段耗时。最后你要能说出一句"Rerank 贡献 +0.4，融合 +0.0x，扩展 +0.0x，HyDE +0.0x 但多 Y 秒"。
+每次正式运行必须生成脱敏 `manifest.json`，至少包含：
 
-第 3 组：延迟（回答第 6 题和第 14 题）
+- `schema_version`、`run_id`、`code_commit`、`dirty=false`、核心代码指纹；本地 dirty 运行只能作探索，不能成为发布证据。
+- `collection`、活跃 `revision`、文档数、chunk/entity/relation 数量、语料非向量字段哈希、快照产物哈希。
+- 数据集路径与 SHA-256、`expected_n`、数据集版本、排除项及原因。
+- 实际生效的脱敏配置、环境文件摘要、`PipelineConfig.fingerprint`、入口和启动顺序。
+- embedding 的 provider/model/dimension/query/passage/truncate；rerank 的 provider/model、输入候选上限、输出 top_n、truncate。
+- 出题、答题、judge 的 backend/model/版本；图实现与图 revision；随机种子（后端支持时）。
+- `timing_mode=exclusive|shared_resources`、并行度、热身规则和运行时补丁指纹。
 
-单并发的分段耗时第 1、2 组顺手就有了，重点是把 rerank 拆出来：Qwen3-Reranker-4B 对 200 条、batch 8、max_length 1024 的耗时，和 RERANK_TOP_N 无关（top_n 只影响输出条数，200 条照样全过模型），这个数字要单独记。
+密钥、token、私有问题正文和语料不得写入公开清单。任何影响产物或行为的运行时 monkeypatch 都必须版本化并纳入指纹；未声明补丁不得用于发布。
 
-并发压测另写一个几十行的脚本：起 bash scripts/serve_api.sh，从冻结集抽 30 个问题，requests + ThreadPoolExecutor 分别以并发 1、4、8 各打 60 次 /retrieval（纯检索）和 /api/ask（含生成），记 p50/p95/p99、吞吐（req/s）、错误率、以及并发 8 时是否出现 HyDE 30 秒预算超时导致的 HyDE 路被跳过（看服务端日志里 [HyDE] 路生成超时 出现次数）。压测前先关语义缓存 SEMANTIC_CACHE_ENABLED=0，否则 30 个问题重复打全是缓存命中。同时用 nvidia-smi dmon -s um -d 1 记 GPU 利用率和显存峰值，/metrics 端点的分位数作交叉验证。
+### 4.2 `regression_v3` 数据标准
 
-第 4 组：生成质量（回答第 3 题，异源 judge）
+现有 `regression_v2_clean20261024` 只能作为重标注输入，不能直接作为 v3 的已验收硬真值：
 
-现有 evaluate.py 的 judge 和生成是同一个 build_llm()。最小改动是把 judge = build_llm() 那一行改成 build_llm(model=os.getenv("JUDGE_MODEL") or None, backend=os.getenv("JUDGE_BACKEND") or None)，api_clients.build_llm 本来就接受这两个参数。然后 JUDGE_BACKEND=api JUDGE_MODEL=<非 Qwen 家族，比如 DeepSeek 或 GLM，走你的 ZenMux> 跑 python eval/evaluate.py --dataset eval/datasets/golden.jsonl --top-k 5 --recall-k 200，四指标各一个数。另外把 metrics.py:67-75 失败返回 0.0 改成返回 None 并统计失败数，否则均值不可信。
+- 80 条中仅 27 条达到当前脚本的完整文本覆盖，53 条为部分探针匹配；部分覆盖不等于必然错误，但必须重新审核。
+- 27 条完整覆盖项也只能优先进入复核，不能自动等同于“问题可回答且证据充分”。
+- 当前数据集元数据仍为 `source_type=unknown`，v3 必须使用匹配后当前 chunk 的真实元数据。
 
-golden.jsonl 需要重新生成一份（build_golden_dataset.py --limit 100，它会记 source_chunk_id），生成模型也换成 judge 那个异源模型，做到出题、答题、判卷三个不同模型。生成后人工抽 30 条：逐条判"问题是否像真人会问的"和"ground_truth 是否正确"，记剔除率——这个剔除率本身就是一个要报的数（说明 LLM 造题的噪声水平）。
+v3 每题至少包含：
 
-第 5 组：软匹配诊断（回答第 5 题）
+```text
+id, query, answer, acceptable_evidence_sets, evidence_spans,
+source_path, source_type, route, risk, authored_by, review_status
+```
 
-在冻结集上跑一次 --soft-match embed --embed-threshold 0.78，把"软命中但硬未命中"的样本全部导出，人工看 20 条，分类计数：A 类是同一文档的相邻 chunk（overlap 区域）、B 类是不同标准里的重复条款、C 类是真的语义等价但不同来源、D 类是误判。你要能说出"软硬差的 10 个点里，A+B 占了多少"，这样"软匹配是语料重复信号而不是系统能力"这句话就有数据了。再补一个阈值扫描：0.70 / 0.78 / 0.85 / 0.90 各跑一次软 MRR，证明 0.78 不是挑出来的。
+并满足：
 
-第 6 组：真人问题集（回答"LLM 造题偏简单"的质疑）
+1. JSON/JSONL 解析错误、重复问题 ID、空问题、空参考答案、必需字段缺失均为数据错误，不得静默跳过。
+2. `acceptable_evidence_sets` 表示任一足以回答问题的证据集合；多跳题可标多个必需 chunk，同义或重复证据可标多个可替代集合。
+3. `evidence_spans` 必须定位实际答案信息，记录当前 physical chunk ID、稳定 logical ID（存在时）、规范化文本哈希和审核人/审核来源。
+4. 单证据硬命中题必须确认完整答案 span 位于目标 chunk；前缀探针匹配、部分覆盖或歧义映射不得直接进入该集合。
+5. 多证据题、跨 chunk 题和父子块可替代题单独计量，不得强行压成单一 chunk ID。
+6. 真值 ID 必须按目标 revision 做存活校验；映射必须同源、可解释且无未决歧义。旧 ID 存活率必须实测，不得写死。
+7. `source_path/source_type/route/risk/authored_by/review_status` 必须可用于分片统计；必需元数据不得为 `unknown`。
 
-你自己或找同学写 30 个真实会问的问题，覆盖路由表里的 10 个类型各 3 个，故意包含口语化、缩写、错别字、需要两段才能答全的问题。这批没有 chunk id 标注，评测方式改为：跑生产路径 top_k=5，把每题的 5 条 chunk 摘要导成 CSV，人工标"前 5 条里有没有能答这个问题的"，得到人工 Hit@5；再和冻结集的 Hit@5 对比，差值就是"合成题 vs 真人题"的分布差距。30 题标注约 40 分钟。
+同时维护两套视图：
 
-顺手记的：语料与入库统计
+- **稳定回归集**：题目与标注跨版本固定，用于同题配对比较。
+- **当前语料验收集**：覆盖新增和修改文档。每篇新增/修改文档至少有一条已审核问题，并覆盖十类路由、口语/缩写/错字、表格、数值与单位、标准版本、多证据、证据冲突及不可回答问题。
 
-文档数、chunk 数、chunk 长度均值/最大/最小（ingest 日志里有）、Milvus 向量数、embedding 维度、BM25 索引构建耗时和内存、全量入库总耗时。这些是面试开场 30 秒介绍里要说的数，现在你一个都说不出来。
+稳定集与当前集分别出数，不得拼接后宣称历史提升。
 
-三、执行顺序与时间
+### 4.3 配置与环境
 
-第一天：前提三件事（1 小时）→ 第 1 组两条路径（每条 100 题、每题约 5～15 秒含 HyDE，各 20 分钟）→ 如果两条路径差异大，先查原因再往下走。第二天：第 2 组 12 个配置（每个 20 分钟，4 小时，可以晚上挂着跑）+ 第 5 组阈值扫描（1 小时）。第三天：第 3 组压测（1 小时）+ 第 4 组 golden 重生成与异源 judge（2 小时，主要是 API 调用等待）+ 人工抽检 30 条（40 分钟）。第四天：第 6 组写题、标注（1.5 小时）+ 汇总。总计约 12 小时人工加机器时间，其中你必须在场的约 5 小时。
+- 正式实验从同一份冻结环境启动，每个配置使用独立进程；禁止同进程修改 `os.environ` 后假定模块常量已刷新。
+- 显式记录 `RECALL_TOP_K`、`RERANK_TOP_N`、`FUSION_RRF_K`、`FUSION_NUM_QUERIES`、`RAG_TOP_DOCS`、图开关和最终扩展配置，不依赖脚本默认值暗示生产口径。
+- 必须覆盖“干净环境”和“预设部署变量的污染环境”，验证 shell、dotenv、显式 CLI 参数的优先级及跨入口一致性。
+- 冻结期间不得向被测 collection 写入。故障测试使用唯一临时 collection，绝不用生产库做清库或覆盖。
 
-写脚本的工作量：生产路径评测脚本约 150 行，消融循环 shell 约 30 行，压测约 60 行，汇总表约 50 行，evaluate.py 改 3 行。
+## 五、G1：工程回归标准
 
-四、测完要填的表
+PR 与发布至少执行以下现有检查：
 
-版本总览表重做：只保留冻结集上的数，v1.6 一行拆成"评测脚本路径"和"生产路径"两行；消融表 12 行；延迟表（并发 1/4/8 × /retrieval 与 /api/ask 的 p50/p95/p99）；分段耗时表（预处理、HyDE、向量、BM25、精排、生成）；生成质量表（四指标 + judge 模型名 + judge 失败数）；软匹配差异分类表；真人题 vs 合成题 Hit@5 对比。docx 里"1000 小时工业可靠性"那句改成"开发环境累计运行约 1000 小时无崩溃；并发 8 时 p95 为 X 秒"，data/traces.jsonl 从仓库删掉。
+```bash
+ruff check .
+ruff format --check tests
+python -m compileall -q src eval scripts tests
+python -m build --no-isolation
+PCB_RAG_LOAD_DOTENV=0 REQUIRE_LLAMA_INDEX=1 ACL_TRUST_HEADERS=0 \
+  pytest -q -rs -m "not integration" \
+  --cov=pcb_rag --cov=eval --cov-report=term-missing
+```
 
-五、几个会让你白测的坑
+通过条件：
 
-evaluate_recall.py 2030 行左右会强行把 SHORT_QUERY_THRESHOLD 改成 100 并强开 HyDE，这和生产不一致，跑基线时要注意它的 --mode 内部逻辑不等于 .env 开关。RERANK_TOP_N=10 时 Hit@20 无意义，--ks 别超过 10。HyDE 有 30 秒等待预算，LLM 冷启动时前几题 HyDE 路会被跳过，正式跑之前先用 3 个问题热身。FUSION_NUM_QUERIES 在路由开启时会被各类型策略里的 num_queries（3～5）覆盖，消融第 5 行要看日志确认实际变体数。3 月那份 0.87 的报告如果在同一个 100 条集上复现不出来，优先怀疑语料在 3 月之后重入过库导致 id 变了，用存活校验的剔除数就能判断。
----
-## 六、切块层冻结记录（2026-09-19，入库后即冻结，此后不重入）
+- `0 failed`、`0 errors`、`0 unexpected skip`；显式 deselect 的 integration 必须另列，不得伪装成已执行。
+- Ruff、格式、字节编译、构建均成功；新增 Python 文件及有行为变更的 Python 文件必须满足格式要求。历史脚本仅同步标准引用时，不强制顺带格式化整个文件。
+- 关键依赖缺失必须失败，不能依靠 `importorskip` 静默消失。
+- 配置测试必须覆盖模块导入顺序、环境污染、布尔值、CLI 覆盖和产物指纹。
+- 评测代码自身必须有单元测试，至少覆盖指标公式、坏数据、空数据、失败退出码、脱敏和报告 schema。
 
-### 冻结配置
-- NODE_PARSER_MODE=parent_child；PARENT 3000/200；CHILD 800/150/80
-- SEMANTIC_SPLIT_THRESHOLD=1000000：子块级语义边界检测**停用**（配额考虑；父层结构切分不受影响）。实测该路径在能工作时也未产出语义块（单篇 70KB 波动未达 0.15）。**重开该开关 = 换语料**，须全量重嵌入并重跑六组。.env 已同步为 1000000 并注释。
-- 语料：60 文档 → 5680 chunks（Milvus pcb_kb）；指纹已改内容哈希（blake2b），manifest v2。
+覆盖率采用递进门槛，不用全仓一刀切替代行为测试：
 
-### 本次修复（重入前完成，tests/test_chunk_split.py 7 项回归）
-- overlap 被句号截没：旧实现取末 80 字后 rfind('。') 向前截断，实际重叠近 0（全库命中率 1.1%）。改为向后补齐到句首（重叠 ∈ [80,160)）→ **94.4%**。
-- 超长"句"整块塞入：无句末标点的 1901 字"句"整块入库。加 _hard_split 句内标点兜底 + 组装后超限二切 → max 1901→863（残差主要是注入行）。
+- 首次在本标准下的干净提交记录总覆盖率基线，之后不得下降；不得通过删除测试或排除文件抬高比例。
+- 新增/修改的关键逻辑行覆盖率应不低于 80%；`retrieval`、`evidence`、`ingestion`、`revisions`、`graph_semantic`、模型适配器和评测汇总逻辑单列观察。
+- 覆盖率采集必须带 `--cov-fail-under` 或等价 CI 检查才具有门禁作用；阈值随已确认基线提升，不得事后调低以放行。
 
-### 质量体检（scripts/chunk_quality.py，5680 块）
-- 结构起始率 52.8%（剥【上下文】前缀后）；句末非标点 27.9%（抽检=图注/表格行等原文无句号单位，非切坏）
-- 同父相邻 overlap 命中 94.4%；content>800 仅 17 条（0.3%，含前缀剥除残差）
-- split_method：length 57.5% / none 42.5% / semantic 0
-- 真值可用性：**98/100 真值可被单个 chunk 完整覆盖**（2 条跨 chunk 边界）
-- 顺序：离线重放 24/24 偏移单调；库内 next_id 链 0 冲突 / 0 悬空
+## 六、G2：真实存储、故障恢复与发布标准
 
-### 已知问题（不重入，记录在案）
-1. 孤立标题微型块（如 14 字"标题：11.1 IPC"）：源文档该节正文为表格/图，个位数，无害。
-2. Contextual 标题行偶为句子碎片（"标题：99 的原理图来说明时序计算方法"）：属 contextual 模块标题定位问题，影响嵌入上限，不影响切块。
-3. 度量教训（自查两次纠错）：长度口径必须剥注入行【上下文…】与"标题：…"（否则 0.3% 报成 8.8%）；按 next_id 查相邻块必须用 {id: row} 映射，写成 {next_id: row} 会取到无关块（曾误判"顺序倒退"）。
+真实 Milvus 检查必须在 nightly/release 执行，而非仅靠手工记录：
 
-### 供应商变更（2026-09-19 晚，重嵌入记录）
-- embed: openrouter free 通道 → NVIDIA 官方 API（模型同名 nemotron-3-embed-1b）。实测同一文本 cosine 仅 0.34 —— 两侧向量空间不兼容，**全量重嵌入**（块文本/id 不变，切块冻结与回归集有效）。
-- rerank: openrouter llama-nemotron-rerank-vl-1b-v2:free → **SiliconFlow BAAI/bge-reranker-v2-m3**（生产 rerank 模型变更，消融表须注明）。
-- 踩坑记录：EMBED_BASE_URL 不能带尾部 /embeddings（客户端自动拼接）；Path B 首跑暴露 query.py 未导入 current_principal（:3785/:3804/:4237，已修——此 bug 意味着此前 /retrieval 无业务过滤查询必崩）。
-- openrouter 免费层当日配额（1000/天）已被白天重建+首跑评测耗尽，是 Path A 中途 429 崩溃的原因。
+```bash
+PCB_RAG_TEST_MILVUS=1 REQUIRE_LLAMA_INDEX=1 \
+PCB_RAG_TEST_MILVUS_URI=<isolated_milvus_uri> \
+RAG_VALIDATION_REPORT=<run_dir>/milvus.json \
+  .venv/bin/python -m pytest -q -rs --junitxml=<run_dir>/pytest.xml
+```
 
-### 闸门触发与归因（2026-09-20，第 1 组完成）
-- 结果：评测脚本路径 MRR=0.4956 / Hit@10=0.650；生产路径 MRR=0.4336 / Hit@10=0.625；|Δ|=0.062>0.03 → 闸门拦截，消融矩阵未启动（接续链按设计中止）。
-- 归因（已闭合）：生产路径 `_extract_query_filters` 把查询中的 Altium/Allegro 抽成 `eda=altium/allegro` 元数据硬过滤，13/80 题被误杀（8 题完全无召回），该组 MRR=0.133 vs 无过滤题 0.487；反事实代入后总体≈0.487 ≈ Path A 的 0.4956。且评测脚本路径**不做业务过滤抽取**（0 处引用）——两路径差异的主因即此。
-- 修复：`_retrieve_nodes` 增加 `_no_business_filter` 回退——业务过滤把候选池清零时，自动整链重检一次（保留 ACL，递归由标志限定一次）。死题实测：vec=0/bm25=0 → 回退 → 312/400 候选 → 精排 10 条。
-- 待重跑：Path B v2 → 重过闸 → 消融矩阵自动接续。残留差异预计 <0.03；若 routing 动态权重仍贡献小幅差异，由矩阵行 05/06 归量。
+必须使用独立服务和唯一临时 collection，并验证临时集合清理、既有集合保留和报告实际生成。通过条件包括：
 
-### 闸门处置（2026-09-20，Path B v3 后）
-- Path B v3（过滤回退修复 + HYDE_WAIT_BUDGET=60）：MRR=0.4460（0.4336→0.4460），空结果 0，HyDE 未命中 21→2。
-- 残余 |ΔMRR|=0.0496>0.03。**归因判定：上游 API（emoera）返回不稳定，部分题目 HyDE 失败/超时降级；叠加生产路径路由动态权重与脚本路径固定融合的结构性差异。**判定为已知且可接受的系统性差异，不阻塞后续实验。
-- 依据该判定放行第 2 组消融矩阵。注：矩阵行 05→08 本身即量化 routing / multi-expand / decompose / HyDE 的边际贡献，比闸门本身更有信息量。
+1. 现有入库、真实父块、无变化跳过、阶段失败保留旧版、恢复不重嵌入已完成 chunk、共享来源删除、集合切换和 HTTP 引用用例全部实际执行。
+2. `ingest`、`graph_rag`、API、CLI、迁移入口按不同顺序导入时，同一输入产生相同有效配置和 revision；`INGEST_EXPECTED_REVISION` 不符必须在任何状态写入前失败。
+3. 对 chunks、vectors、lexical、graph、graph_vectors、publish 分别注入异常和进程级中断；恢复必须幂等，无重复 ID，已完成阶段不得无意义重做。
+4. 图向量必须在窗口级持久化断点后才可宣称“图向量阶段可恢复”。全量内存聚合、失败后从头重算不满足该项。
+5. 发布后及 Milvus 重启后，按 ID 集合比对快照与子块、实体、关系向量，并复核正文、必需元数据、维度、嵌入身份和哈希；不得只信 `row_count`。
+6. 图来源贡献、原文 revision 和 ACL 复核率必须为 100%；共享来源删除不影响其他来源，最后来源删除后不再返回该证据，跨租户泄漏必须为 0。
+7. 热切换后 API/SDK/CLI 返回同一 revision，旧版在切换失败时仍可读取；回滚必须同时恢复集合、模型、缓存、清单和图产物。
+8. 启用图块失败容忍时，失败块数量、比例、原因和清单必须进入报告；未审计失败块不得被静默记为成功发布。
 
-### 第 2 组消融矩阵结果（2026-09-20，冻结集 80 题，限速版全表零失败）
+## 七、G3：生产效果标准
 
-| 配置 | MRR | Hit@1 | Hit@5 | NDCG@10 | p50(s) | 逐行ΔMRR |
-| --- | --- | --- | --- | --- | --- | --- |
-| 00 BM25 单路 | **0.4891** | 0.388 | 0.600 | 0.5265 | ~0 | — |
-| 01 纯向量 | 0.0690 | 0.037 | 0.100 | 0.0880 | 0.3 | — |
-| 02 向量+Rerank | 0.2479 | 0.200 | 0.325 | 0.2673 | 18.5 | +0.179 |
-| 03 +BM25融合 | 0.4811 | 0.375 | 0.613 | 0.5286 | 18.0 | +0.233 |
-| 04 +同义扩展 | 0.4634 | 0.375 | 0.588 | 0.5056 | 18.3 | −0.018 |
-| 05 +多变体 | 0.4627 | 0.362 | 0.588 | 0.5083 | 18.3 | −0.001 |
-| 06 +路由 | 0.4622 | 0.362 | 0.588 | 0.5078 | 13.8 | −0.001 |
-| 07 +分解/step-back | 0.4611 | 0.362 | 0.588 | 0.5069 | 17.0 | −0.001 |
-| 08 +HyDE（=生产） | 0.4435 | 0.338 | 0.575 | 0.4880 | 29.8 | −0.018 |
-| 09 recall50 | 0.4289 | 0.350 | 0.525 | 0.4699 | 25.2 | −0.015 |
-| 10 rerank_top50 | 0.4496 | 0.338 | 0.575 | 0.4887 | 35.6 | +0.021 |
-| 11 rule 模式 | 0.4481 | 0.350 | 0.575 | 0.4886 | 35.3 | −0.002 |
-| 12 +chunk_expand | 0.4512 | 0.338 | 0.588 | 0.4936 | 42.7 | +0.003 |
-| 对照：r1 生产基线 | 0.4460 | 0.338 | 0.575 | 0.4926 | 36.2 | — |
+### 7.1 基线与测量对象
 
-一句话结论：**Rerank 在向量路上 +0.18；BM25 融合 +0.23；同义扩展/多变体/路由/分解/HyDE 全部 ≈0 或为负（HyDE −0.018 还多 13s）；BM25 单路就是当前语料的最优配置（0.4891）**。
+新基线必须使用同一冻结的当前语料、当前 NVIDIA embedding/rerank、当前 GraphRAG 和生产配置。旧的向量单路结果不能替代完整融合+重排+图+最终证据基线。
 
-#### 头号待查：向量路贡献≈0（行 01 MRR 0.069）
-- 离线验证（1 题）：金标准 chunk 纯余弦排名 2548/5680。
-- input_type 实验（3 题 × 3 模式）：query/passage 模式只解释一小部分（最好 2548→11，其余 256/408 仍差）。
-- 判定：**非代码缺陷，是 embedding 模型与中文术语/参数密集语料的适配问题**（nemotron 系英文优先）。
-- 改进选项（需重嵌入 + 重测，另行决策）：a) 换本地 Ollama qwen3-embedding:8b（中文强、零 API 配额）；b) SiliconFlow bge-m3；c) 保留现状，生产以 BM25 为主。
-- 顺带小缺陷：vector-only 分支（bm25_index 为空时）没有过滤清零回退，行 01/02 各有 2 道空结果题。
+模型或供应商变更后，先用固定的真实接口小样本做 canary，再启动全量实验：
 
-### Embedding 输入模式归因修正（2026-10-20）
+- embedding 必须验证 query/passage、返回维度、有限数值、批量索引和 truncate；实际模型、维度和 collection description 必须一致。
+- rerank 必须验证对象化请求、候选上限、完整索引、负 logit 和本地 top_n 裁剪；任何契约错误或未声明回退都使 canary 失败。
+- sigmoid 只保持单调顺序，不保证跨模型分数可比。使用 `score_threshold` 前必须在已标注数据上校准分数分布，并分别报告阈值开启/关闭结果。
 
-- 先前“非代码缺陷、模型与中文不适配”的结论不再成立。通用客户端未指定 NVIDIA 的 `input_type`，查询和文档未按 `query` / `passage` 配对。
-- 保持现有 5680 个实体的正文、ID、全部元数据不变，在新集合 `pcb_kb_nv_query_passage_20261020` 中以 `passage` 重建，并以 `query` 查询。旧集合 `pcb_kb` 保留。
-- 同一冻结 80 题、无业务过滤/重排/改写/HyDE 的精确 IP 对照：旧 MRR@20=0.068966；只修查询=0.096103；两端配对修正并重建=0.393509。Hit@5 从 0.1000 提升到 0.5875；Hit@200 从 0.4000 提升到 0.9375。独立矩阵排名与 Milvus FLAT/IP 实际排名一致。
-- `.env` 与 `.env.eval` 已切换到新集合；新集合记录模型、接口地址、维度及输入模式，查询与入库校验配置，避免混用向量。
-- 这是向量检索的同题对照，不能当作完整生成质量或真人问题集的指标。详细过程、报告位置与回退要求见 `docs/EMBEDDING_FIX.md`。
+每次至少保留两类结果：
 
-### 双模型切换（2026-10-23）
+- **排名诊断**：向量/BM25/融合/精排中间顺序，用于定位候选召回和排序问题。
+- **生产最终结果**：扩展、去重、预算裁剪后的证据及 `/retrieval`、`/api/ask` 实际返回，用于发布验收。
 
-- embed: `nvidia/nemotron-3-embed-1b`（2048 维）→ `nvidia/nemotron-3.5-embed-8b`（原生 4096 维）。
-- rerank: SiliconFlow `BAAI/bge-reranker-v2-m3` → `nvidia/nemotron-3.5-rerank-8b`。
-- 接口契约实测：embeddings 原生 4096 维、`dimensions` 可取 1~4096、`truncate` 仅 `END`/`NONE`（`START` 返回 400）；rerank 走 `/v1/retrieval/<model>/reranking`，`query` 与 `passages` 均为对象，不接受 `top_n`，返回 `rankings[].logit`（可为负），passages 上限 512。
-- 因此 `EMBED_DIM` 在本模型下是真实下发参数，不再只是建表期望值；rerank 适配层把 logit 按 sigmoid 归一到 0~1，以维持 `sources[].score` 的对外量纲。
-- 新集合 `pcb_kb_nv35_embed8b_20261023`，块文本与 id 不变；`scripts/repair_embeddings.py` 已放开「目标维度必须等于源维度」的限制，可直接做 2048→4096 的只换向量迁移。
-- 本机实调结果（生产工厂 + 真实接口）：query/passage 均返回 4096 维，相关文本余弦 0.742；重排三选一命中金标准，分值 0.206 / 0.038 / 0.032。
-- 新旧指标不构成可比序列：向量空间、维度、重排模型与分值量纲四项同时变化，消融表须在新集合上重测后再下结论。详细步骤见 `docs/MODEL_SWITCH_20261023.md`。
-- 迁移结果（2026-10-23，5680 行 / 47 分 27 秒，ids 与正文逐条校验一致）：向量单路 80 题 MRR@20 0.3935 → **0.4463**，Hit@1 0.2375 → 0.3000，Hit@5 0.5875 → 0.6375，Hit@200 0.9375 → 0.9500。语料文本与评测口径相同，属跨报告对照，非严格配对实验。
-- 本次迁移的语料仍是 10-20 那批 60 个 `clear_docs` 文件；当日整理的 66 文件（含 `04_工程语料/` 20 篇）未入库。chunk id 由文件路径派生，换目录后 id 全变，只能全量重建、不能增量覆盖。
+`evaluate_recall.py` 的独立实现和 Path A/Path B 对比仅保留为历史诊断。原“两路径 MRR 差 0.03”不再是生产放行主闸门，也不得用人工归因直接覆盖阈值。
+
+### 7.2 指标与统计判定
+
+检索至少报告：
+
+- MRR@10、Hit@1/3/5/10、NDCG@10、空结果数、请求错误数、各降级数。
+- 候选阶段另报 Recall@200；最终只保留10条时不得报告无意义的最终 Hit@20。
+- 按 route、source_type、risk、单/多证据和新增/旧文档分片报告样本量及最差分片；分片少于30题只作探索。
+
+候选与基线必须使用同题逐条配对结果：
+
+- 报告每题 reciprocal rank、命中和 NDCG 差值，以及 paired bootstrap 95% 置信区间。
+- 暂定非劣边界为 MRR@10 `-0.02`、Hit@5 `-2` 个百分点。正式跑前可评审调整，但不得看到结果后修改。
+- 对 `candidate - baseline`：95% CI 下界高于负非劣边界才可判非劣；上界仍低于该边界为 `failed`；其余为 `inconclusive`。
+- 宣称“提升”时，主要指标差值的 95% CI 下界必须大于 0，而不只是点估计为正。
+- LLM 路由、HyDE、生成等随机或外部依赖关键配置至少重复 3 次并报告批间波动；确定性向量/BM25 计算可单次执行。
+
+### 7.3 消融设计
+
+逐级加法只用于观察特定路径，不再把每行差值解释为独立贡献。新矩阵包含：
+
+1. 最小底座上的单项加入：vector、BM25、rerank、graph。
+2. 完整生产配置上的 leave-one-out：分别关闭 BM25、rerank、graph、同义扩展、多变体、routing、decompose/step-back、HyDE、chunk expansion。
+3. 参数诊断：recall50、rerank_top_n50、rule 模式；必要时增加 graph×rerank、expansion×parent 的交互项。
+4. 每个配置独立进程、相同冻结集和 revision，保存实际生效参数、逐题结果和降级记录。
+
+`shared_resources` 下可比较质量，但所有延迟比较必须标记不可用；性能只能取 G4 的独占测量。
+
+### 7.4 GraphRAG 专项
+
+必须在相同基础检索和重排配置上比较 graph off/on，并增加：
+
+- 基础 vector+BM25 无有效证据题集上的 `graph_rescue_rate`。
+- 多跳、多来源和需要关系限定的题目；报告图路对 MRR/NDCG/证据充分率的配对差值。
+- 图证据来源、revision、ACL 和删除后不可见性；关键安全题中的无依据图证据必须为 0。
+- 图构建/向量失败数、图路耗时和内存。图集合规模本身不得作为效果提升证据。
+
+### 7.5 生成、引用与判卷
+
+出题、答题和 judge 应使用不同模型或不同厂商，并记录确切身份。judge 必须用 20～30 条人工标注校准，报告一致率、分歧类型和失败数。
+
+以下现有阈值作为首轮逐项门槛，不得用 overall 均值抵消单项不达标：
+
+| 指标 | 首轮门槛 |
+| --- | --- |
+| Faithfulness | ≥ 0.75 |
+| Answer Relevancy | ≥ 0.80 |
+| Context Precision | ≥ 0.70 |
+| Context Recall | ≥ 0.80 |
+
+同时满足：
+
+- 发布报告中每项指标必须达到其 `expected_n`；judge 失败重试后仍缺失则报告为 `invalid` 或 `incomplete`，不能只平均成功样本。
+- 引用编号有效率必须为 100%，但编号有效不等于事实支持；另行报告 claim 支持率、citation coverage 和 `support_status`。
+- 数值、单位、标准版本和适用条件关键题必须逐项正确，关键安全样本中的不支持引用为 0。
+- 不可回答问题、证据冲突和知识不足必须单独评分，不得强迫模型回答后按普通 QA 计分。
+- 自动指标阈值经首轮人工校准后方可调整为长期门槛；调整必须留版本记录。
+
+### 7.6 软匹配与拟真问题
+
+- 软匹配只作诊断，不得抵消硬真值或人工证据充分性失败。
+- 保留 0.70/0.78/0.85/0.90 阈值扫描，审核软命中但硬未命中的样本，按 A/B/C/D 分类；judge 与生成模型应异源。
+- `scripts/experiment_scenarios.json` 的30题是 AI 拟真鲁棒性集，不是真人集。
+- 只有实际由人提出并人工标注证据充分性的题目，才可报告“真人 Hit@5”或真人使用质量。
+
+## 八、G4：性能与负载标准
+
+- 使用独立服务和独立端口，`timing_mode=exclusive`；不得与其他实验共享模型、Milvus 或压测队列。
+- `/retrieval` 与 `/api/ask` 分别测并发 1/4/8；记录 p50/p95/p99、吞吐、错误率、超时、排队、各阶段耗时、降级和 token/费用。
+- 至少热身3题且不计入正式样本；冷启动单独测量。缓存关闭用于基础负载，缓存开启另列，不能混算。
+- 客户端与服务端指标交叉验证；远程 GPU 等不可得资源标记 `unavailable`，不得写成 0。
+- 60 次/格仅为冒烟，不得作为发布级 p99 证据。正式报告必须给出分位数置信区间和有效样本量；样本不足时 p99 为 `inconclusive`。
+- 首轮建立当前生产基线，不宣称满足未定义的绝对 SLO。后续版本在相同环境下比较，暂定 p95 比值的 95% CI 上界不得超过基线的 1.10 倍，且错误率不得上升。
+- 产品绝对 SLO 确定后，必须同时满足绝对 SLO 与相对非劣门槛。
+
+## 九、报告与留档
+
+每个正式批次至少输出：
+
+1. `manifest.json` 与数据校验报告。
+2. G1/G2 执行结果、实际 skip/deselect、临时集合清理证明。
+3. 生产基线、逐题结果、配对差值与置信区间。
+4. 消融、GraphRAG、生成质量、judge 校准、降级与豁免明细。
+5. 独占性能报告、资源可用性和原始请求明细。
+6. 最终 `verdict`、未通过项、`incomplete_or_failed_steps` 和排除项。
+
+原始问题、语料和私有报告可继续留在受控本地目录；脱敏摘要、schema、配置指纹和 verdict 必须纳入版本控制或不可变的受控制品库。不得因为原始数据不入 Git 就让公开结论完全无法核验。
+
+## 十、当前实现差距与执行顺序
+
+以下是标准生效前的明确差距，不得因本文件更新而视为已经修复：
+
+- `eval/evaluate.py` 仍需把逐题异常、样本缺失和 `summary.invalid` 映射为非零退出及正式 verdict。
+- `scripts/experiment_aux.py` 的固定80题和旧 Path A/B 闸门仍需参数化；新调度器必须支持 v3、多套数据集视图和 `expected_n`。
+- `scripts/freeze_snapshot.py` 与 `scripts/remap_ground_truth.py` 仍生成历史 v1；部分探针匹配及写死的旧 ID 存活率不满足 v3，不能将其输出直接标为已验收真值。
+- `scripts/run_r1_baseline.sh`、`scripts/run_r2_*.sh`、`scripts/run_reembed_and_eval.sh`、`scripts/run_g3_loadtest.sh`、`scripts/run_g4_g5.sh` 及相关评测脚本仍是历史六组协议实现；其中“历史版 TestRule”章节号和旧 G3/G4/G5 编号均不属于本版门禁。完成适配前只能作历史诊断，不得直接产出 v2 `passed`。
+- 旧批次编排器写入 `protocol_sha256` 只证明记录了本文件哈希，不证明其实现满足本版协议；不得仅靠更新哈希把旧流程标为 v2 合规。
+- CI 仍需把覆盖率递进门槛、真实 Milvus nightly/release 和报告 verdict 接入自动检查。
+- `graph_semantic.build_graph_vectors` 仍需实现真正的窗口级断点与恢复，才能通过 G2 的图向量恢复项。
+- `regression_v3` 的数据校验器、多证据指标、配对置信区间和新增语料验收集仍需实现。
+
+执行顺序固定为：
+
+1. 在干净提交上完成 G1，建立新的覆盖率与测试基线。
+2. 完成 v3 重标注、数据校验和冻结清单；未通过 G0 不启动付费全量实验。
+3. 完成 G2，优先关闭图向量断点、重启后 ID 一致性和发布回滚风险。
+4. 运行当前双模型、66篇语料和 GraphRAG 的完整生产基线。
+5. 基线有效后再做 leave-one-out 消融、关键配置重复实验和 G4；不得用旧成绩替代本轮基线。
+
+## 十一、历史对照（非现行门槛）
+
+| 批次 | 可保留的事实 | 使用限制 |
+| --- | --- | --- |
+| 2026-09-20 | 旧80题、旧模型和旧语料上的消融曾显示 BM25/重排贡献，HyDE 等收益有限 | 后续 embedding 修复和双模型切换已改变前提，不得继续作为当前最优配置结论 |
+| 2026-10-20 | query/passage 配对修复后，旧60篇、5680块向量单路 MRR@20=0.393509、Hit@200=0.9375 | 只证明当时向量检索变化，不是完整生产或生成质量 |
+| 2026-10-23 | nemotron-3.5-embed-8b 4096维迁移后，向量单路 MRR@20=0.4463、Hit@5=0.6375、Hit@200=0.9500 | 旧60篇、跨报告非严格配对；不含新 rerank/GraphRAG 的完整效果 |
+| 2026-10-24～26 | 66篇、5747子块、51802实体、61966关系贡献，revision `f0adc4daf0b6c8d6697c54d8` 完成发布及11项运维校验 | 证明该次发布产物核验，不等于 G0～G4 全部通过，也不证明准确率提升 |
+| 2026-10-20 SiliconFlow 重跑 | 留档包含完成的检索消融，但压测未收尾、生成质量未完成、软匹配和拟真题审核失败 | 批次为未完成状态，不得标记为 `passed` |
+
+详细历史见 `docs/EMBEDDING_FIX.md`、`docs/MODEL_SWITCH_20261023.md`、`docs/INGEST_REPORT_20261024.md`、`docs/EXPERIMENT_RERUN_20261020.md` 和 `docs/LIGHTRAG_FIXES_WSL_20261023.md`。

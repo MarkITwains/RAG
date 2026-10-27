@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 第 3 组：延迟与并发压测（TestRule.md §二.3）
+# 第 3 组：延迟与并发压测（历史版 TestRule.md §二.3）
 # 起 /retrieval 与 /api/ask 并发 1/4/8 各 60 次；语义缓存关闭；结束抓服务端
 # HyDE 跳过次数与 /metrics 快照。
 set -uo pipefail
@@ -7,7 +7,7 @@ cd /root/rag_v1
 source scripts/env_defaults.sh
 pcb_rag_load_env_defaults .env.eval
 export PYTHONUNBUFFERED=1
-export SEMANTIC_CACHE_ENABLED=0     # 压测前提：关语义缓存（TestRule §二.3）
+export SEMANTIC_CACHE_ENABLED=0     # 压测前提：关语义缓存（历史版 TestRule §二.3）
 mkdir -p logs eval/reports
 
 PY=.venv/bin/python

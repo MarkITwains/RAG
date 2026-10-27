@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 第 1 组：回归基线两条路径（TestRule.md §二.1）
+# 第 1 组：回归基线两条路径（历史版 TestRule.md §二.1）
 #   Path A: eval/evaluate_recall.py（与 docx/3月报告同源可比）
 #   Path B: 生产路径 _retrieve_nodes（scripts/eval_production_path.py）
 # 全程后台可跑；每步独立日志；一步失败不影响后续步骤。
