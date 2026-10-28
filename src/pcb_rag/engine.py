@@ -440,6 +440,13 @@ class KnowledgeBase:
             return GraphNeighborhood(entity=entity, found=False, degraded=["graph_unavailable"])
 
         from pcb_rag import security
+        from pcb_rag.graph_rag import build_neighborhood_text, link_entities, normalize_entity
+
+        normalized = normalize_entity(entity)
+        candidates = [normalized] if normalized in graph.nodes else []
+        candidates.extend(name for name, _ in link_entities(entity, graph) if name not in candidates)
+        if not candidates:
+            return GraphNeighborhood(entity=entity, found=False, degraded=[])
 
         if security.ACL_ENABLED or state.get("active"):
             from pcb_rag.graph_semantic import authorized_graph
@@ -451,26 +458,15 @@ class KnowledgeBase:
                         graph,
                         lambda ids: run_stage("graph_sources", self.pipeline._fetch, ids, state),
                         lambda nodes: self.pipeline._allowed(nodes, state, parents=True),
+                        entities=candidates,
                     )
             except Exception as exc:
                 return GraphNeighborhood(
                     entity=entity, found=False, degraded=["graph_source_error:" + type(exc).__name__]
                 )
 
-        from pcb_rag.graph_rag import build_neighborhood_text, normalize_entity
-
-        name = normalize_entity(entity)
+        name = next((candidate for candidate in candidates if candidate in graph.nodes), "")
         node = graph.nodes.get(name)
-        if node is None:
-            # 退化为模糊链接：查询词可能只是实体名的一部分
-            from pcb_rag.graph_rag import link_entities
-
-            hits = link_entities(entity, graph, max_entities=1)
-            if not hits:
-                return GraphNeighborhood(entity=entity, found=False, degraded=[])
-            name = hits[0][0]
-            node = graph.nodes.get(name)
-
         if node is None:
             return GraphNeighborhood(entity=entity, found=False, degraded=[])
 

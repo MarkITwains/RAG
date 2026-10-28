@@ -527,3 +527,36 @@ def test_evidence_quote_tolerates_line_break_normalisation(monkeypatch):
     llm_bad = SimpleNamespace(complete=lambda prompt: SimpleNamespace(text=json.dumps(bad)))
     with pytest.raises(ValueError, match="exact source quote"):
         g.extract_triples_llm(text, llm_bad, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("record", "message"),
+    [
+        ({"head": "铜厚", "relation": "要求", "tail": "35 μm"}, "exact source quote"),
+        (
+            {"head": "不存在的材料", "relation": "要求", "tail": "35 μm", "evidence": "铜厚要求 35 μm"},
+            "entities must appear",
+        ),
+    ],
+)
+def test_strict_extraction_rejects_missing_evidence_and_invented_entities(monkeypatch, record, message):
+    from pcb_rag import graph_rag as g
+
+    monkeypatch.setattr(g, "GRAPH_LLM_GLEANING", 0)
+    llm = SimpleNamespace(complete=lambda prompt: SimpleNamespace(text=json.dumps([record], ensure_ascii=False)))
+    with pytest.raises(ValueError, match=message):
+        g.extract_triples_llm("铜厚要求 35 μm", llm, strict=True)
+
+
+def test_strict_entity_matching_tolerates_case_and_whitespace(monkeypatch):
+    from pcb_rag import graph_rag as g
+
+    monkeypatch.setattr(g, "GRAPH_LLM_GLEANING", 0)
+    text = "ipc-6012 规定铜厚。"
+    record = {"head": "IPC-6012", "relation": "规定", "tail": "铜 厚", "evidence": text}
+    llm = SimpleNamespace(complete=lambda prompt: SimpleNamespace(text=json.dumps([record], ensure_ascii=False)))
+
+    triples = g.extract_triples_llm(text, llm, strict=True)
+
+    assert len(triples) == 1
+    assert triples[0].head == "IPC-6012"

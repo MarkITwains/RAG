@@ -363,8 +363,19 @@ class KnowledgeGraph:
                           for cid in ([c.get("chunk_id")] if c.get("chunk_id") else c.get("chunk_ids", [])) if cid))
         edge["d"] = list(dict.fromkeys(did for c in contributions
                           for did in ([c.get("doc_id")] if c.get("doc_id") else c.get("doc_ids", [])) if did))
-        for dst, src in (("e", "evidence"), ("rd", "relation_desc")):
-            edge[dst] = "；".join(dict.fromkeys(str(c.get(src, "")) for c in contributions if c.get(src)))
+        for dst, src, limit in (
+            ("e", "evidence", GRAPH_EVIDENCE_CHARS),
+            ("rd", "relation_desc", GRAPH_LLM_DESC_CHARS),
+        ):
+            merged = ""
+            for value in dict.fromkeys(str(c.get(src, "")) for c in contributions if c.get(src)):
+                if not merged:
+                    merged = value[: max(0, limit)]
+                elif len(merged) + 1 + len(value) <= limit:
+                    merged += "；" + value
+                if len(merged) >= limit:
+                    break
+            edge[dst] = merged
         edge["s"] = next((c.get("source_path", "") for c in contributions if c.get("source_path")), "")
         edge["facts"] = [dict(c.get("qualifiers") or {}, doc_id=c.get("doc_id", ""),
                               chunk_id=c.get("chunk_id", ""), revision=c.get("revision", ""))
@@ -677,6 +688,7 @@ class KnowledgeGraph:
                 "contributions": cls._contributions(edge),
                 "order": edge.get("order", len(graph.edges)),
             }
+            graph._refresh_edge(graph.edges[key])
             graph.adjacency[head].add(tail)
             graph.adjacency[tail].add(head)
             graph.incident[head].add(key)
@@ -965,6 +977,11 @@ def _is_source_quote(evidence: str, snippet: str) -> bool:
     return _WS_RE.sub("", evidence) in _WS_RE.sub("", snippet)
 
 
+def _is_entity_mention(entity: str, snippet: str) -> bool:
+    normalized = _WS_RE.sub("", normalize_entity(entity)).casefold()
+    return bool(normalized) and normalized in _WS_RE.sub("", snippet).casefold()
+
+
 def extract_triples_llm(
     text: str,
     llm: Any,
@@ -1019,10 +1036,13 @@ def extract_triples_llm(
                 break
 
     evidence = _WS_RE.sub(" ", snippet)[:GRAPH_EVIDENCE_CHARS]
-    if strict and any(
-        item.get("evidence") and not _is_source_quote(item["evidence"], snippet) for item in records
-    ):
-        raise ValueError("graph extraction evidence is not an exact source quote")
+    if strict:
+        for item in records:
+            quote = item.get("evidence", "")
+            if not quote or not _is_source_quote(quote, snippet):
+                raise ValueError("graph extraction evidence is not an exact source quote")
+            if any(not _is_entity_mention(item[field], snippet) for field in ("head", "tail")):
+                raise ValueError("graph extraction entities must appear in source")
     triples = [
         Triple(
             head=item["head"],
@@ -1452,14 +1472,10 @@ class GraphRetriever:
             source_path = ""
 
             for edge in group_edges[:GRAPH_MAX_NEIGHBORS]:
-                direction = ""
-                if edge["h"] == anchor:
-                    lines.append(f"{edge['h']} --{edge['r']}--> {edge['t']}")
-                else:
-                    direction = "（反向）"
-                    lines.append(f"{edge['h']} --{edge['r']}--> {edge['t']}")
-                if direction:
-                    lines[-1] += direction
+                line = f"{edge['h']} --{edge['r']}--> {edge['t']}"
+                if edge["t"] == anchor and edge["h"] != anchor:
+                    line += "（反向）"
+                lines.append(line)
                 if edge.get("e"):
                     evidence_parts.append(str(edge["e"]))
                 for cid in edge.get("c", []):

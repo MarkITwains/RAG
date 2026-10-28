@@ -376,7 +376,12 @@ class RetrievalPipeline:
             if graph:
 
                 def graph_candidates():
-                    return graph.retrieve_sources(clean, lambda ids: self._fetch(ids, state), top_k=cfg.graph_top_k)
+                    return graph.retrieve_sources(
+                        clean,
+                        lambda ids: self._fetch(ids, state),
+                        top_k=cfg.graph_top_k,
+                        allowed=lambda nodes: self._allowed(nodes, state),
+                    )
 
                 submit("graph", cfg.graph_weight, graph_candidates)
                 if not graph.semantic_ready:

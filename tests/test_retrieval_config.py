@@ -28,11 +28,15 @@ def test_graph_hop_two_keeps_second_hop_evidence():
     graph = KnowledgeGraph()
     graph.add_triple(Triple("铜厚", "要求", "35 μm", evidence="first"))
     graph.add_triple(Triple("35 μm", "测试方法", "荧光法", evidence="second"))
+    graph.add_triple(Triple("测试标准", "规定", "铜厚", evidence="incoming"))
     retriever = GraphRetriever(graph, hops=2)
 
     passages = retriever.build_passages("铜厚要求")
+    text = "\n".join(passage["text"] for passage in passages)
 
-    assert any("35 μm --测试方法--> 荧光法" in passage["text"] for passage in passages)
+    assert "35 μm --测试方法--> 荧光法" in text
+    assert "35 μm --测试方法--> 荧光法（反向）" not in text
+    assert "测试标准 --规定--> 铜厚（反向）" in text
 
 
 def test_shared_graph_evidence_uses_configured_hops(monkeypatch):

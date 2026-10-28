@@ -63,3 +63,34 @@ def test_different_versions_and_conditions_remain_separate_contributions():
     graph.add_triple(fact("B", "b", revision="v2", qualifiers={"edition": "2025", "value": "30", "unit": "μm"}))
     edge = next(iter(graph.edges.values()))
     assert [q["edition"] for q in edge["facts"]] == ["2002", "2025"]
+
+
+def test_aggregate_text_is_bounded_without_losing_source_contributions(tmp_path):
+    import json
+    from pcb_rag import graph_rag as g
+
+    graph = KnowledgeGraph()
+    for index in range(100):
+        triple = fact(str(index), f"c{index}", relation_desc=f"relation {index}:" + "r" * 140)
+        triple.evidence = f"{index:03d}:" + "x" * 236
+        graph.add_triple(triple)
+    edge = next(iter(graph.edges.values()))
+    assert len(edge["e"]) <= g.GRAPH_EVIDENCE_CHARS
+    assert len(edge["rd"]) <= g.GRAPH_LLM_DESC_CHARS
+    assert len(edge["contributions"]) == 100
+
+    path = tmp_path / "kg.json"
+    payload = graph.to_dict()
+    payload["edges"][0]["e"] = "legacy " * 1000
+    payload["edges"][0]["rd"] = "d" * 1000
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    loaded = KnowledgeGraph.load(str(path))
+    edge = next(iter(loaded.edges.values()))
+    assert len(edge["e"]) <= g.GRAPH_EVIDENCE_CHARS
+    assert len(edge["rd"]) <= g.GRAPH_LLM_DESC_CHARS
+    assert len(edge["contributions"]) == 100
+
+    loaded.remove_docs([str(index) for index in range(99)])
+    edge = next(iter(loaded.edges.values()))
+    assert edge["e"] == edge["contributions"][0]["evidence"]
+    assert edge["contributions"][0]["doc_id"] == "99"

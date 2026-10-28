@@ -58,6 +58,70 @@ def test_graph_recovers_zero_base_recall_without_entity_name(offline_pipeline, t
     assert result.nodes[0].node.metadata["graph_route"] in {"entity_description", "relation_description"}
 
 
+def test_community_summary_recalls_original_evidence(offline_pipeline, tmp_path):
+    class CommunityEmbedding(Embedding):
+        def get_text_embedding_batch(self, texts):
+            return [[1.0, 0.0] if "无损测量" in text else [0.0, 1.0] for text in texts]
+
+    f = offline_pipeline
+    f.index.rows = []
+    evidence = f.node("evidence", "该方法能在不破坏样品的情况下测定金层的厚薄。")
+    graph = KnowledgeGraph()
+    graph.add_triples(
+        [
+            Triple("镀层厚度", "采用", "荧光法", chunk_id="evidence", evidence=evidence.text),
+            Triple("荧光法", "属于", "无损检测", chunk_id="evidence", evidence=evidence.text),
+        ]
+    )
+    graph.communities = {
+        "测厚主题": {
+            "entities": ["镀层厚度", "荧光法", "无损检测"],
+            "size": 3,
+            "summary": "无损测量覆盖层厚度的方法",
+        }
+    }
+    path = tmp_path / "community.json"
+    embed = CommunityEmbedding()
+    payload = build_graph_vectors(graph, embed, path)
+    retriever = GraphEvidenceRetriever.load(graph, path, embed)
+    f.pipeline.config = replace(f.pipeline.config, graph_enabled=True)
+    f.pipeline.state.update(graph=graph, graph_retriever=retriever, source_nodes={"evidence": evidence})
+
+    result = f.pipeline.retrieve("如何检查覆盖层尺寸？")
+
+    assert len(payload["communities"]) == 1
+    assert [item.node.id_ for item in result.nodes] == ["evidence"]
+    assert result.nodes[0].node.metadata["graph_route"] == "community_summary"
+    assert result.nodes[0].node.text == evidence.text
+    assert "无损测量" not in result.nodes[0].node.text
+
+
+def test_graph_acl_filters_before_candidate_limit(offline_pipeline, tmp_path, monkeypatch):
+    f = offline_pipeline
+    f.index.rows = []
+    monkeypatch.setattr(security, "ACL_ENABLED", True)
+    private = [
+        f.node(
+            f"private-{index:02d}",
+            "secret coating process",
+            tenant_id="other",
+            visibility="private",
+            doc_node_id=f"private-doc-{index}",
+        )
+        for index in range(20)
+    ]
+    public = f.node("public", "公开测试方法", tenant_id="acme", visibility="public", doc_node_id="public-doc")
+    graph_route(f, tmp_path, [*private, public])
+    token = security.set_request_principal(security.Principal(tenant_id="acme", user_id="alice", authenticated=True))
+    try:
+        result = f.pipeline.retrieve("如何检查覆盖层？")
+    finally:
+        security.reset_request_principal(token)
+
+    assert [item.node.id_ for item in result.nodes] == ["public"]
+    assert result.routes["graph"] == "ok"
+
+
 def test_private_graph_text_never_reaches_reranker_or_neighborhood(offline_pipeline, tmp_path, monkeypatch):
     f = offline_pipeline
     monkeypatch.setattr(security, "ACL_ENABLED", True)
@@ -85,6 +149,58 @@ def test_private_graph_text_never_reaches_reranker_or_neighborhood(offline_pipel
         assert neighborhood.relations[0]["sources"][0]["chunk_id"] == "public"
     finally:
         security.reset_request_principal(token)
+
+
+def test_neighborhood_authorization_fetches_only_candidate_sources(offline_pipeline, tmp_path, monkeypatch):
+    f = offline_pipeline
+    monkeypatch.setattr(security, "ACL_ENABLED", True)
+    public = f.node("public", "公开测试方法", tenant_id="acme", visibility="public", doc_node_id="d1")
+    graph, _ = graph_route(f, tmp_path, [public])
+    unrelated = f.node("unrelated", "secret", tenant_id="other", visibility="private", doc_node_id="d2")
+    graph.add_triple(Triple("秘密实体", "采用", "秘密工艺", chunk_id="unrelated", doc_id="d2"))
+    f.pipeline.state["source_nodes"]["unrelated"] = unrelated
+    requested = []
+    original_fetch = f.pipeline._fetch
+
+    def fetch(ids, state):
+        requested.extend(ids)
+        return original_fetch(ids, state)
+
+    monkeypatch.setattr(f.pipeline, "_fetch", fetch)
+    token = security.set_request_principal(security.Principal(tenant_id="acme", user_id="alice", authenticated=True))
+    try:
+        neighborhood = KnowledgeBase(auto_init=False, pipeline=f.pipeline).graph_neighbors("镀层厚度")
+    finally:
+        security.reset_request_principal(token)
+
+    assert neighborhood.found
+    assert requested == ["public"]
+    assert "secret" not in json.dumps(neighborhood.to_dict())
+
+
+def test_neighborhood_falls_back_to_authorized_fuzzy_entity(offline_pipeline, monkeypatch):
+    f = offline_pipeline
+    monkeypatch.setattr(security, "ACL_ENABLED", True)
+    private = f.node("private", "secret", tenant_id="other", visibility="private", doc_node_id="d2")
+    public = f.node("public", "公开测试方法", tenant_id="acme", visibility="public", doc_node_id="d1")
+    graph = KnowledgeGraph()
+    graph.add_triples(
+        [
+            Triple("镀层厚度", "采用", "秘密工艺", chunk_id="private", doc_id="d2"),
+            Triple("镀层厚度要求", "采用", "荧光法", chunk_id="public", doc_id="d1"),
+        ]
+    )
+    f.pipeline.state.update(graph=graph, source_nodes={"private": private, "public": public})
+    token = security.set_request_principal(security.Principal(tenant_id="acme", user_id="alice", authenticated=True))
+    try:
+        neighborhood = KnowledgeBase(auto_init=False, pipeline=f.pipeline).graph_neighbors("镀层厚度")
+    finally:
+        security.reset_request_principal(token)
+
+    assert neighborhood.found
+    assert neighborhood.entity == "镀层厚度要求"
+    assert neighborhood.relations[0]["sources"][0]["chunk_id"] == "public"
+    assert "secret" not in json.dumps(neighborhood.to_dict())
 
 
 def test_embedding_mode_mismatch_disables_semantic_index(offline_pipeline, tmp_path):

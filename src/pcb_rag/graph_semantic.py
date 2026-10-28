@@ -1,4 +1,4 @@
-"""Entity/relation description vectors that resolve back to original evidence."""
+"""Entity, relation and community vectors that resolve back to original evidence."""
 
 from __future__ import annotations
 
@@ -28,16 +28,23 @@ def embedding_identity(model):
     }
 
 
-def authorized_graph(graph, fetch, allowed):
+def authorized_graph(graph, fetch, allowed, *, entities=None):
     """Rebuild aggregate descriptions using only authorized source contributions."""
     import copy
     from pcb_rag.graph_rag import KnowledgeGraph
 
-    ids = list(dict.fromkeys(source["chunk_id"] for edge in graph.edges.values() for source in _source_records(edge)))
+    selected = None if entities is None else {
+        key for name in entities for key in graph.incident.get(name, set())
+    }
+    keys = list(graph.edges) if selected is None else [key for key in graph.edges if key in selected]
+    ids = list(dict.fromkeys(
+        source["chunk_id"] for key in keys for source in _source_records(graph.edges[key])
+    ))
     nodes = {node.id_: node for node in allowed(fetch(ids))} if ids else {}
     result = KnowledgeGraph()
     result.revision = graph.revision
-    for key, edge in graph.edges.items():
+    for key in keys:
+        edge = graph.edges[key]
         sources = []
         for source in edge.get("contributions", []):
             node = nodes.get(source.get("chunk_id"))
@@ -101,6 +108,10 @@ class RelationRetriever(VectorDescriptionRetriever):
     pass
 
 
+class CommunityRetriever(VectorDescriptionRetriever):
+    pass
+
+
 def _source_records(edge):
     return [
         {
@@ -116,7 +127,7 @@ def _source_records(edge):
 
 def build_graph_vectors(graph, embed_model, path, *, client=None, collection_prefix="pcb_graph", backend="local"):
     """Build immutable description indexes using the existing passage embedder."""
-    entities, relations = [], []
+    entities, relations, communities = [], [], []
     for name, node in graph.nodes.items():
         sources = [source for edge in graph.edges_of(name) for source in _source_records(edge)]
         if not sources:
@@ -149,7 +160,27 @@ def build_graph_vectors(graph, embed_model, path, *, client=None, collection_pre
                     "sources": sources,
                 }
             )
-    records = entities + relations
+    for label, community in graph.communities.items():
+        summary = str(community.get("summary") or "").strip()
+        if not summary:
+            continue
+        members = set(community.get("entities", []))
+        sources = list({
+            source["chunk_id"]: source
+            for edge in graph.edges.values()
+            if edge["h"] in members and edge["t"] in members
+            for source in _source_records(edge)
+        }.values())
+        if not sources:
+            continue
+        communities.append(
+            {
+                "key": fingerprint(["community", label])[:32],
+                "text": " ".join([label, summary, "、".join(community.get("entities", [])[:30])]),
+                "sources": sources,
+            }
+        )
+    records = entities + relations + communities
     for start in range(0, len(records), 32):
         batch = records[start : start + 32]
         if hasattr(embed_model, "get_text_embedding_batch"):
@@ -164,7 +195,7 @@ def build_graph_vectors(graph, embed_model, path, *, client=None, collection_pre
     if backend == "milvus" and records:
         if client is None:
             raise ValueError("Milvus graph backend requires a client")
-        for name, batch in (("entities", entities), ("relations", relations)):
+        for name, batch in (("entities", entities), ("relations", relations), ("communities", communities)):
             if not batch:
                 continue
             collection = f"{collection_prefix[:180]}_{name}_{fingerprint(batch)[:12]}"
@@ -191,11 +222,12 @@ def build_graph_vectors(graph, embed_model, path, *, client=None, collection_pre
                 )
             collections[name] = collection
     payload = {
-        "version": 1,
+        "version": 2,
         "revision": graph.revision,
         "backend": backend,
         "entities": entities,
         "relations": relations,
+        "communities": communities,
         "collections": collections,
         "embedding_model": str(getattr(embed_model, "model_name", "")),
         "embedding_identity": embedding_identity(embed_model),
@@ -210,16 +242,17 @@ def build_graph_vectors(graph, embed_model, path, *, client=None, collection_pre
 
 
 class GraphEvidenceRetriever:
-    def __init__(self, graph, embed_model=None, *, entities=None, relations=None):
+    def __init__(self, graph, embed_model=None, *, entities=None, relations=None, communities=None):
         self.graph = graph
         self.embed_model = embed_model
         self.entities = entities
         self.relations = relations
+        self.communities = communities
 
     @property
     def semantic_ready(self):
         return self.embed_model is not None and any(
-            getattr(retriever, "records", []) for retriever in (self.entities, self.relations)
+            getattr(retriever, "records", []) for retriever in (self.entities, self.relations, self.communities)
         )
 
     @classmethod
@@ -238,20 +271,30 @@ class GraphEvidenceRetriever:
         return cls(
             graph,
             embed_model,
-            entities=EntityRetriever(payload["entities"], client=client, collection=names.get("entities", "")),
-            relations=RelationRetriever(payload["relations"], client=client, collection=names.get("relations", "")),
+            entities=EntityRetriever(payload.get("entities", []), client=client, collection=names.get("entities", "")),
+            relations=RelationRetriever(payload.get("relations", []), client=client, collection=names.get("relations", "")),
+            communities=CommunityRetriever(
+                payload.get("communities", []), client=client, collection=names.get("communities", "")
+            ),
         )
 
-    def retrieve_sources(self, query, fetch, *, top_k=5):
+    def retrieve_sources(self, query, fetch, *, top_k=5, allowed=None):
         from llama_index.core.schema import NodeWithScore
 
+        if top_k <= 0:
+            return []
         hits = []
         for name, score in link_entities(query, self.graph):
             for edge in self.graph.related_edges([name], hops=GRAPH_HOP):
                 hits.extend(dict(source, score=score, route="entity_name") for source in _source_records(edge))
         if self.semantic_ready:
             vector = self.embed_model.get_query_embedding(query)
-            for route, retriever in (("entity_description", self.entities), ("relation_description", self.relations)):
+            routes = (
+                ("entity_description", self.entities),
+                ("relation_description", self.relations),
+                ("community_summary", self.communities),
+            )
+            for route, retriever in routes:
                 if retriever is not None:
                     for match in retriever.search(vector, top_k):
                         if match["score"] <= 0:
@@ -261,17 +304,29 @@ class GraphEvidenceRetriever:
         by_id = {}
         for hit in hits:
             by_id.setdefault(hit["chunk_id"], hit)
-        # Fetch more than the display top_k, so ACL filtering can preserve recall.
-        ids = list(by_id)[: max(top_k * 4, 20)]
+        ids = list(by_id)
+        batch_size = max(top_k * 4, 20)
         results = []
-        for node in fetch(ids):
-            hit = by_id.get(node.id_)
-            if not hit:
-                continue
-            if hit["revision"] and str(node.metadata.get("revision", "")) != hit["revision"]:
-                continue
-            if hit["doc_id"] and str(node.metadata.get("doc_node_id", "")) != hit["doc_id"]:
-                continue
-            node.metadata = dict(node.metadata, graph_route=hit["route"], graph_qualifiers=hit["qualifiers"])
-            results.append(NodeWithScore(node=node, score=hit["score"]))
+        for start in range(0, len(ids), batch_size):
+            batch = ids[start : start + batch_size]
+            requested = set(batch)
+            candidates = []
+            for node in fetch(batch):
+                hit = by_id.get(node.id_)
+                if not hit or node.id_ not in requested:
+                    continue
+                if hit["revision"] and str(node.metadata.get("revision", "")) != hit["revision"]:
+                    continue
+                if hit["doc_id"] and str(node.metadata.get("doc_node_id", "")) != hit["doc_id"]:
+                    continue
+                candidates.append(node)
+            if allowed is not None:
+                authorized = {node.id_ for node in allowed(candidates)}
+                candidates = [node for node in candidates if node.id_ in authorized]
+            for node in candidates:
+                hit = by_id[node.id_]
+                node.metadata = dict(node.metadata, graph_route=hit["route"], graph_qualifiers=hit["qualifiers"])
+                results.append(NodeWithScore(node=node, score=hit["score"]))
+            if len(results) >= top_k:
+                break
         return sorted(results, key=lambda item: (-float(item.score), item.node.id_))[:top_k]

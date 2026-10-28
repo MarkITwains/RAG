@@ -109,7 +109,8 @@ def test_real_ingestion_recovery_graph_indexes_and_collection_switch(tmp_path, m
         assert any(node.metadata.get("pcb_facts") for node in children)
         assert all("doc_node_id:" not in text and "tenant_id:" not in text for text in embed._passages)
         semantic = json.loads(Path(first["artifacts"]["graph_vectors"]).read_text())
-        assert set(semantic["collections"]) == {"entities", "relations"}
+        expected_indexes = {"entities", "relations"} | ({"communities"} if semantic["communities"] else set())
+        assert set(semantic["collections"]) == expected_indexes
         for name in semantic["collections"].values():
             hits = client.search(collection_name=name, data=[[0.5] * 8], limit=1, output_fields=["key"])
             assert hits[0]
