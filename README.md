@@ -1,9 +1,9 @@
 <h1 align="center">PCB-RAG</h1>
 
-<p align="center"><b>面向 PCB 知识库的检索增强生成（RAG）问答系统</b></p>
+<p align="center"><b>把 PCB 设计规范、工艺资料和工程文档变成能提问、带出处的知识库</b></p>
 
 <p align="center">
-  文档入库 · 向量检索 · BM25 词法召回 · 多路融合 · Rerank 精排 · Dify 集成
+  Web 问答 · HTTP API · Dify 外部知识库 · Python / Agent 元件
 </p>
 
 <p align="center">
@@ -19,184 +19,322 @@
 
 ---
 
-PCB-RAG 面向 PCB 设计规范、工艺资料与工程经验文档，覆盖从文档预处理、结构切块入库，到混合检索、重排序、答案合成与对外服务的完整链路，可用于构建 PCB 领域的智能问答助手。
+把你的 PCB 文档放进来，入库一次，就可以：
 
-2026-10-23 的共享检索内核、可恢复入库、图语义召回、引用预算及 WSL 验证记录见 [修复与验证报告](docs/LIGHTRAG_FIXES_WSL_20261023.md)。旧集合需要先迁移，才能使用新版父块、来源元数据与图索引。
+- 在网页里直接提问。答案带 `[n]` 角标，点一下就能看到原文。
+- 把它配成 Dify 的外部知识库，接进工作流或对话应用。
+- 通过 HTTP API 或 Python 接口，给自己的系统或 Agent 当检索工具。
+
+想了解检索原理、架构、已知问题和修复记录，请看 [原理与设计](docs/ARCHITECTURE.md)。
 
 ## 目录
 
-- [项目亮点](#项目亮点)
-- [系统架构](#系统架构)
-- [技术栈](#技术栈)
-- [目录结构](#目录结构)
+- [适用场景](#适用场景)
 - [快速开始](#快速开始)
-- [检索链路](#检索链路)
-- [Web 界面](#web-界面)
-- [作为元件接入自研 Agent](#作为元件接入自研-agent)
-- [Dify 外部知识库 API](#dify-外部知识库-api)
-- [配置说明](#配置说明)
+- [使用方式](#使用方式)
+  - [Web 界面](#web-界面)
+  - [HTTP API](#http-api)
+  - [接入 Dify](#接入-dify)
+  - [在 Python / Agent 里调用](#在-python--agent-里调用)
+- [日常操作](#日常操作)
+- [按需开启的功能](#按需开启的功能)
+- [选择模型后端](#选择模型后端)
+- [上线前检查](#上线前检查)
+- [配置参考](#配置参考)
 - [评测](#评测)
 - [常见问题](#常见问题)
-- [开发意义](#开发意义)
+- [更多文档](#更多文档)
 - [公开仓库说明](#公开仓库说明)
 - [License](#license)
 
-## 项目亮点
+## 适用场景
 
-| 亮点 | 说明 |
-| --- | --- |
-| **本地 / API 双后端** | LLM、Embedding、Rerank 均支持「本地服务」与「OpenAI 兼容 API」两种后端，通过 `*_BACKEND` 环境变量切换，不锁定厂商 |
-| **一键环境补全** | `scripts/setup.sh` 自动创建虚拟环境、安装依赖、生成 `.env`、启动 Milvus，并按后端检查模型可用性 |
-| **领域化文档处理** | 面向 PCB 规范、EDA 工具文档与工艺参数，内置编码修复、OCR 乱码清理、结构感知切块与元数据抽取 |
-| **混合检索架构** | Milvus 向量检索 + BM25 词法检索 + HyDE 查询扩展 + 加权 RRF 多路融合，提升专业问题召回率 |
-| **查询理解** | 意图识别与动态权重、复合问题自动分解、过于具体的问题自动 Step-back 补充背景知识 |
-| **Agentic RAG** | 可选的迭代检索：检索 → 充分性判断 → 信息不足则改写查询重检，直到满足或达到迭代上限 |
-| **Contextual Retrieval** | 入库时为每个 chunk 注入「文档 · 章节 · 标准号」语境前缀，缓解切块导致的上下文丢失 |
-| **可切换精排** | 支持 API 精排（Jina / 硅基流动等）与本地精排（Qwen3-Reranker / cross-encoder / SBERT） |
-| **上下文扩展** | 子块参与向量召回，按需读取快照中保存的完整父块与相邻证据；表格保留列头、单位和脚注 |
-| **Dify 集成** | 提供符合规范的 FastAPI 外部知识库接口，可直接接入 Dify 工作流或对话应用 |
-| **GraphRAG 图检索** | 实体描述、关系描述各有语义索引；图命中回查可授权原文，与向量/BM25 一起融合和精排 |
-| **发布与恢复** | 内容及处理配置生成阶段指纹；入库失败保留旧版本，完成校验后原子发布，支持图补建和新集合迁移 |
-| **统一证据与引用** | HTTP、SDK、CLI、评测共用检索管道；最终提示词、引用、返回原文与完整请求预算共用 EvidenceBundle |
-| **上下文压缩** | 近似去重 + 抽取式压缩 + 字符预算裁剪，在长召回链路上显著降低 token 消耗 |
-| **多租户权限** | 按租户 / 角色 / 组做检索级过滤（向量库表达式 + 内存兜底双层），并支持访问审计 |
-| **可观测性** | 结构化 tracing（JSONL）、计数器与延迟分位，`/metrics` 直接暴露 |
-| **多模态** | PDF 图片经视觉模型转成可检索描述，表格结构化为 Markdown，列值对应关系不再丢失 |
-| **标准工程结构** | `src/pcb_rag` 包结构 + `pyproject.toml`，便于安装、导入与维护 |
-
-## 系统架构
-
-### 模型层：本地 / API 双后端
-
-```mermaid
-flowchart TB
-    subgraph F["api_clients.py — 统一模型工厂"]
-        direction LR
-        LLM["LLM"]
-        EMB["Embedding"]
-        RRK["Rerank"]
-    end
-
-    LLM --> LLM_L["local：Ollama"]
-    LLM --> LLM_A["api：OpenAI 兼容"]
-
-    EMB --> EMB_L["local：Ollama"]
-    EMB --> EMB_A["api：OpenAI 兼容"]
-
-    RRK --> RRK_A["api：HTTP /rerank"]
-    RRK --> RRK_H["local：HF / Qwen3-Reranker / SBERT"]
-    RRK --> RRK_N["none：关闭精排"]
-```
-
-### 检索链路
-
-```mermaid
-flowchart LR
-    Q["用户问题"] --> ACL["权限过滤 + 元数据解析"]
-    ACL --> EXP["查询扩展 + HyDE"]
-    EXP --> DENSE["向量召回"]
-    EXP --> SPARSE["BM25 词法召回"]
-    EXP --> GRAPH["图语义检索 → 授权原文"]
-    DENSE --> FUSE["加权 RRF 融合"]
-    SPARSE --> FUSE
-    GRAPH --> FUSE
-    FUSE --> RERANK["Rerank 精排"]
-    RERANK --> CTX["相邻 / 父级 Chunk 扩展"]
-    CTX --> COMP["去重 + 上下文压缩"]
-    COMP --> ANS["LLM 合成答案 + 引用"]
-```
-
-## 技术栈
-
-| 层次 | 组件 |
-| --- | --- |
-| 语言 | Python 3.10+ |
-| RAG 框架 | LlamaIndex |
-| 向量数据库 | Milvus 2.6（Docker Compose 一键启动） |
-| 模型服务 | OpenAI 兼容 API / Ollama / HuggingFace Transformers |
-| 服务框架 | FastAPI + Uvicorn |
-| 外部集成 | Dify External Knowledge API |
-| 分词与检索 | jieba 领域词典 + 本地 BM25+ 词法索引 |
-
-## 目录结构
-
-```text
-.
-├── .env.example                  # 环境变量模板（本地 / API 双后端）
-├── .gitlab-ci.yml                # CI：lint + pytest
-├── .github/workflows/ci.yml      # GitHub Actions：ruff 静态检查 + 构建 + pytest
-├── requirements.txt              # Python 依赖
-├── pyproject.toml                # Python 包配置
-├── src/pcb_rag/                  # 核心源码包
-│   ├── api_clients.py            # LLM / Embedding / Rerank 双后端工厂
-│   ├── cache.py                  # 语义缓存（精确匹配 + 向量相似）
-│   ├── chunk_quality.py          # chunk 信息密度评估（低价值块标记）
-│   ├── context_budget.py         # 上下文 token 预算与三段式组装
-│   ├── engine.py                 # Agent 元件：结构化检索 / 问答 / 工具定义
-│   ├── fusion.py                 # 加权 RRF 与配额制融合（纯逻辑）
-│   ├── graph_rag.py              # 实体关系图：抽取、存储、图检索
-│   ├── ingest.py                 # 文档预处理、切块与入库
-│   ├── query.py                  # 检索链路与交互式问答
-│   ├── preprocess_docs.py        # 编码修复与乱码清理
-│   ├── webui/index.html          # Web 问答界面（单文件，零构建）
-│   └── dify_external_api.py      # Dify 外部知识库 API 服务
-├── examples/                     # 作为元件接入 agent 的示例与说明
-├── tests/                        # 单元测试（缓存 / 评测指标 / 文档预处理）
-├── eval/                         # 评测体系（黄金集 + 四指标）
-│   ├── build_golden_dataset.py   # 数据集构建
-│   ├── metrics.py                # 忠实度 / 相关性 / 精确率 / 召回率
-│   └── evaluate.py               # 评测主脚本
-├── scripts/                      # 一键安装与运行脚本
-│   ├── setup.sh                  # 环境一键补全
-│   ├── check_env.py              # 环境自检
-│   ├── run_ingest.sh             # 文档入库
-│   ├── run_query.sh              # 交互式问答
-│   ├── serve_api.sh              # 启动 API 服务
-│   └── run_optimized.sh          # 交互式参数配置脚本
-├── docker/milvus/docker-compose.yml
-├── data/README.md                # 数据目录说明
-└── docs/                         # 配置、集成与优化文档
-```
+| 场景 | 怎么用 | 入口 |
+| --- | --- | --- |
+| 工程师查规范、查工艺参数 | 在网页里提问，对照引用原文 | `http://localhost:8000/` |
+| 在 Dify 里做 PCB 助手 | 配成外部知识库 | `POST /retrieval` |
+| 在业务系统里嵌入问答 | 调用问答接口，支持流式输出 | `POST /api/ask`、`POST /api/ask/stream` |
+| 自研 Agent 需要查资料 | 直接 import，或用 function calling | `pcb_rag.engine.KnowledgeBase` |
+| 多个团队共用一个库 | 打开租户 / 角色权限 | `ACL_ENABLED=1` |
 
 ## 快速开始
 
 ### 前置要求
 
 - Python 3.10+
-- Docker 与 Docker Compose（用于启动 Milvus）
+- Docker 与 Docker Compose（用于启动 Milvus 向量库）
 - 模型服务（二选一）：
+  - API：任意 OpenAI 兼容服务的 `BASE_URL` 与 `API_KEY`（推荐，不需要显卡）
   - 本地：安装并启动 [Ollama](https://ollama.com/)
-  - API：准备任意 OpenAI 兼容服务的 `BASE_URL` 与 `API_KEY`
 
-### 1. 一键补全环境
+> Windows 用户请在 WSL 里运行。从 PowerShell 启动、停止服务的方法见 [WSL 运行说明](docs/WSL_API.md)。
+
+### 1. 安装
 
 ```bash
 bash scripts/setup.sh
 ```
 
-脚本执行内容：
+这个脚本会创建 `.venv`、安装依赖、从 `.env.example` 生成 `.env`、建好数据目录、启动 Milvus，最后做一次环境自检。
 
-| 步骤 | 内容 |
-| --- | --- |
-| 1 | 创建 `.venv` 虚拟环境 |
-| 2 | 安装 `requirements.txt`，并执行 `pip install -e .` |
-| 3 | 从 `.env.example` 生成 `.env` |
-| 4 | 创建 `data/clear_docs/`、`data/raw_docs/`、`logs/` |
-| 5 | 启动 `docker/milvus/docker-compose.yml` |
-| 6 | 按 `LLM_BACKEND` / `EMBED_BACKEND` 检查模型后端 |
-| 7 | 运行 `scripts/check_env.py` 完成环境自检 |
-
-WSL / Linux Python 3.12 可复用已验证的依赖版本：
+WSL / Linux 上的 Python 3.12 可以复用已验证的依赖版本：
 
 ```bash
 python -m pip install -c requirements/constraints-wsl-py312.txt -e ".[runtime,ollama,dev]"
 ```
 
-`runtime` 包含 API 模型适配、Milvus、HTTP 与文档读取依赖；`ollama` 包含本地服务客户端。使用本地 torch 精排时另装 `pip install -e ".[local_models]"`。该本地模型配置不在上述 WSL 版本快照内。依赖自检可用 `python scripts/check_env.py --dependencies-only`，不会请求模型或数据库。
+要用本地 torch 精排时，再装 `pip install -e ".[local_models]"`。
 
-### 2. 配置模型后端
+### 2. 填写 `.env`
 
-编辑 `.env` 选择后端，三者可自由混搭。
+最少要填模型接口和服务口令。下面是全部走 API 的例子（以硅基流动为例）：
+
+```bash
+AI_API_ONLY=1
+LLM_BACKEND=api
+EMBED_BACKEND=api
+LLM_BASE_URL=https://api.siliconflow.cn/v1
+LLM_API_KEY=sk-xxxx
+LLM_MODEL=Qwen/Qwen3-8B
+EMBED_MODEL=BAAI/bge-m3
+EMBED_DIM=1024
+
+RERANK_BACKEND=api
+RERANK_API_URL=https://api.jina.ai/v1/rerank
+RERANK_API_KEY=xxxx
+RERANK_API_MODEL=jina-reranker-v2-base-multilingual
+
+# 服务口令：不设置或用占位值 change-me 时，服务拒绝启动
+DIFY_API_TOKEN=换成一串随机字符
+```
+
+想用本地模型或混搭，见 [选择模型后端](#选择模型后端)。
+
+填好后自检一次，它会列出缺的配置：
+
+```bash
+python scripts/check_env.py
+```
+
+### 3. 放入文档
+
+把你有权使用的文档放进 `data/clear_docs/`，子目录也会读取。支持 PDF、Word（`.docx` / `.doc`）和 `.txt` / `.md` 等文本文件。
+
+> 入库时默认会修复 `.txt` 文件的编码，并**直接改写原文件**。不想改原文件，请设 `AUTO_FIX_ENCODING=0`。
+
+公开仓库不包含任何原始语料。
+
+### 4. 入库
+
+```bash
+bash scripts/run_ingest.sh      # 等价：python -m pcb_rag.ingest
+```
+
+入库会先准备新版本，校验通过后才发布。中途失败时，旧版本照常可用。只想预览要处理哪些文件，先设 `INGEST_PLAN_ONLY=1` 再运行。
+
+### 5. 开始提问
+
+命令行问答：
+
+```bash
+bash scripts/run_query.sh       # 等价：python -m pcb_rag.query
+```
+
+或者启动服务，用浏览器打开 `http://localhost:8000/`：
+
+```bash
+bash scripts/serve_api.sh       # 默认端口 8000，可用 API_PORT 修改
+```
+
+可以试试这些问题：
+
+```text
+4 层 PCB 的阻抗控制需要关注哪些参数？
+Altium Designer 中如何处理高速差分线等长？
+```
+
+## 使用方式
+
+下面四种方式共用同一套检索和同一份索引，可以同时使用。
+
+### Web 界面
+
+服务启动后访问 `http://localhost:8000/`。页面是单个静态文件（`src/pcb_rag/webui/index.html`），不需要构建，离线部署也能用。
+
+| 能力 | 说明 |
+| --- | --- |
+| 流式问答 | 检索完先列出证据，答案逐段出现 |
+| 证据溯源 | 列出原文片段、章节、得分；答案里的 `[n]` 可点击定位 |
+| 检索参数 | 召回条数、相似度阈值可以在页面上直接调 |
+| 多轮对话 | 自动带上最近 6 轮问答，后续问题可以说"它"、"上面那个" |
+| 状态指示 | 顶栏显示索引、词法索引、精排是否就绪 |
+
+第一次提问如果提示 401，点右上角「设置」，填入 `.env` 里的 `DIFY_API_TOKEN`。口令只存在你的浏览器里。
+
+管理页在 `/manage`。可以查看已发布和待发布的版本、每个文档的处理阶段和失败原因，也可以重试失败的入库。开了权限控制时，管理操作需要管理员身份。
+
+### HTTP API
+
+所有业务接口都要带 `Authorization: Bearer <DIFY_API_TOKEN>`。完整的交互式文档在 `http://localhost:8000/docs`。
+
+**问答：**
+
+```bash
+curl -X POST http://localhost:8000/api/ask \
+  -H "Authorization: Bearer $DIFY_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "4 层 PCB 的阻抗控制需要关注哪些参数？", "top_k": 5}'
+```
+
+返回里最常用的字段：
+
+| 字段 | 内容 |
+| --- | --- |
+| `answer` | 答案文本，带 `[n]` 引用角标 |
+| `records` | 引用到的原文片段，含来源文件、章节、页码 |
+| `citations` | 答案里每个 `[n]` 对应的证据 |
+| `degraded` | 哪一路没跑起来（为空表示全链路正常） |
+| `revision` | 本次使用的知识库版本 |
+
+**多轮对话：** 有两种做法。
+
+- 自己保存历史：调 `/api/ask`，在 `chat_history` 里传 `[{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]`。
+- 让服务端保存：调 `/api/chat`。第一次不传 `session_id`，之后用返回的 `session_id` 继续问。
+
+**全部接口：**
+
+| 接口 | 用途 |
+| --- | --- |
+| `POST /api/ask` | 检索 + 生成答案，可传对话历史 |
+| `POST /api/ask/stream` | 流式问答（SSE）：先推证据，再逐段推答案 |
+| `POST /api/ask/plain` | 只返回纯文本答案，适合 Dify 工作流 |
+| `POST /api/chat` | 服务端记住会话的问答，返回 `session_id` |
+| `POST /api/chat/plain` | 同上，只返回纯文本 |
+| `POST /retrieval` | Dify 外部知识库接口，只检索不生成 |
+| `POST /api/session/create`、`GET /api/sessions` | 创建、列出会话 |
+| `GET /api/session/{id}`、`DELETE /api/session/{id}` | 查看、删除会话 |
+| `GET /api/admin/status`、`GET /api/admin/documents` | 查看发布版本和文档处理状态 |
+| `POST /api/admin/retry` | 重试未完成的入库 |
+| `GET /api/graph/neighbors` | 查看某个实体的图谱关系（需开启 GraphRAG） |
+| `GET /health` | 健康检查，给负载均衡和探针用，不需要口令 |
+| `GET /health/detail` | 完整配置摘要，需要口令 |
+| `GET /metrics` | 请求计数和延迟分位（p50 / p95 / p99） |
+
+### 接入 Dify
+
+先启动服务（`bash scripts/serve_api.sh`），再在 Dify 的「外部知识库」里填：
+
+| 配置项 | 值 |
+| --- | --- |
+| URL | `http://<你的服务器地址>:8000/retrieval` |
+| API Key | `Bearer <你的 DIFY_API_TOKEN>` |
+
+想让 Dify 直接拿到生成好的答案，可以在工作流里用 HTTP 节点调 `/api/ask/plain`。详细步骤见 [Dify 接入指南](docs/DIFY_INTEGRATION_GUIDE.md)。
+
+### 在 Python / Agent 里调用
+
+不经过 HTTP，直接在代码里用：
+
+```python
+from pcb_rag.engine import KnowledgeBase
+
+kb = KnowledgeBase()
+kb.ensure_ready()                                  # 首次加载需要几十秒
+
+hit = kb.retrieve("4 层板阻抗控制关注什么", top_k=8)
+for ev in hit.evidence:
+    print(ev.source_name, ev.section, ev.score)    # 逐条证据，不是拼好的字符串
+
+if hit.degraded:                                   # 有一路没跑起来时要处理
+    print("降级：", hit.degraded)
+
+ans = kb.answer("那 6 层板呢？", history=[
+    {"role": "user", "content": "4 层板阻抗控制关注什么"},
+    {"role": "assistant", "content": "..."},
+])
+print(ans.answer)
+```
+
+| 要做的事 | 接口 |
+| --- | --- |
+| 只检索证据 | `retrieve()` / `aretrieve()` |
+| 检索并生成答案 | `answer()` / `aanswer(history=[...])` |
+| 查实体的图谱邻域 | `graph_neighbors()` |
+| 检查各组件状态 | `health()` |
+| 给 LLM 做 function calling | `tool_specs()` / `call_tool()` / `acall_tool()` |
+
+元件不保存会话，历史由调用方传入。可运行的示例：
+
+```bash
+python examples/agent_toolkit_demo.py --mode direct --query "4 层板阻抗控制关注什么"
+python examples/agent_toolkit_demo.py --mode tools    # 打印 function calling 定义
+python examples/agent_toolkit_demo.py --mode react    # 文本协议的 agent 循环
+```
+
+更多说明见 [examples/README.md](examples/README.md)。
+
+## 日常操作
+
+### 新增或更新文档
+
+1. 把新文件放进 `data/clear_docs/`，或直接替换旧文件。
+2. 重新运行 `bash scripts/run_ingest.sh`。只有内容变了的文件会重新处理。
+3. 校验通过后新版本自动发布。正在运行的服务会切到新版本，不用重启。
+
+前提是服务和入库使用同一个 `KB_STATE_PATH`。
+
+### 查看入库状态、重试失败
+
+打开 `/manage` 页面，或调 `GET /api/admin/status` 和 `GET /api/admin/documents`。失败的入库可以在页面上点重试，或调 `POST /api/admin/retry`。
+
+### 从旧集合迁移
+
+旧集合要先迁移，才能用新版的父块、来源信息和图索引。迁移默认只预览，不写数据库：
+
+```bash
+python -m pcb_rag.migrate --target-collection pcb_kb_v2             # 预览
+python -m pcb_rag.migrate --target-collection pcb_kb_v2 --execute   # 建新集合并输出验证报告
+```
+
+确认报告没问题后，加 `--execute --publish` 切换到新集合。之后把 `.env` 里的 `COLLECTION` 改成新集合名。旧集合和快照会保留，可以随时切回。
+
+需要核对旧评测真值时，加 `--mapping-from 旧词法缓存.jsonl --truth-ids 旧chunk编号数组.json`。完整操作顺序见 [修复与验证报告](docs/LIGHTRAG_FIXES_WSL_20261023.md)。
+
+### 全量重建
+
+用新集合名走一遍上面的迁移流程。`INGEST_OVERWRITE=1` 对非空集合会直接报错，不能用来清空重建。
+
+### 补建图谱
+
+已有新版快照时，下面这条命令会补建图谱并直接发布。源文件和切块配置没变时，会复用已有的切块和向量：
+
+```bash
+python -m pcb_rag.migrate --stage graph --execute
+```
+
+## 按需开启的功能
+
+都在 `.env` 里改，改完重启服务。
+
+| 功能 | 什么时候开 | 开关 | 默认 |
+| --- | --- | --- | --- |
+| 精排 | 想让最相关的排在前面 | `RERANK_BACKEND=api`（或本地，见下文） | 开（API） |
+| HyDE 查询增强 | 问题很短、说得不完整 | `HYDE_ENABLED=1` | 开 |
+| 复合问题拆分 | 一句话问了好几件事 | `QUERY_DECOMPOSE_ENABLED=1` | 开 |
+| Step-back 背景补充 | 问题太具体，需要上位知识 | `QUERY_STEP_BACK_ENABLED=1` | 开 |
+| 引用标注 | 答案要标出处 | `CITATION_ENABLED=1` | 开 |
+| 语义缓存 | 重复问题多，想省钱 | `SEMANTIC_CACHE_ENABLED=1` | 开 |
+| GraphRAG 图检索 | 问题涉及多个概念之间的关系 | `GRAPH_RAG_ENABLED=1`，先[补建图谱](#补建图谱) | 关 |
+| 多轮迭代检索 | 一次查不全，要自己判断再查 | `SELF_RAG_ENABLED=1`，请求里再传 `use_self_rag: true` | 关 |
+| 上下文压缩 | 召回内容太长，想省 token | `CONTEXT_COMPRESSION_ENABLED=1` | 关 |
+| 会话持久化 | 重启后要保留对话 | `SESSION_STORE=sqlite` | `memory` |
+| 多租户权限 | 多个团队共用一个库 | `ACL_ENABLED=1` | 关 |
+| PDF 图片描述 | 文档里有大量图（需要视觉模型） | `MULTIMODAL_ENABLED=1` | 关 |
+| 各路保底条数 | 想保证某一路至少进几条 | `FUSION_QUOTAS=vector=3,bm25=2,graph=1` | 空（均分） |
+
+## 选择模型后端
+
+LLM、Embedding、Rerank 三个可以分别选，自由混搭。
 
 **全本地（Ollama）**
 
@@ -208,199 +346,61 @@ OLLAMA_LLM_MODEL=qwen3.5:35b-a3b-q4_K_M
 OLLAMA_EMBED_MODEL=qwen3-embedding:8b-q8_0
 ```
 
-**全 API（OpenAI 兼容，以硅基流动为例）**
+**全 API（OpenAI 兼容）**：见 [快速开始](#2-填写-env) 的例子。评测用的打分模型可以单独配：
 
 ```bash
-AI_API_ONLY=1
-LLM_BACKEND=api
-EMBED_BACKEND=api
-LLM_BASE_URL=https://api.siliconflow.cn/v1
-LLM_API_KEY=sk-xxxx
-LLM_MODEL=Qwen/Qwen3-8B
-EMBED_MODEL=BAAI/bge-m3
-EMBED_DIM=1024
-# 生成评测使用独立的 API judge；地址/密钥留空时复用 LLM_API_*。
 JUDGE_BACKEND=api
 JUDGE_MODEL=glm-5-3-260814
-JUDGE_BASE_URL=
-JUDGE_API_KEY=
+JUDGE_BASE_URL=     # 留空时复用 LLM_BASE_URL
+JUDGE_API_KEY=      # 留空时复用 LLM_API_KEY
 ```
 
-**Rerank 后端**
+**精排**
 
 ```bash
-# API 精排（推荐，无需本地显存）
+# API 精排（推荐，不占本地显存）
 RERANK_BACKEND=api
 RERANK_API_URL=https://api.jina.ai/v1/rerank
 RERANK_API_KEY=xxxx
 RERANK_API_MODEL=jina-reranker-v2-base-multilingual
 
-# 本地精排（可选 hf / qwen3reranker / sbert），或 none 关闭
+# 本地精排：hf / qwen3reranker / sbert；不需要精排时设 none
 RERANK_BACKEND=qwen3reranker
 ```
 
-> 混搭示例：LLM 走 API、Embedding 走本地，只需分别设置 `LLM_BACKEND` 与 `EMBED_BACKEND`。
+> 混搭示例：LLM 走 API、Embedding 走本地，只需分别设置 `LLM_BACKEND=api` 与 `EMBED_BACKEND=local`，并设 `AI_API_ONLY=0`。
 
-### 3. 准备数据
+## 上线前检查
 
-公开仓库不包含任何原始语料。请将你有权使用的 PCB 文档放入：
-
-```text
-data/clear_docs/
-```
-
-### 4. 文档入库
-
-```bash
-bash scripts/run_ingest.sh      # 等价：python -m pcb_rag.ingest
-```
-
-默认按内容和处理阶段指纹增量写入。入库先准备新快照，验证向量、词法、图产物后再发布；删除或更新文档时旧版本仍可读取。`INGEST_OVERWRITE=1` 对非空集合会报错，全量重建应使用新集合。
-
-旧集合迁移默认仅预览，不写数据库：
-
-```bash
-python -m pcb_rag.migrate --target-collection pcb_kb_v2
-python -m pcb_rag.migrate --target-collection pcb_kb_v2 --execute
-```
-
-第二条命令构建独立集合并输出验证报告。需要检查旧评测真值时，加 `--mapping-from 旧词法缓存.jsonl --truth-ids 旧chunk编号数组.json`；必须匹配的 ID 无法唯一映射时验证失败。确认报告后，加 `--execute --publish` 切换同一状态文件的读取版本，已完成阶段会复用。后续 API 与入库继续使用相同 `KB_STATE_PATH`，入库 `COLLECTION` 设为发布后的集合。详见修复报告中的完整操作顺序。
-
-已有新版 chunk 快照时，`python -m pcb_rag.migrate --stage graph --execute` 可补建图；源文件和切块配置相同的情况下复用现有 chunk 与向量。该图命令完成后直接发布新 revision。
-
-### 5. 运行问答
-
-```bash
-bash scripts/run_query.sh       # 等价：python -m pcb_rag.query
-```
-
-示例问题：
-
-```text
-4 层 PCB 的阻抗控制需要关注哪些参数？
-Altium Designer 中如何处理高速差分线等长？
-```
-
-## 检索链路
-
-| 阶段 | 说明 |
+| 项目 | 要求 |
 | --- | --- |
-| 权限过滤 | 严格旧数据模式下将完整 ACL 条件下推到召回；默认旧文档兼容模式保留召回后内存复核，避免不完整的下推条件误删合法证据 |
-| 元数据过滤解析 | 从问题中提取 `vendor` / `eda` / `layer_count` / `copper_oz` 等条件，缩小检索范围 |
-| 查询理解 | 规则 + LLM 混合的意图识别，输出查询类型与动态检索权重 |
-| 查询分解 | 复合问题拆成多个子问题分别召回，缓解多跳问题漏召 |
-| 查询扩展 | PCB 同义词与缩写扩展，提升专业术语召回 |
-| HyDE 增强 | 生成假设文档参与向量检索，缓解短查询语义稀疏问题 |
-| Step-back | 过于具体的问题抽象为上位问题，单独一路召回补充背景知识 |
-| 多路召回 | 向量检索与 BM25 词法检索并行执行 |
-| 加权 RRF 融合 | 按查询类型动态调整各路线权重并融合排序 |
-| Rerank 精排 | 使用 API 或本地 cross-encoder 对候选重排序 |
-| 上下文扩展 | 命中 chunk 并入相邻 / 父级 chunk，保持上下文完整 |
-| GraphRAG 图检索 | 实体链接命中图谱后取邻域关系与原文依据，作为独立一路（有独立权重与 rank）参与 RRF 融合，并顺带补全多跳事实 |
-| 权限复核 | 对召回结果逐条复核，向量库过滤被忽略时也能兜底拦截 |
-| 上下文压缩 | 近似去重 → 抽取式压缩（优先保留含数值 / 标准号的句子）→ 字符预算裁剪 |
-| 答案合成 | 基于 RAG Prompt 生成答案并标注引用来源 |
+| 服务口令 | 必须设置 `DIFY_API_TOKEN`，不能是 `change-me`，否则服务拒绝启动 |
+| 跨域 | `CORS_ALLOW_ORIGINS` 默认为空。只有浏览器要直连时，才按来源白名单配置 |
+| 身份头 | `ACL_TRUST_HEADERS` 保持 `0`。打开后任何人都能自称管理员读全库。只有网关会剥离客户端同名头时才开，并同时设 `ACL_TRUST_HEADERS_ACK=1` |
+| 用户身份 | 多租户场景用 `AUTH_TOKEN_PRINCIPALS_FILE` 把口令映射到用户、租户、角色 |
+| 健康检查 | 探针用 `/health`；`/health/detail` 含配置摘要，需要口令 |
+| 并发和超时 | `RAG_MAX_CONCURRENT` / `RAG_MAX_QUEUED`（默认 8 / 16），`RAG_REQUEST_TIMEOUT`（默认 120 秒） |
+| 费用上限 | `RAG_MAX_MODEL_CALLS`、`RERANK_TOKEN_BUDGET`、`RERANK_REQUEST_BUDGET` 可限制单请求或累计用量 |
+| 密钥 | `.env`、原始数据和模型缓存不要提交到仓库 |
 
-## Web 界面
+## 配置参考
 
-服务启动后直接访问根路径即可使用：
+最常改的几项：
 
-```text
-http://localhost:8000/
-```
-
-界面为单文件静态页（`src/pcb_rag/webui/index.html`），零构建、零前端依赖，由
-FastAPI 直接托管，离线部署同样可用。
-
-| 能力 | 说明 |
+| 变量 | 作用 |
 | --- | --- |
-| 流式问答 | 走 `/api/ask/stream`，检索完成即先出证据列表，答案逐段推送 |
-| 证据溯源 | 桌面端右侧、移动端抽屉列出原文片段、所属章节、检索得分与 token 数，点击可展开 |
-| 角标定位 | 答案中的 `[n]` 可点击，滚动并高亮当前回答对应的证据卡；历史回答使用各自轮次的证据 |
-| 检索参数 | 召回条数、相似度阈值可直接调，无需改配置 |
-| 多轮对话 | 最近 6 轮问答随请求带上，服务端做历史感知的查询改写 |
-| 状态指示 | 顶栏显示索引 / 词法索引 / 精排的就绪状态，数据来自 `/health` |
+| `DATA_DIR` | 文档目录，默认 `./data/clear_docs` |
+| `COLLECTION` | 向量集合名，迁移后要改成新集合 |
+| `KB_STATE_PATH` | 版本状态文件，服务和入库必须用同一个 |
+| `MILVUS_URI` | Milvus 地址，默认 `http://127.0.0.1:19530` |
+| `API_PORT` | 服务端口，默认 `8000` |
+| `RERANK_TOP_N` | 精排后保留几条，默认 `10` |
+| `RAG_CONTEXT_MAX_TOKENS` | 给 LLM 的证据上限，默认 `6000` token |
 
-管理页位于 `/manage`：查看已发布/待发布版本、文档阶段状态、失败原因，重试未完成入库，并从图邻域查看来源。管理接口为 `/api/admin/status`、`/api/admin/documents`、`/api/admin/retry`；图来源接口为 `/api/graph/neighbors`。启用身份文件或 ACL 时，管理操作需要管理员身份；页面中的令牌仅保存在当前输入框内。
+完整列表展开下面各组查看，也可以看 `.env.example` 和 [配置指南](docs/CONFIGURATION_GUIDE.md)。
 
-鉴权沿用服务端的 Bearer Token：首次提问若收到 401，界面会提示从右上角「设置」
-填入 `DIFY_API_TOKEN`，Token 存在浏览器 localStorage，不上传任何第三方。
-
-> 页面本身不含配置与密钥，公开可访问是安全的；数据一律经带鉴权的 API 取。
-
-## 作为元件接入自研 Agent
-
-除开箱即用的 Web 界面与 HTTP 服务外，检索能力可以作为一个元件直接嵌入自研
-agent，不需要经过 HTTP：
-
-```python
-from pcb_rag.engine import KnowledgeBase
-
-kb = KnowledgeBase()
-kb.ensure_ready()                                  # 首次调用耗时数十秒
-
-hit = kb.retrieve("4 层板阻抗控制关注什么", top_k=8)
-for ev in hit.evidence:
-    print(ev.source_name, ev.section, ev.score)    # 结构化对象，不是拼好的字符串
-
-if hit.degraded:                                   # 链路降级要显式处理
-    print("降级：", hit.degraded)
-```
-
-| 能力 | 接口 |
-| --- | --- |
-| 检索证据（不生成） | `retrieve()` / `aretrieve()` |
-| 检索 + 生成答案 | `answer()` / `aanswer(history=[...])` |
-| 图谱邻域 | `graph_neighbors()` |
-| 组件状态 | `health()` |
-| Function calling | `tool_specs()` / `call_tool()` / `acall_tool()` |
-
-设计上刻意做了三个取舍：**返回逐条证据而不是拼接好的上下文**（否则"信息是否充分"
-的判断被锁死在元件里，agent 失去再检索的机会）；**降级状态显式暴露**（静默降级
-会让 agent 把"某条路没跑起来"误读成"知识库没有"）；**不保存会话状态**（历史由
-agent 传入，元件不在背后攒一份不一致的上下文）。
-
-元件与 HTTP 服务共用同一套检索实现和同一个索引实例，两种形态可并行使用。
-
-详见 [examples/README.md](examples/README.md)，可运行示例：
-
-```bash
-python examples/agent_toolkit_demo.py --mode direct --query "4 层板阻抗控制关注什么"
-python examples/agent_toolkit_demo.py --mode tools    # 打印 function calling 定义
-python examples/agent_toolkit_demo.py --mode react    # 文本协议的 agent 循环
-```
-
-## Dify 外部知识库 API
-
-```bash
-bash scripts/serve_api.sh
-# 等价：uvicorn pcb_rag.dify_external_api:app --host 0.0.0.0 --port 8000
-```
-
-在 Dify 外部知识库中配置：
-
-| 配置项 | 值 |
-| --- | --- |
-| URL | `http://<your-server-host>:8000/retrieval` |
-| API Key | `Bearer <your DIFY_API_TOKEN>` |
-
-主要端点：
-
-| 端点 | 说明 |
-| --- | --- |
-| `POST /retrieval` | Dify 外部知识库规范接口，返回命中的 records |
-| `POST /api/ask` | 检索 + LLM 合成答案，支持传入对话历史 |
-| `POST /api/ask/stream` | SSE 流式问答：先推检索来源，再逐 token 推答案 |
-| `POST /api/chat` | 服务端会话记忆问答，返回 `session_id` |
-| `GET /health` | 轻量健康检查（LB / 探针用），只返回状态与依赖就绪标记，不含敏感配置 |
-| `GET /health/detail` | 完整配置摘要（索引 / 后端 / 检索参数 / 缓存 / 图谱 / 权限 / 压缩），需鉴权 |
-| `GET /metrics` | 运行指标：计数器与延迟分位（p50 / p95 / p99） |
-
-更多步骤见 `docs/DIFY_INTEGRATION_GUIDE.md`。
-
-## 配置说明
-
-### 模型后端
+<details>
+<summary>模型后端</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -420,24 +420,33 @@ bash scripts/serve_api.sh
 | `RERANK_API_URL` | 空 | API 精排地址 |
 | `RERANK_API_MODEL` | 空 | API 精排模型名 |
 
-### 存储与入库
+</details>
+
+<details>
+<summary>存储与入库</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DATA_DIR` | `./data/clear_docs` | 待入库文档目录 |
 | `MILVUS_URI` | `http://127.0.0.1:19530` | Milvus 服务地址 |
 | `COLLECTION` | `pcb_kb` | 向量集合名称 |
-| `INGEST_OVERWRITE` | `0` | 入库时是否清空重建集合（重建时**忽略**入库清单，本次全量处理并重写清单） |
+| `KB_STATE_PATH` | `./data/kb_state_<COLLECTION>.json` | API 与入库共享的发布指针、阶段状态及上一版本 |
 | `INGEST_INCREMENTAL` | `1` | 增量入库：按内容哈希指纹只处理新增 / 变更文档 |
+| `INGEST_PLAN_ONLY` | `0` | 只预览要处理的文件，不写任何数据 |
+| `INGEST_OVERWRITE` | `0` | 对非空集合会报错；全量重建请用新集合 |
+| `AUTO_FIX_ENCODING` | `1` | 入库前修复 `.txt` 文件编码（会改写原文件） |
 | `LEXICAL_CACHE_TTL_HOURS` | `24` | 词法索引缓存有效期（小时） |
 | `LEXICAL_RELOAD_STAMP` | `<词法缓存>.stamp` | 入库结束后写入的重载标记；长驻 API 按它轮询并热重载 BM25 |
 
-### 检索与生成
+</details>
+
+<details>
+<summary>检索与生成</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RECALL_TOP_K` | `200`（API 进程 `setdefault` 亦为 `200`） | 初始召回数量 |
-| `RERANK_TOP_N` | `10`（CLI / API 一致） | 重排返回条数，API 请求也使用这个值；不决定输入量 |
+| `RECALL_TOP_K` | `200` | 初始召回数量 |
+| `RERANK_TOP_N` | `10` | 重排返回条数，API 请求也使用这个值；不决定输入量 |
 | `RERANK_MAX_CANDIDATES` | `50` | 真正送入重排 API 的候选上限，独立于初始召回 200 条 |
 | `RERANK_MAX_DOCUMENT_CHARS` | `1200` | 每条重排正文的字符上限；不发送文件路径、ID 等技术元数据 |
 | `RERANK_MIN_INTERVAL` | `0` | 主动限速间隔；0 关闭，非零时跨进程共享 |
@@ -457,19 +466,23 @@ bash scripts/serve_api.sh
 | `RAG_MIN_CHUNK_TOKENS` | `120` | 单条证据最小配额，低于此值停止填充 |
 | `RAG_DEMOTE_LOW_VALUE` | `1` | 入库标记的低价值块是否降权到末尾（只调顺序，不硬过滤） |
 
-### 融合与 chunk 质量
+</details>
+
+<details>
+<summary>融合与 chunk 质量</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `FUSION_QUOTA_ENABLED` | `1` | 配额保底 + RRF 补齐。`0` 退回纯加权 RRF |
 | `FUSION_MIN_PER_ROUTE` | `1` | 每路保底条数（未配 `FUSION_QUOTAS` 时生效） |
 | `FUSION_QUOTAS` | 空 | 显式配额，按路名写：`vector=3,bm25=2,graph=1`（路名：vector/bm25/graph/hyde/stepback）；旧的位置式 `3,2,1` 按 向量/HyDE/BM25 解释，两个值时为 向量/BM25；写错时告警并退回均分 |
+| `FUSION_RRF_K` | `40` | 融合平滑参数，包含图来源 |
 | `CHUNK_QUALITY_MODE` | `flag` | `off` 不评估 / `flag` 只打标记 / `drop` 丢弃低价值块 |
-| `GRAPH_LLM_GLEANING` | `1` | 图抽取的 gleaning 轮数（回灌已抽结果补漏） |
-| `GRAPH_LLM_DESC_CHARS` | `120` | 单条实体 / 关系描述字符上限 |
-| `GRAPH_NODE_DESC_CHARS` | `240` | 实体描述跨块合并后的总上限 |
 
-### 缓存
+</details>
+
+<details>
+<summary>缓存与会话</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -477,18 +490,22 @@ bash scripts/serve_api.sh
 | `SEMANTIC_CACHE_MAX_SIZE` | `512` | 缓存条目上限 |
 | `SEMANTIC_CACHE_TTL_SECONDS` | `3600` | 缓存有效期（秒） |
 | `SEMANTIC_CACHE_THRESHOLD` | `0.95` | 语义命中的相似度阈值 |
+| `SESSION_STORE` | `memory` | 会话存储：`memory` / `sqlite`（重启后保留） |
+| `SESSION_DB_PATH` | `./data/sessions.db` | SQLite 会话库路径 |
+| `SESSION_EXPIRE_MINUTES` | `60` | 会话过期时间（分钟） |
+| `SESSION_MAX_COUNT` | `1000` | 最大会话数 |
+| `SESSION_REQUIRE_IDENTITY` | `0` | 要求会话具有已认证的 tenant/user；已有无归属会话不可被认领 |
 
-### 服务
+</details>
+
+<details>
+<summary>服务、并发与用量</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DIFY_API_TOKEN` | 无（**未设置时服务拒绝启动**） | Dify 外部知识库鉴权 Token；占位值 `change-me` 同样会被拒绝 |
+| `DIFY_API_TOKEN` | 无（**未设置时服务拒绝启动**） | 业务接口鉴权口令；占位值 `change-me` 同样会被拒绝 |
 | `CORS_ALLOW_ORIGINS` | 空（不下发跨域头） | 允许跨域的来源白名单，逗号分隔；需要浏览器直连时才配置 |
 | `API_PORT` | `8000` | API 服务端口 |
-| `SESSION_EXPIRE_MINUTES` | `60` | 会话过期时间（分钟） |
-| `SESSION_MAX_COUNT` | `1000` | 最大会话数 |
-| `SESSION_STORE` | `memory` | 会话存储：`memory` / `sqlite`（重启后保留） |
-| `SESSION_DB_PATH` | `./data/sessions.db` | SQLite 会话库路径 |
 | `SELF_RAG_ENABLED` | `0` | 是否启用 Agentic RAG 迭代检索 |
 | `SELF_RAG_MAX_ITERATIONS` | `3` | 迭代检索的最大轮数 |
 | `RAG_REQUEST_TIMEOUT` | `120` | 总请求 deadline（秒），覆盖排队、检索、生成及 SSE |
@@ -498,10 +515,11 @@ bash scripts/serve_api.sh
 | `RAG_LLM_MAX_INPUT_TOKENS` / `RAG_EMBEDDING_MAX_INPUT_TOKENS` / `RAG_RERANK_MAX_INPUT_TOKENS` | `0` | 各类模型的单请求累计输入上限 |
 | `RAG_USAGE_LEDGER` | 空 | 可选 JSONL 用量账本；实际值与保守估算分列 |
 | `AUTH_TOKEN_PRINCIPALS_FILE` | 空 | 以 Token 的 SHA-256 为键映射用户、租户、角色的 JSON 文件 |
-| `SESSION_REQUIRE_IDENTITY` | `0` | 要求会话具有已认证的 tenant/user；已有无归属会话不可被认领 |
-| `KB_STATE_PATH` | `./data/kb_state_<COLLECTION>.json` | API 与入库共享的发布指针、阶段状态及上一版本 |
 
-### GraphRAG（P1-2）
+</details>
+
+<details>
+<summary>GraphRAG 图检索</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -513,14 +531,18 @@ bash scripts/serve_api.sh
 | `GRAPH_HOP` | `1` | 实体邻域扩展跳数 |
 | `GRAPH_TOP_K` | `5` | 图路径返回的候选数 |
 | `GRAPH_WEIGHT` | `0.35` | 图路在 RRF 融合中的权重（独立一路，有独立 rank） |
-| `FUSION_RRF_K` | `40` | 共享管道统一融合平滑参数，包含图来源 |
-| `FUSION_MIN_PER_ROUTE` | `1` | 启用配额融合时每路最低候选数；图来源参与最终 top-k |
+| `GRAPH_LLM_GLEANING` | `1` | 图抽取的 gleaning 轮数（回灌已抽结果补漏） |
+| `GRAPH_LLM_DESC_CHARS` | `120` | 单条实体 / 关系描述字符上限 |
+| `GRAPH_NODE_DESC_CHARS` | `240` | 实体描述跨块合并后的总上限 |
 | `GRAPH_EXPAND_MAX` | `2` | 旧 `_graph_augment` 接口的扩展上限；共享检索管道不执行此扩展 |
 | `GRAPH_COMMUNITY_ENABLED` | `0` | 是否生成社区摘要（面向综述类问题） |
 
-开启图检索前完成新版入库或图补建。图抽取与向量索引是发布校验的一部分，失败时保留旧 revision；实体/关系命中必须回查原文后才进入答案证据。
+开启图检索前，先完成新版入库或图补建。图抽取失败时保留旧版本；图命中的实体和关系必须回查到有权限的原文，才会进入答案证据。
 
-### 上下文压缩（P2）
+</details>
+
+<details>
+<summary>上下文压缩</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -531,12 +553,15 @@ bash scripts/serve_api.sh
 | `CONTEXT_DEDUPE_ENABLED` | `1` | 是否做近似去重 |
 | `CONTEXT_DEDUPE_THRESHOLD` | `0.85` | 去重相似度阈值 |
 
-### 访问控制（P2）
+</details>
+
+<details>
+<summary>访问控制</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `ACL_ENABLED` | `0` | 是否启用多租户过滤 |
-| `ACL_DEFAULT_VISIBILITY` | `private` | 入库默认可视性 |
+| `ACL_DEFAULT_VISIBILITY` | `private` | 入库默认可见性 |
 | `ACL_PUBLIC_VALUE` | `public` | 该 visibility 的文档对所有租户可见 |
 | `ACL_ADMIN_ROLES` | `admin,root` | 可跨租户访问的角色 |
 | `ACL_TRUST_HEADERS` | `0` | 是否信任客户端自报的身份头。默认关闭：打开后任何人都能自报 `X-User-Roles: admin` 读全库 |
@@ -544,7 +569,10 @@ bash scripts/serve_api.sh
 | `ACL_STRICT_LEGACY` | `0` | 未标注权限字段的历史数据是否拒绝访问 |
 | `ACL_HEADER_TENANT` | `X-Tenant-Id` | 租户请求头，另有 `X-User-Id` / `X-User-Roles` / `X-User-Groups` |
 
-### 可观测性与多模态（P2）
+</details>
+
+<details>
+<summary>可观测性与多模态</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -556,28 +584,50 @@ bash scripts/serve_api.sh
 | `MULTIMODAL_VLM_MODEL` | 空 | 视觉模型名（留空复用 `LLM_MODEL`） |
 | `TABLE_MARKDOWN_ENABLED` | `1` | 表格结构化为 Markdown（零成本） |
 
-完整配置见 `.env.example` 与 `docs/CONFIGURATION_GUIDE.md`。
+</details>
 
 ## 评测
 
-项目自带评测体系，用四个指标量化检索与生成质量：
+用自己的文档，量一量检索和回答的质量：
 
 ```bash
-# 1. 构建黄金数据集（需已入库）
+# 1. 从已入库的文档生成测试题
 python eval/build_golden_dataset.py --limit 100
 
-# 2. 人工抽检 20~30 条后执行评测
+# 2. 人工抽查 20~30 条后，运行评测
 python eval/evaluate.py --dataset eval/datasets/golden.jsonl
 ```
 
-| 指标 | 度量对象 | 参考阈值 |
+| 指标 | 看什么 | 参考线 |
 | --- | --- | --- |
-| Faithfulness | 答案与检索上下文的事实一致性 | ≥ 0.75 |
-| Answer Relevancy | 是否真正回应了问题 | ≥ 0.80 |
-| Context Precision | 相关上下文是否排在前面 | ≥ 0.70 |
-| Context Recall | 所需信息是否都被召回 | ≥ 0.80 |
+| Faithfulness | 答案有没有编造，是否和原文一致 | ≥ 0.75 |
+| Answer Relevancy | 是否真的回答了问题 | ≥ 0.80 |
+| Context Precision | 有用的原文是否排在前面 | ≥ 0.70 |
+| Context Recall | 需要的信息是否都找到了 | ≥ 0.80 |
 
-支持 `--no-rerank` 对比重排收益、`--retrieval-only` 只评检索（更快更省）。详见 `eval/README.md`。
+加 `--retrieval-only` 只评检索，更快更省；加 `--no-rerank` 可以对比精排的效果。详见 [eval/README.md](eval/README.md)。
+
+想让检索评测和线上服务用同一套参数，运行：
+
+```bash
+python eval/evaluate_recall.py --rrf-k 40 --recall-k 200 --rerank --rerank-top-n 10
+```
+
+<details>
+<summary>评测口径和线上参数对照</summary>
+
+| 口径 | CLI / eval | API 进程 |
+| --- | --- | --- |
+| `RECALL_TOP_K` | 200（`FUSION_RRF_K`=40） | 200 |
+| `RERANK_TOP_N` | 10 | 10 |
+| API 实际重排输入上限 | 50 | 50 |
+| 实际喂给 LLM | `RAG_TOP_DOCS`=5 | 5 |
+| `--soft-match` 默认 | `none`（`0.78` 是 **embed 模式**的阈值，非命中判定默认） | — |
+| `--rrf-k` / `--recall-k` 默认 | 60 / 40 | 40 / 200 |
+
+未显式传参时，评测脚本与线上并不同参，分数不能直接当作线上指标。指标只适合在同一个数据集内比较不同配置，原因见 [已知问题](docs/ARCHITECTURE.md#已知问题known-issues)。
+
+</details>
 
 ## 常见问题
 
@@ -597,13 +647,21 @@ Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确�
 </details>
 
 <details>
-<summary>API 后端启动时报缺少配置？</summary>
+<summary>服务启动时报缺少配置？</summary>
 
+- `DIFY_API_TOKEN` 没设置或是 `change-me`：服务会拒绝启动
 - `LLM_BACKEND=api`：需要 `LLM_BASE_URL` 与 `LLM_MODEL`
 - `EMBED_BACKEND=api`：需要 `EMBED_MODEL`（`EMBED_BASE_URL` 留空时自动复用 `LLM_BASE_URL`）
 - `RERANK_BACKEND=api`：需要 `RERANK_API_URL`
 
 运行 `python scripts/check_env.py` 可直接看到缺失项。
+
+</details>
+
+<details>
+<summary>网页提问返回 401？</summary>
+
+点右上角「设置」，填入 `.env` 里的 `DIFY_API_TOKEN`。调 API 时，请求头要带 `Authorization: Bearer <DIFY_API_TOKEN>`。
 
 </details>
 
@@ -617,87 +675,42 @@ Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确�
 </details>
 
 <details>
-<summary>重新入库后 BM25 仍在检索旧内容？</summary>
-
-新版管道在请求开始时检查已发布 revision，同步切换来源快照、BM25、图及集合；检索缓存包含 revision 与配置指纹。先检查 API 与入库是否使用同一 `KB_STATE_PATH`，以及 pending 阶段是否失败。`LEXICAL_CACHE_PATH` 和缓存 TTL 主要用于尚未迁移的旧集合。
-
-</details>
-
-<details>
-<summary>如何完整重建向量库？</summary>
-
-使用 `python -m pcb_rag.migrate --target-collection 新集合 --execute`，核对来源字段、parent 链接、图来源贡献及真值 ID 映射，再加 `--publish` 激活。旧集合和快照保留供回滚；新版主流程不会自动删除仍可回滚的物理行。`INGEST_OVERWRITE=1` 不再用于清空已有集合。
-
-</details>
-
-<details>
 <summary>入库后新文档检索不到 / 排得很靠后？</summary>
 
 依次检查三件事：
-1. **新版本是否已发布** —— 在 `/manage` 检查 revision、pending 及失败阶段；
-2. **读取状态是否一致** —— API 与入库的 `KB_STATE_PATH` 应相同，响应中的 revision 应对应新集合；
-3. **是否只看了 Hit@K** —— 新文档缺一路投票时 Hit@K 可能不变，但 MRR/NDCG 会掉。
+1. **新版本是否已发布**：在 `/manage` 检查版本、待发布状态及失败阶段；
+2. **服务和入库是否用同一个状态文件**：两边的 `KB_STATE_PATH` 应相同，响应里的 `revision` 应是新版本；
+3. **是否只看了 Hit@K**：新文档缺一路投票时 Hit@K 可能不变，但 MRR/NDCG 会掉。
 
 </details>
 
-## 已知问题（Known Issues）
+<details>
+<summary>重新入库后 BM25 仍在检索旧内容？</summary>
 
-列在这里的目的是**可证伪**：每条都写清现象、根因、当前状态与彻底修法，便于接手的人复核。
+服务在每个请求开始时检查已发布版本，同步切换快照、BM25、图谱和集合。先检查服务与入库是否使用同一 `KB_STATE_PATH`，以及待发布阶段是否失败。`LEXICAL_CACHE_PATH` 和缓存 TTL 主要用于尚未迁移的旧集合。
 
-| # | 现象 | 根因 | 当前状态 |
-| --- | --- | --- | --- |
-| 0 | 旧 r2 消融使用失效的向量索引 | NVIDIA query/passage 编码契约错误 | 已修，2026-10-20 已有重跑的检索基线与消融；10 月 23 日本轮代码仍需新效果基线，不能复用旧成绩作为改进结论 |
-| 1 | 评测脚本与评测报告未入库 | `eval/reports/`、`eval/*.json(l)` 被 `.gitignore` 排除（数据集含语料原文，不宜公开）；`eval/evaluate_recall.py` 亦未纳入版本控制 | **未修（唯一需要人工决策的一条）**：脱敏后提交脚本 + 报告摘要，或在 README 给出「数据集规模 / 该集指标 / 脚本版本」对照表。在提交之前，README 里的所有 MRR / Hit@K / NDCG 数字都无法被第三方复现 |
-| 2 | 指标绝对值不可跨数据集比较 | 仓库内多版数据集互不重合（`eval_dataset.json` / `eval_dataset_146.json`）；真值由 chunk 反推问题生成，chunk 按定义相关 | 只用于**同数据集内**的配置对比；换集必须重跑基线。生成侧偏差方向明确：共享词汇使 Hit/Recall 系统性**高估** |
-| 3 | LLM 出题 / 判卷与生成同源 | 共用模型会放大同源偏差 | 生成评测支持 `JUDGE_*` 独立 API 模型，软匹配支持 `SOFT_JUDGE_*`；仍**需人工抽检 20~30 条校准并报告 judge 与人评一致率** |
-| 4 | 每请求独立建线程池 | 多入口重复调度检索 | 已改为共享有界执行器与服务并发/队列边界，排队也计入总 deadline |
-| 5 | SSE 断开后的后台工作 | 已开始的同步 HTTP 调用无法强制终止 | 已传播断开/超时并取消待执行工作，停止后续响应；运行中的调用继续占用工作槽直到结束，并记录迟到用量，不能承诺供应商立即停止计费 |
-| 6 | 分路贡献无 ablation | 只有整体开关对比，没有关掉单路的对照实验 | 部分修：`fusion.route_contribution()` 提供"这条只靠哪一路进来"的归因；`quota_rrf_fuse` 补了"单路失效不挤占另一路"的回归测试。完整 ablation 表待新基线重跑补齐 |
-| 7 | parent 指向首个子块 | 未存储完整父块文本 | 新版快照已保存完整 parent，子块单独嵌入；检索按 ID 读取真实父节并复核权限/版本。旧集合须迁移 |
-| 8 | O(n²) 的其它潜在热点 | 已修 `_parent_child_parse` 的邻居查找（此前 1e4 chunk 约 30~60s）；其它循环未逐一审计 | 未完全修 |
+</details>
 
-### 此前修复记录
+<details>
+<summary>回答里出现 degraded 是什么意思？</summary>
 
-下表保留早期实现记录；2026-10-23 的共享管道与迁移行为以 [修复报告](docs/LIGHTRAG_FIXES_WSL_20261023.md) 为准。
+表示有一路检索或某个组件没跑起来，比如 `rerank_unavailable`（精排不可用）、`graph_unavailable`（图谱没建好）。答案仍会返回，但可能不完整。看 `degraded` 里的名字，再查 `/health/detail` 和服务日志。
 
-| 问题 | 现象 | 修法 |
-| --- | --- | --- |
-| `INGEST_OVERWRITE` 与 manifest 冲突 | 重建集合后清单未失效 → `to_process` 为空 → **库被清空且什么都不插入**，后续增量继续空转 | `incremental.plan_ingest()`：overwrite 时忽略清单并写入真实指纹 |
-| 增量指纹用 mtime | `git clone` / `cp -r` 改写 mtime → 全量误判重嵌入 | 改为 size 快筛 + blake2b 内容哈希，路径不进指纹 |
-| CLI HyDE 键错位 | `primed_queries` 以 `expanded_q` 为键，却用 `hyde_q` 发起查询 → 原始查询没进检索、BM25 被喂 LLM 长文 | 改用 `expanded_q` 发起查询（与 eval / API 一致） |
-| 图融合量纲 | 图规则分（0.2~1.0）× 0.35 与 RRF 分（~0.02）同池排序 → 图节点无条件霸榜 | 改为独立的 rank-based RRF 路；API 侧再加独立配额 `GRAPH_EVIDENCE_MAX` |
-| BM25 不重载 | 长驻 API 只在启动时建一次索引 → 新文档缺一整路投票 | 入库写 `LEXICAL_RELOAD_STAMP`，API 按 mtime 惰性后台重载 |
-| BM25 文档侧 tf 被压成 0/1 | `cut` + `cut_for_search` 合并去重 → k1 完全失效，与"调高 k1 增强词频"的注释矛盾 | `cut_words` 保留词频，`search_words` 只补新词 |
-| IDF 高频词 postings 截断 | `postings[:5000]` 按入库顺序截断 → 新文档永远进不了高频词候选 | 默认不截断（DF>80% 已在打分阶段过滤） |
-| judge 静默降级为 0 分 | judge 失败 / 无可判定陈述都返回 0.0 → 所有生成侧指标被低估且无人察觉 | 三态返回（`None` = 评测失败），汇总分列 evaluated / failed，失败率超阈值标记 `invalid` |
-| ACL 合并把 OR 摊平 | ACL 的 `tenant OR public` 被并进外层 AND → 本租户私有文档全部不可见 | `merge_filters` 保留 OR 子树（已提交，含真实编译表达式回归测试） |
-| 缓存跨租户复用 | 缓存 key 不含访问主体 → 语义命中会跨租户返回 | scope 前缀 + 同 scope 语义匹配；未传 scope 时告警 |
-| `/api/ask` 绕过兜底 | 直调 `_retrieve_nodes` → 少了内存侧权限复核，且 GraphRAG 完全不生效 | 两步都下沉到 `_retrieve_nodes` 末尾，所有端点共享 |
-| 默认不安全 | `DIFY_API_TOKEN=change-me` 可启动；`ACL_TRUST_HEADERS` 默认信任自报头（自报 admin 即读全库）；CORS 通配 | Token 缺失/占位时拒绝启动；信任头默认关闭 + 需显式 ACK；CORS 改白名单 |
-| `/health` 泄露配置 | 无鉴权的 `/health` 返回租户字段名、admin 角色、后端地址 | 拆为 `/health`（探针用）与 `/health/detail`（需鉴权） |
-| 纯逻辑不可测 | 融合 / 增量比对与重型 import 绑在一起，测试只能 `importorskip` 静默跳过 | 下沉到 `pcb_rag/fusion.py`、`pcb_rag/incremental.py`，新增 60+ 用例；CI 增加依赖自检让"被跳过"变成硬失败 |
-| `FUSION_MODE` 空转 | 三份文档把它当 v1.3 核心变更，代码里只用来挑打印字符串 | 代码与文档同步标注为"不改变行为"，CLI 启动横幅显式提示 |
+</details>
 
-## 评测口径速查
+## 更多文档
 
-| 口径 | CLI / eval | API 进程 |
-| --- | --- | --- |
-| `RECALL_TOP_K` | 200（`FUSION_RRF_K`=40） | 200 |
-| `RERANK_TOP_N` | 10 | 10 |
-| API 实际重排输入上限 | 50 | 50 |
-| 实际喂给 LLM | `RAG_TOP_DOCS`=5 | 5 |
-| `--soft-match` 默认 | `none`（`0.78` 是 **embed 模式**的阈值，非命中判定默认） | — |
-| `--rrf-k` / `--recall-k` 默认 | 60 / 40 | 40 / 200 |
-
-> 复现线上行为：`python eval/evaluate_recall.py --rrf-k 40 --recall-k 200 --rerank --rerank-top-n 10`。
-> 未显式传参时，评测脚本与线上并不同参，分数不可直接当作线上指标。
-
-## 开发意义
-
-- 设计并实现面向 PCB 领域文档的 RAG 问答系统，支持规范文档入库、向量检索、BM25 召回、多路融合、Rerank 精排与答案生成。
-- 基于 LlamaIndex、Milvus、FastAPI 搭建知识库服务，模型层抽象出「本地 / OpenAI 兼容 API」双后端，可按部署环境自由切换。
-- 针对 PCB 专业术语、工艺参数和 EDA 工具场景设计元数据抽取、查询过滤和混合检索策略，提升专业问题召回与回答相关性。
-- 整理为可复现工程：提供标准 Python 包结构、环境变量模板、Docker Compose 与一键 setup/run 脚本。
+| 文档 | 内容 |
+| --- | --- |
+| [原理与设计](docs/ARCHITECTURE.md) | 亮点、架构图、检索各阶段、已知问题、修复记录 |
+| [配置指南](docs/CONFIGURATION_GUIDE.md) | 全部配置项的详细说明 |
+| [Dify 接入指南](docs/DIFY_INTEGRATION_GUIDE.md) | 在 Dify 里接入的完整步骤 |
+| [Web 界面说明](docs/WEB_UI.md) | 问答页与管理页 |
+| [WSL 运行说明](docs/WSL_API.md) | 在 Windows 上通过 WSL 启动、停止服务 |
+| [安装说明](docs/SETUP.md) | 环境安装细节 |
+| [Agent 接入示例](examples/README.md) | Python 元件与 function calling |
+| [评测说明](eval/README.md) | 数据集构建与评测脚本 |
+| [修复与验证报告](docs/LIGHTRAG_FIXES_WSL_20261023.md) | 2026-10-23 修复记录与迁移操作顺序 |
 
 ## 公开仓库说明
 
