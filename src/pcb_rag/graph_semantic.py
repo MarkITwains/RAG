@@ -10,6 +10,9 @@ from typing import Protocol
 from pcb_rag.graph_rag import GRAPH_HOP, link_entities
 from pcb_rag.revisions import atomic_json, fingerprint
 
+#: 图路内部各子路（实体名 / 实体描述 / 关系描述 / 社区摘要）按名次合并用的 RRF k
+GRAPH_RRF_K = 60
+
 
 def embedding_identity(model):
     """Include retrieval mode and endpoint, never credentials."""
@@ -283,10 +286,20 @@ class GraphEvidenceRetriever:
 
         if top_k <= 0:
             return []
-        hits = []
+        # 每条子路各自排好名次，再按 RRF 合并。实体名链接分（0.34~1.0）和描述向量的
+        # 余弦分标尺不同，早先混在一起按分数排序：链接分最高的那个实体的所有边
+        # 拿同一个分、按 chunk_id 字母序占满 top_k，语义三路几乎进不来。
+        runs = []
+        entity_hits = []
         for name, score in link_entities(query, self.graph):
             for edge in self.graph.related_edges([name], hops=GRAPH_HOP):
-                hits.extend(dict(source, score=score, route="entity_name") for source in _source_records(edge))
+                weight = float(edge.get("w", 0.0) or 0.0)
+                entity_hits.extend(
+                    (score, weight, dict(source, route="entity_name")) for source in _source_records(edge)
+                )
+        # 同一实体内按边权重排序，不再让所有边并列同分
+        entity_hits.sort(key=lambda hit: (-hit[0], -hit[1], hit[2]["chunk_id"]))
+        runs.append([hit for _score, _weight, hit in entity_hits])
         if self.semantic_ready:
             vector = self.embed_model.get_query_embedding(query)
             routes = (
@@ -296,15 +309,30 @@ class GraphEvidenceRetriever:
             )
             for route, retriever in routes:
                 if retriever is not None:
+                    run = []
                     for match in retriever.search(vector, top_k):
                         if match["score"] <= 0:
                             continue
-                        hits.extend(dict(source, score=match["score"], route=route) for source in match["sources"])
-        hits.sort(key=lambda source: (-source["score"], source["chunk_id"]))
+                        run.extend(dict(source, route=route) for source in match["sources"])
+                    runs.append(run)
         by_id = {}
-        for hit in hits:
-            by_id.setdefault(hit["chunk_id"], hit)
-        ids = list(by_id)
+        fused = {}
+        for run in runs:
+            rank = 0
+            seen = set()
+            for hit in run:
+                chunk_id = hit["chunk_id"]
+                if chunk_id in seen:
+                    continue
+                seen.add(chunk_id)
+                rank += 1
+                contribution = 1.0 / (GRAPH_RRF_K + rank)
+                fused[chunk_id] = fused.get(chunk_id, 0.0) + contribution
+                # 元数据取该块排名最靠前的那条子路
+                if chunk_id not in by_id or contribution > by_id[chunk_id][0]:
+                    by_id[chunk_id] = (contribution, hit)
+        by_id = {chunk_id: dict(hit, score=fused[chunk_id]) for chunk_id, (_c, hit) in by_id.items()}
+        ids = sorted(by_id, key=lambda chunk_id: (-by_id[chunk_id]["score"], chunk_id))
         batch_size = max(top_k * 4, 20)
         results = []
         for start in range(0, len(ids), batch_size):

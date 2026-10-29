@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from pcb_rag.fusion import (
     DEFAULT_RRF_K,
     describe_fusion,
+    merge_scored_runs,
     node_id_key,
     quota_rrf_fuse,
     rank_of,
@@ -27,6 +28,19 @@ from pcb_rag.fusion import (
 
 def _item(node_id: str, score: float = 0.0):
     return SimpleNamespace(node=SimpleNamespace(node_id=node_id), score=score)
+
+
+class TestMergeScoredRuns:
+    def test_higher_score_query_run_ranks_first(self):
+        out = merge_scored_runs([[_item("original", 0.1)], [_item("variant", 0.99)]])
+        assert [item.node.node_id for item in out] == ["variant", "original"]
+
+    def test_duplicate_keeps_best_score_and_top_n(self):
+        out = merge_scored_runs([[_item("shared", 0.2), _item("other", 0.1)], [_item("shared", 0.9)]], top_n=1)
+        assert len(out) == 1 and out[0].node.node_id == "shared" and out[0].score == 0.9
+
+    def test_zero_limit_returns_empty(self):
+        assert merge_scored_runs([[_item("a", 1.0)]], top_n=0) == []
 
 
 # ---------------------------------------------------------------------------

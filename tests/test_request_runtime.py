@@ -47,6 +47,17 @@ def test_nested_stages_share_control_and_do_not_deadlock():
         assert run_stage("outer", lambda: run_stage("inner", lambda: current_control() is control))
 
 
+def test_local_wait_budget_accepts_already_completed_work():
+    executor = BoundedExecutor(1, 0)
+    try:
+        future = executor.submit(lambda: "done")
+        assert future.result(timeout=1) == "done"
+        with request_scope(1) as control:
+            assert await_work(future, control, timeout=0) == "done"
+    finally:
+        executor.close()
+
+
 def test_llm_transport_timeout_is_capped_by_client_and_request_deadline():
     from pcb_rag.usage import _call_options
 

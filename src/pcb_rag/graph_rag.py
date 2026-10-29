@@ -1265,6 +1265,32 @@ def load_graph(path: Optional[str] = None) -> Optional[KnowledgeGraph]:
 # ---------------------------------------------------------------------------
 # 6. 实体链接
 # ---------------------------------------------------------------------------
+_WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
+
+
+def _contains_term(haystack: str, needle: str) -> bool:
+    """子串命中；needle 的英文/数字端点要求词边界（两侧都已小写）。
+
+    中文没有空格，子串匹配就是正常做法（「镀金」命中「镀金层」）；但英文短名
+    直接用 ``in`` 会误命中：别名 ``pi`` 命中 ``spi``、实体 ``0.1`` 命中 ``10.1``。
+    """
+    if not needle:
+        return False
+    check_left = needle[0] in _WORD_CHARS
+    check_right = needle[-1] in _WORD_CHARS
+    if not (check_left or check_right):
+        return needle in haystack
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        left_ok = not check_left or start == 0 or haystack[start - 1] not in _WORD_CHARS
+        right_ok = not check_right or end == len(haystack) or haystack[end] not in _WORD_CHARS
+        if left_ok and right_ok:
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
 def link_entities(
     query: str,
     graph: KnowledgeGraph,
@@ -1293,16 +1319,16 @@ def link_entities(
     for name, node in graph.nodes.items():
         name_lower = name.lower()
         score = 0.0
-        if any(alias.lower() in lowered for alias in node.aliases if len(alias) >= 2):
+        if any(_contains_term(lowered, alias.lower()) for alias in node.aliases if len(alias) >= 2):
             score = 0.8
 
-        if len(name_lower) >= 2 and name_lower in lowered:
+        if len(name_lower) >= 2 and _contains_term(lowered, name_lower):
             # 完整命中：名字越长越可信
             score = min(1.0, 0.55 + 0.03 * len(name_lower))
         else:
             # 查询词元被实体包含（如查询「镀金」命中实体「镀金层」）
             for term in terms:
-                if term in name_lower:
+                if _contains_term(name_lower, term):
                     score = max(score, min(0.5, 0.2 + 0.06 * len(term)))
                     break
 
@@ -1408,6 +1434,18 @@ def summarize_communities(graph: KnowledgeGraph, llm: Any = None) -> Dict[str, D
 # ---------------------------------------------------------------------------
 # 8. 图检索
 # ---------------------------------------------------------------------------
+def _aggregate_acl_metadata() -> Dict[str, str]:
+    """给「聚合了多篇文档原文」的图节点打上非公开标记。
+
+    这类节点混合了不同文档的证据，没法继承某一篇的权限。字段留空的话，
+    ``node_allowed`` 会把它当成没有标注的旧数据放行，等于越权。这里标成
+    非公开、不属于任何租户：开 ACL 时只有管理员能看到；不开 ACL 时不受影响。
+    """
+    from pcb_rag.security import ACL_VISIBILITY_FIELD
+
+    return {ACL_VISIBILITY_FIELD: "graph_aggregate"}
+
+
 class GraphRetriever:
     """基于知识图谱的检索器。
 
@@ -1552,6 +1590,7 @@ class GraphRetriever:
                 metadata={
                     **passage["metadata"],
                     "entities": passage["entities"][:10],
+                    **_aggregate_acl_metadata(),
                 },
             )
             results.append(NodeWithScore(node=node, score=float(passage["score"])))
@@ -1600,6 +1639,7 @@ class GraphRetriever:
                     "source_type": "knowledge_graph_community",
                     "community": label,
                     "entities": community.get("entities", [])[:20],
+                    **_aggregate_acl_metadata(),
                 },
             )
             results.append(NodeWithScore(node=node, score=float(score) * self.weight))
@@ -1739,6 +1779,7 @@ def expand_nodes_with_graph(
                 # 标记为「图证据」：调用方据此给它单独配额，避免它凭相对分数
                 # 挤占真实检索结果的 top-k 名额（见 dify_external_api Step 7）
                 "graph_evidence": True,
+                **_aggregate_acl_metadata(),
             },
         )
         # 分数取已召回结果的最高分略作衰减，保证排在原结果之后但仍可能进入上下文

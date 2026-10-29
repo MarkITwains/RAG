@@ -18,9 +18,10 @@
 
 ## 🚀 快速开始
 
-### 最小配置（开箱即用）
+### 最小配置（API-only）
 ```bash
-# 只需确保 Ollama 和 Docker 可用
+# 确保 Docker 可用，并在 .env 中配置 LLM/Embedding/Rerank API。
+# 配置模板默认 AI_API_ONLY=1，禁止本地模型后端和静默回退。
 bash scripts/setup.sh
 
 # 入库
@@ -75,7 +76,7 @@ source .env
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `LLM_BACKEND` | `local` | `local`（Ollama）或 `api`（OpenAI 兼容） |
+| `LLM_BACKEND` | `api`（配置模板） | `api`（OpenAI 兼容）或 `local`（Ollama，需关闭 API-only） |
 | `OLLAMA_BASE` | `http://127.0.0.1:11434` | 本地 Ollama 地址（local） |
 | `OLLAMA_LLM_MODEL` | `qwen3.5:35b-a3b-q4_K_M` | 本地 LLM 模型（local） |
 | `OLLAMA_NUM_CTX` | `8192` | 本地 LLM 上下文窗口（local） |
@@ -92,7 +93,7 @@ source .env
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `EMBED_BACKEND` | `local` | `local`（Ollama）或 `api`（OpenAI 兼容） |
+| `EMBED_BACKEND` | `api`（配置模板） | `api`（OpenAI 兼容）或 `local`（Ollama，需关闭 API-only） |
 | `OLLAMA_EMBED_MODEL` | `qwen3-embedding:8b-q8_0` | 本地 Embedding 模型（local） |
 | `EMBED_BASE_URL` | 空 | API 地址，留空复用 `LLM_BASE_URL` |
 | `EMBED_API_KEY` | 空 | API 密钥，留空复用 `LLM_API_KEY` |
@@ -102,12 +103,14 @@ source .env
 
 **示例：**
 ```bash
-# 全本地
+# 全本地（显式关闭 API-only）
+export AI_API_ONLY=0
 export LLM_BACKEND=local
 export EMBED_BACKEND=local
 export OLLAMA_LLM_MODEL="qwen3.5:35b-a3b-q4_K_M"
 
 # 全 API
+export AI_API_ONLY=1
 export LLM_BACKEND=api
 export EMBED_BACKEND=api
 export LLM_BASE_URL="https://api.siliconflow.cn/v1"
@@ -570,12 +573,13 @@ export RERANK_ENABLED=0
 
 ### 核心配置
 ```bash
-# 后端选择
-LLM_BACKEND=local            # local | api
-EMBED_BACKEND=local          # local | api
+# 后端选择（配置模板默认全部使用 API）
+AI_API_ONLY=1
+LLM_BACKEND=api              # api | local（local 需 AI_API_ONLY=0）
+EMBED_BACKEND=api            # api | local（local 需 AI_API_ONLY=0）
 RERANK_BACKEND=api           # api | hf | qwen3reranker | sbert | none
 
-# 本地后端（Ollama）
+# 本地后端（Ollama，仅显式关闭 API-only 后使用）
 OLLAMA_BASE=http://127.0.0.1:11434
 OLLAMA_LLM_MODEL=qwen3.5:35b-a3b-q4_K_M
 OLLAMA_EMBED_MODEL=qwen3-embedding:8b-q8_0
@@ -591,6 +595,10 @@ EMBED_DIM=
 RERANK_API_URL=
 RERANK_API_KEY=
 RERANK_API_MODEL=
+JUDGE_BACKEND=api
+JUDGE_BASE_URL=
+JUDGE_API_KEY=
+JUDGE_MODEL=glm-5-3-260814
 
 # 检索（FUSION_MODE 当前不改变行为，如需保留请显式设为 RECIPROCAL_RANK）
 FUSION_WEIGHTS=0.35,0.65

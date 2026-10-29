@@ -201,6 +201,7 @@ python -m pip install -c requirements/constraints-wsl-py312.txt -e ".[runtime,ol
 **全本地（Ollama）**
 
 ```bash
+AI_API_ONLY=0
 LLM_BACKEND=local
 EMBED_BACKEND=local
 OLLAMA_LLM_MODEL=qwen3.5:35b-a3b-q4_K_M
@@ -210,6 +211,7 @@ OLLAMA_EMBED_MODEL=qwen3-embedding:8b-q8_0
 **全 API（OpenAI 兼容，以硅基流动为例）**
 
 ```bash
+AI_API_ONLY=1
 LLM_BACKEND=api
 EMBED_BACKEND=api
 LLM_BASE_URL=https://api.siliconflow.cn/v1
@@ -217,6 +219,11 @@ LLM_API_KEY=sk-xxxx
 LLM_MODEL=Qwen/Qwen3-8B
 EMBED_MODEL=BAAI/bge-m3
 EMBED_DIM=1024
+# 生成评测使用独立的 API judge；地址/密钥留空时复用 LLM_API_*。
+JUDGE_BACKEND=api
+JUDGE_MODEL=glm-5-3-260814
+JUDGE_BASE_URL=
+JUDGE_API_KEY=
 ```
 
 **Rerank 后端**
@@ -278,7 +285,7 @@ Altium Designer 中如何处理高速差分线等长？
 
 | 阶段 | 说明 |
 | --- | --- |
-| 权限过滤 | 按请求头解析出的租户 / 角色生成 ACL 条件，与业务过滤以 AND 合并，在召回阶段就挡掉无权数据 |
+| 权限过滤 | 严格旧数据模式下将完整 ACL 条件下推到召回；默认旧文档兼容模式保留召回后内存复核，避免不完整的下推条件误删合法证据 |
 | 元数据过滤解析 | 从问题中提取 `vendor` / `eda` / `layer_count` / `copper_oz` 等条件，缩小检索范围 |
 | 查询理解 | 规则 + LLM 混合的意图识别，输出查询类型与动态检索权重 |
 | 查询分解 | 复合问题拆成多个子问题分别召回，缓解多跳问题漏召 |
@@ -308,8 +315,8 @@ FastAPI 直接托管，离线部署同样可用。
 | 能力 | 说明 |
 | --- | --- |
 | 流式问答 | 走 `/api/ask/stream`，检索完成即先出证据列表，答案逐段推送 |
-| 证据溯源 | 右侧列出命中的原文片段、所属章节、检索得分与 token 数，点击可展开 |
-| 角标定位 | 答案中的 `[n]` 可点击，滚动并高亮对应证据卡 |
+| 证据溯源 | 桌面端右侧、移动端抽屉列出原文片段、所属章节、检索得分与 token 数，点击可展开 |
+| 角标定位 | 答案中的 `[n]` 可点击，滚动并高亮当前回答对应的证据卡；历史回答使用各自轮次的证据 |
 | 检索参数 | 召回条数、相似度阈值可直接调，无需改配置 |
 | 多轮对话 | 最近 6 轮问答随请求带上，服务端做历史感知的查询改写 |
 | 状态指示 | 顶栏显示索引 / 词法索引 / 精排的就绪状态，数据来自 `/health` |
@@ -397,9 +404,9 @@ bash scripts/serve_api.sh
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `LLM_BACKEND` | `local` | `local`（Ollama）/ `api`（OpenAI 兼容） |
-| `EMBED_BACKEND` | `local` | `local`（Ollama）/ `api`（OpenAI 兼容） |
-| `RERANK_BACKEND` | `qwen3reranker` | `api` / `hf` / `qwen3reranker` / `sbert` / `none` |
+| `LLM_BACKEND` | `api`（配置模板） | `api`（OpenAI 兼容）/ `local`（Ollama，需关闭 API-only） |
+| `EMBED_BACKEND` | `api`（配置模板） | `api`（OpenAI 兼容）/ `local`（Ollama，需关闭 API-only） |
+| `RERANK_BACKEND` | `api`（配置模板） | `api` / `hf` / `qwen3reranker` / `sbert` / `none` |
 | `RERANK_ENABLED` | `1` | 是否启用精排 |
 | `OLLAMA_BASE` | `http://127.0.0.1:11434` | 本地 Ollama 服务地址 |
 | `OLLAMA_LLM_MODEL` | `qwen3.5:35b-a3b-q4_K_M` | 本地 LLM 模型 |
@@ -456,7 +463,7 @@ bash scripts/serve_api.sh
 | --- | --- | --- |
 | `FUSION_QUOTA_ENABLED` | `1` | 配额保底 + RRF 补齐。`0` 退回纯加权 RRF |
 | `FUSION_MIN_PER_ROUTE` | `1` | 每路保底条数（未配 `FUSION_QUOTAS` 时生效） |
-| `FUSION_QUOTAS` | 空 | 显式配额，按 routes 顺序；数量不匹配则退回均分 |
+| `FUSION_QUOTAS` | 空 | 显式配额，按路名写：`vector=3,bm25=2,graph=1`（路名：vector/bm25/graph/hyde/stepback）；旧的位置式 `3,2,1` 按 向量/HyDE/BM25 解释，两个值时为 向量/BM25；写错时告警并退回均分 |
 | `CHUNK_QUALITY_MODE` | `flag` | `off` 不评估 / `flag` 只打标记 / `drop` 丢弃低价值块 |
 | `GRAPH_LLM_GLEANING` | `1` | 图抽取的 gleaning 轮数（回灌已抽结果补漏） |
 | `GRAPH_LLM_DESC_CHARS` | `120` | 单条实体 / 关系描述字符上限 |
@@ -642,7 +649,7 @@ Milvus 首次启动约需 1-2 分钟，可用 `python scripts/check_env.py` 确�
 | 0 | 旧 r2 消融使用失效的向量索引 | NVIDIA query/passage 编码契约错误 | 已修，2026-10-20 已有重跑的检索基线与消融；10 月 23 日本轮代码仍需新效果基线，不能复用旧成绩作为改进结论 |
 | 1 | 评测脚本与评测报告未入库 | `eval/reports/`、`eval/*.json(l)` 被 `.gitignore` 排除（数据集含语料原文，不宜公开）；`eval/evaluate_recall.py` 亦未纳入版本控制 | **未修（唯一需要人工决策的一条）**：脱敏后提交脚本 + 报告摘要，或在 README 给出「数据集规模 / 该集指标 / 脚本版本」对照表。在提交之前，README 里的所有 MRR / Hit@K / NDCG 数字都无法被第三方复现 |
 | 2 | 指标绝对值不可跨数据集比较 | 仓库内多版数据集互不重合（`eval_dataset.json` / `eval_dataset_146.json`）；真值由 chunk 反推问题生成，chunk 按定义相关 | 只用于**同数据集内**的配置对比；换集必须重跑基线。生成侧偏差方向明确：共享词汇使 Hit/Recall 系统性**高估** |
-| 3 | LLM 出题 / 判卷与生成同源 | `build_golden_dataset.py`、`evaluate.py`、`metrics.py` 都用 `build_llm()` | 部分修：`evaluate_recall.py` 支持 `SOFT_JUDGE_*` 指向另一厂商模型；生成侧 judge 仍同源，**需人工抽检 20~30 条校准并报告 judge 与人评一致率** |
+| 3 | LLM 出题 / 判卷与生成同源 | 共用模型会放大同源偏差 | 生成评测支持 `JUDGE_*` 独立 API 模型，软匹配支持 `SOFT_JUDGE_*`；仍**需人工抽检 20~30 条校准并报告 judge 与人评一致率** |
 | 4 | 每请求独立建线程池 | 多入口重复调度检索 | 已改为共享有界执行器与服务并发/队列边界，排队也计入总 deadline |
 | 5 | SSE 断开后的后台工作 | 已开始的同步 HTTP 调用无法强制终止 | 已传播断开/超时并取消待执行工作，停止后续响应；运行中的调用继续占用工作槽直到结束，并记录迟到用量，不能承诺供应商立即停止计费 |
 | 6 | 分路贡献无 ablation | 只有整体开关对比，没有关掉单路的对照实验 | 部分修：`fusion.route_contribution()` 提供"这条只靠哪一路进来"的归因；`quota_rrf_fuse` 补了"单路失效不挤占另一路"的回归测试。完整 ablation 表待新基线重跑补齐 |

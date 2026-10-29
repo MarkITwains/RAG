@@ -298,6 +298,59 @@ def test_self_rag_uses_distinct_followup_retrieval(offline_pipeline, monkeypatch
     assert {entry["chunk_id"] for entry in result["evidence_bundle"].entries} == {"first", "second"}
 
 
+def test_self_rag_low_final_score_triggers_threshold_retrieval(offline_pipeline, monkeypatch):
+    from pcb_rag import query as q
+
+    f = offline_pipeline
+    monkeypatch.setattr(q, "SELF_RAG_ENABLED", True)
+    monkeypatch.setattr(q, "_agentic_plan", lambda *args: {"sufficient": True, "next_query": "", "reason": "规划完成"})
+    scores = iter([2, 4])
+
+    def evaluate(*args):
+        score = next(scores)
+        return {
+            "overall": score,
+            "retrieval_suggestion": "铜厚测量条件" if score < 3 else "",
+            "reason": "需要补充条件",
+        }
+
+    monkeypatch.setattr(q, "self_rag_evaluate", evaluate)
+    f.index.rows = lambda query: [f.score(f.node("second" if "条件" in query else "first"))]
+
+    class Adapter:
+        def retrieve(self, query):
+            return f.pipeline.retrieve_nodes(query)
+
+    result = q.self_rag_query("铜厚", Adapter(), f.llm, max_iterations=3, threshold=3, verbose=False)
+
+    assert f.index.calls == ["铜厚", "铜厚测量条件"]
+    assert result["self_rag_info"]["final_score"] == 4
+    assert result["self_rag_info"]["iterations"] == 2
+    assert any(row.get("phase") == "threshold_retrieval" for row in result["self_rag_info"]["history"])
+
+
+def test_self_rag_threshold_stops_on_duplicate_query(offline_pipeline, monkeypatch):
+    from pcb_rag import query as q
+
+    f = offline_pipeline
+    monkeypatch.setattr(q, "SELF_RAG_ENABLED", True)
+    monkeypatch.setattr(q, "_agentic_plan", lambda *args: {"sufficient": True, "next_query": "", "reason": "规划完成"})
+    monkeypatch.setattr(
+        q,
+        "self_rag_evaluate",
+        lambda *args: {"overall": 1, "retrieval_suggestion": "铜厚要求", "reason": "重复查询"},
+    )
+
+    class Adapter:
+        def retrieve(self, query):
+            return f.pipeline.retrieve_nodes(query)
+
+    result = q.self_rag_query("铜厚要求", Adapter(), f.llm, max_iterations=4, threshold=3, verbose=False)
+
+    assert f.index.calls == ["铜厚要求"]
+    assert result["self_rag_info"]["iterations"] == 1
+
+
 def test_published_snapshot_refreshes_lexical_graph_and_source_visibility(tmp_path, offline_pipeline):
     from pcb_rag.ingestion import run_ingestion
     from pcb_rag.revisions import pipeline_fingerprints

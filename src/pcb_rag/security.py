@@ -9,8 +9,8 @@ Dify / HTTP 接口对外暴露时必须保证「不同租户只能看到自己�
 
 1. **入库侧**（``acl_metadata_for_ingest``）：为每个文档写入 ``tenant_id`` /
    ``visibility`` / ``acl_groups`` 等字段，作为后续过滤的依据
-2. **检索侧（向量库）**（``build_acl_filters``）：把权限条件编译成 Milvus 过滤表达式，
-   在召回阶段就把无权文档挡掉，避免「先召回后过滤」导致的 top_k 稀释
+2. **检索侧（向量库）**（``build_acl_filters``）：严格旧数据模式下编译完整
+   Milvus 授权条件；兼容模式不使用会误删旧文档的不完整下推条件
 3. **检索侧（内存兜底）**（``filter_nodes`` / ``node_allowed``）：对召回结果逐条复核，
    即使向量库表达式被服务端忽略（或降级为全量召回）也不会越权
 
@@ -314,17 +314,18 @@ def acl_metadata_for_ingest(
 # 4. 检索侧：Milvus 过滤表达式
 # ---------------------------------------------------------------------------
 def build_acl_filters(principal: Optional[Principal]) -> Optional[Any]:
-    """把权限条件编译为 llama-index ``MetadataFilters``（Milvus 侧粗过滤）。
+    """Build pushdown filters only when they preserve every authorization rule.
 
-    - 管理员：返回 ``None``（不限制）
-    - 普通用户：``tenant_id == <租户> OR visibility == public``
-    - 关闭 ACL：返回 ``None``
-
-    返回类型为 ``MetadataFilters | None``；由于延迟导入 llama-index，
-    本函数在无重型依赖的环境（如纯逻辑单测）中也能被调用（仅当 ACL 关闭时返回 None）。
+    Non-strict legacy mode allows documents without ACL metadata, which cannot be
+    expressed reliably by the supported Milvus filters. Returning ``None`` then
+    keeps recall intact; ``filter_nodes`` remains the authoritative check.
     """
-
-    if not ACL_ENABLED or principal is None or principal.is_admin:
+    if (
+        not ACL_ENABLED
+        or principal is None
+        or principal.is_admin
+        or not _env_bool("ACL_STRICT_LEGACY", False)
+    ):
         return None
 
     from llama_index.core.vector_stores.types import (
@@ -334,10 +335,22 @@ def build_acl_filters(principal: Optional[Principal]) -> Optional[Any]:
         MetadataFilters,
     )
 
+    tokens = sorted(principal.group_tokens())
+    if any(character in token for token in tokens for character in ("%", "_", "'", '"', "\\", "\x00")):
+        return None
+
     clauses = [
         MetadataFilter(key=ACL_TENANT_FIELD, operator=FilterOperator.EQ, value=principal.tenant_id),
         MetadataFilter(key=ACL_VISIBILITY_FIELD, operator=FilterOperator.EQ, value=ACL_PUBLIC_VALUE),
     ]
+    if principal.user_id:
+        clauses.append(
+            MetadataFilter(key=ACL_OWNER_FIELD, operator=FilterOperator.EQ, value=principal.user_id)
+        )
+    clauses.extend(
+        MetadataFilter(key=ACL_GROUPS_FIELD, operator=FilterOperator.TEXT_MATCH, value=f"%|{token}|%")
+        for token in tokens
+    )
     return MetadataFilters(filters=clauses, condition=FilterCondition.OR)
 
 

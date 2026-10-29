@@ -95,4 +95,7 @@ testpaths = ["tests"]
 # 让 src/ 与仓库根都可导入，使 pcb_rag 与 eval 两个包在未安装时也能被测试引用
 pythonpath = ["src", "."]
 addopts = "-ra --strict-markers --strict-config"
-markers = ["integration: requires an explicitly enabled local Milvus service"]
+markers = [
+    "integration: requires an explicitly enabled local Milvus service",
+    "local_model: requires optional local model dependencies; excluded from API-only runs",
+]

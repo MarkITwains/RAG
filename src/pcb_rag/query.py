@@ -28,7 +28,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from math import log
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 def _bootstrap_local_venv() -> None:
     """允许模块运行时也能找到本项目 `.venv` 里的依赖（兼容 Windows / POSIX）。"""
@@ -189,6 +189,10 @@ from pcb_rag.observability import (
 # P2：访问控制（多租户 / 角色 / 组）
 from pcb_rag.security import (
     ACL_ENABLED,
+    ACL_GROUPS_FIELD,
+    ACL_OWNER_FIELD,
+    ACL_TENANT_FIELD,
+    ACL_VISIBILITY_FIELD,
     build_acl_filters,
     current_principal,
     describe_acl as describe_acl,
@@ -244,6 +248,26 @@ LEXICAL_METADATA_KEYS: list[str] = [
     "copper_oz",
     "effective_date",
 ]
+
+# 权限与版本字段：词法路必须带上。缺了权限字段，node_allowed 会把块当成
+# 「没有标注的旧数据」放行（开 ACL 时越权，ACL_STRICT_LEGACY=1 时整路变空）；
+# 缺了 revision / node_level / doc_node_id，_allowed 既剔不掉父块，也认不出
+# 未发布或已下线的版本。字段名跟随 security 模块的可配置名。
+LEXICAL_REQUIRED_KEYS: list[str] = list(
+    dict.fromkeys(
+        [
+            ACL_TENANT_FIELD,
+            ACL_VISIBILITY_FIELD,
+            ACL_OWNER_FIELD,
+            ACL_GROUPS_FIELD,
+            "revision",
+            "node_level",
+            "doc_node_id",
+        ]
+    )
+)
+# 词法缓存格式版本。旧缓存没有上面的字段，靠旁路文件 <cache>.schema.json 识别。
+LEXICAL_CACHE_SCHEMA = 2
 
 # Rerank: 先高召回，再用 cross-encoder 精排，减少“看起来相关但其实不对”的段落
 RERANK_ENABLED = env_bool("RERANK_ENABLED", True)
@@ -421,26 +445,20 @@ FUSION_RRF_K = int(os.getenv("FUSION_RRF_K", "40"))
 FUSION_QUOTA_ENABLED = env_bool("FUSION_QUOTA_ENABLED", True)
 # 每路保底条数（未显式配置 FUSION_QUOTAS 时生效）
 FUSION_MIN_PER_ROUTE = int(os.getenv("FUSION_MIN_PER_ROUTE", "1"))
-# 显式配额，按 routes 顺序，逗号分隔；留空则按 FUSION_MIN_PER_ROUTE 均分
+# 显式配额，逗号分隔；留空则按 FUSION_MIN_PER_ROUTE 均分。
+# 推荐按路名写：vector=3,bm25=2,graph=1；旧的位置式 3,2,1 按 向量/HyDE/BM25(/Step-back) 解释
 FUSION_QUOTAS_RAW = os.getenv("FUSION_QUOTAS", "").strip()
 
 
-def _parse_fusion_quotas(n_routes: int) -> Optional[list[int]]:
-    """解析 FUSION_QUOTAS；数量与路数不匹配时退回 None（改用均分配额）。
+def _parse_fusion_quotas(route_names: Sequence[str]) -> Optional[list[int]]:
+    """按路名取 FUSION_QUOTAS 配额；未配置时返回 None（改用均分配额）。
 
-    按位置绑定而非按路名，是因为调用点的 routes 顺序稳定（主检索固定为
-    ``向量 / HyDE / BM25``，两路模式为 ``向量 / BM25``）。故意不做"补零/截断"：
-    顺序一旦错位，静默补零会让某一路彻底失去保底，比直接退回均分更危险。
+    早先按位置绑定、只校验「个数等于路数」：三路时既可能是 向量/HyDE/BM25，
+    也可能是 向量/BM25/Step-back，个数对得上配额却给错了路。现在按路名绑定。
     """
-    if not FUSION_QUOTAS_RAW:
-        return None
-    try:
-        quotas = [int(x) for x in FUSION_QUOTAS_RAW.split(",") if x.strip() != ""]
-    except ValueError:
-        return None
-    if len(quotas) != n_routes:
-        return None
-    return quotas
+    return fusion.quotas_for_routes(
+        route_names, fusion.parse_route_quotas(FUSION_QUOTAS_RAW), FUSION_MIN_PER_ROUTE
+    )
 
 # HyDE few-shot 开关
 HYDE_FEWSHOT_ENABLED = env_bool("HYDE_FEWSHOT_ENABLED", True)
@@ -451,6 +469,8 @@ QUERY2DOC_MAX_POINTS = int(os.getenv("QUERY2DOC_MAX_POINTS", "5"))
 # 短查询阈值（低于此长度才使用 HyDE/Query2Doc）
 # 设置较高值使大多数查询都能受益于 HyDE 增强
 SHORT_QUERY_THRESHOLD = int(os.getenv("SHORT_QUERY_THRESHOLD", "120"))
+# 超过长度阈值、但词数不超过这个值的查询仍算短查询（与原实现的 `< 4` 一致）
+SHORT_QUERY_MAX_WORDS = 3
 # 查询增强是否对所有查询生效（默认开启；关闭后仅短查询启用）
 QUERY_ENHANCE_ALL = env_bool("QUERY_ENHANCE_ALL", True)
 
@@ -471,6 +491,9 @@ def _gpu_free_mib() -> dict[int, int]:
 def _try_build_reranker():
     if not RERANK_ENABLED or RERANK_BACKEND in {"none", "off", "disabled"}:
         return None
+    from pcb_rag.api_clients import assert_api_only
+
+    assert_api_only()
 
     # ── API 精排（Jina / 硅基流动 / DashScope 等，无需本地显存）─────────────
     if RERANK_BACKEND == "api":
@@ -1313,17 +1336,30 @@ def _is_short_query(query: str) -> bool:
     """判断是否为短查询。
     
     短查询的特征：
-    1. 字符长度小于阈值
-    2. 或者词数少于 3 个
+    1. 字符长度不超过 SHORT_QUERY_THRESHOLD（默认 120，有意设大，见常量处注释）
+    2. 或者词数不超过 SHORT_QUERY_MAX_WORDS 个
+
+    词数：英文/数字串各算 1 个；中文没有空格，一段连续汉字按每 2 字 1 个词估算。
+    早先把一整段连续汉字算成 1 个词，一句 200 字、只有两三个逗号的中文问题
+    也会被判成短查询。
     """
     if len(query) <= SHORT_QUERY_THRESHOLD:
         return True
-    # 统计有意义的词（中文词组 + 英文单词）
-    words = re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+', query)
-    return len(words) < 4
+    words = sum(1 for _ in re.finditer(r"[A-Za-z0-9]+", query))
+    words += sum(max(1, len(run) // 2) for run in re.findall(r"[\u4e00-\u9fff]{2,}", query))
+    return words <= SHORT_QUERY_MAX_WORDS
 
 
-def hyde_expand_query(query: str, llm=None) -> str:
+def _reraise_control_errors(error: BaseException) -> None:
+    """预算用完 / 请求超时是请求级的中止信号，不能被查询增强当成普通失败吞掉。"""
+    from pcb_rag.runtime import DeadlineExceeded
+    from pcb_rag.usage import UsageBudgetExceeded
+
+    if isinstance(error, (DeadlineExceeded, UsageBudgetExceeded)):
+        raise error
+
+
+def hyde_expand_query(query: str, llm=None, *, force: bool = False, strict: bool = False) -> str:
     """HyDE (Hypothetical Document Embedding) 查询增强。
     
     通过 LLM 生成一个假设的文档片段，该片段可能包含问题的答案。
@@ -1335,17 +1371,20 @@ def hyde_expand_query(query: str, llm=None) -> str:
     Args:
         query: 原始查询
         llm: LLM 实例（如果为 None，使用 Settings.llm）
+        force: 调用方已按自己的配置决定要跑 HyDE（如 ``PipelineConfig.hyde``），
+            跳过模块级的 ``HYDE_ENABLED`` / ``QUERY_ENHANCE_ALL`` 开关
+        strict: LLM 出错时抛出而不是退回原查询，让调用方把这一路记成失败
         
     Returns:
         增强后的查询字符串
     """
-    if not HYDE_ENABLED:
-        return query
-    
-    # 取消短查询限制：对所有查询都应用 HyDE（提升语义召回）
-    # 但仍检查 QUERY_ENHANCE_ALL 配置
-    if not QUERY_ENHANCE_ALL and not _is_short_query(query):
-        return query
+    if not force:
+        if not HYDE_ENABLED:
+            return query
+
+        # 仍检查 QUERY_ENHANCE_ALL 配置：关闭时只增强短查询
+        if not QUERY_ENHANCE_ALL and not _is_short_query(query):
+            return query
     
     try:
         if llm is None:
@@ -1367,11 +1406,14 @@ def hyde_expand_query(query: str, llm=None) -> str:
         return enhanced_query
         
     except Exception as e:
+        _reraise_control_errors(e)
+        if strict:
+            raise
         print(f"[HyDE] 生成假设文档失败: {e}")
         return query
 
 
-def query2doc_expand(query: str, llm=None) -> str:
+def query2doc_expand(query: str, llm=None, *, force: bool = False, strict: bool = False) -> str:
     """Query2Doc 查询增强。
     
     通过 LLM 提取回答问题所需的关键信息点，
@@ -1384,15 +1426,18 @@ def query2doc_expand(query: str, llm=None) -> str:
     Args:
         query: 原始查询
         llm: LLM 实例（如果为 None，使用 Settings.llm）
+        force: 跳过模块级 ``QUERY2DOC_ENABLED`` / ``QUERY_ENHANCE_ALL`` 开关
+        strict: LLM 出错时抛出而不是退回原查询
         
     Returns:
         增强后的查询字符串
     """
-    if not QUERY2DOC_ENABLED:
-        return query
-    
-    if not QUERY_ENHANCE_ALL and not _is_short_query(query):
-        return query  # 仅在增强所有查询或短查询时启用
+    if not force:
+        if not QUERY2DOC_ENABLED:
+            return query
+
+        if not QUERY_ENHANCE_ALL and not _is_short_query(query):
+            return query  # 仅在增强所有查询或短查询时启用
     
     try:
         if llm is None:
@@ -1423,6 +1468,9 @@ def query2doc_expand(query: str, llm=None) -> str:
         return query
         
     except Exception as e:
+        _reraise_control_errors(e)
+        if strict:
+            raise
         print(f"[Query2Doc] 提取关键信息点失败: {e}")
         return query
 
@@ -1466,6 +1514,7 @@ def _weighted_rrf_fuse_three_routes(
     routes: list[tuple[list[NodeWithScore], float]],
     top_n: int,
     rrf_k: int = fusion.DEFAULT_RRF_K,
+    route_names: Optional[Sequence[str]] = None,
 ) -> list[NodeWithScore]:
     """加权三路 RRF 融合（实现见 :mod:`pcb_rag.fusion`）。
 
@@ -1476,14 +1525,22 @@ def _weighted_rrf_fuse_three_routes(
     ``FUSION_QUOTA_ENABLED=1``（默认）时走配额制：先按 ``FUSION_MIN_PER_ROUTE``
     给每路保底名额并轮转取数，剩余名额按加权 RRF 分补齐。关闭后退回纯 RRF，
     两条路径返回的 ``score`` 同为加权 RRF 分，可直接横向对比。
+
+    ``route_names`` 与 ``routes`` 一一对应，用于按路名取 ``FUSION_QUOTAS``；
+    不传时按 ``向量 / HyDE / BM25 / Step-back``（两路时 ``向量 / BM25``）推断。
     """
     if FUSION_QUOTA_ENABLED:
+        if route_names is None:
+            route_names = (
+                ("vector", "bm25") if len(routes) == 2 else fusion.POSITIONAL_QUOTA_ROUTES[: len(routes)]
+            )
+        quotas = _parse_fusion_quotas(route_names)
         return fusion.quota_rrf_fuse(
             routes,
             top_n=top_n,
             rrf_k=rrf_k,
             min_per_route=FUSION_MIN_PER_ROUTE,
-            quotas=_parse_fusion_quotas(len(routes)),
+            quotas=quotas if quotas is not None and len(quotas) == len(routes) else None,
         )
     return fusion.weighted_rrf_fuse(routes, top_n=top_n, rrf_k=rrf_k)
 
@@ -1614,15 +1671,19 @@ class ThreeWayHyDEFusionRetriever(BaseRetriever):
             (raw_vec_nodes, self._vector_weight),
             (bm25_nodes, self._bm25_weight),
         ]
+        route_names = ["vector", "bm25"]
         if hyde_vec_nodes:
             routes.insert(1, (hyde_vec_nodes, self._hyde_weight))
+            route_names.insert(1, "hyde")
         if stepback_vec_nodes:
             routes.append((stepback_vec_nodes, self._vector_weight * float(STEPBACK_ROUTE_WEIGHT)))
+            route_names.append("stepback")
 
         return _weighted_rrf_fuse_three_routes(
             routes,
             top_n=self._k,
             rrf_k=self._rrf_k,
+            route_names=route_names,
         )
 
 
@@ -2198,6 +2259,18 @@ def _self_rag_query_impl(
     used_queries: list[str] = [query]
     current_query = query
 
+    def add_documents(new_docs) -> int:
+        added = 0
+        for doc in new_docs:
+            node = doc.node if hasattr(doc, "node") else doc
+            doc_id = getattr(node, "node_id", None) or getattr(node, "id_", None) or str(id(node))
+            if doc_id in seen_ids:
+                continue
+            seen_ids.add(doc_id)
+            all_docs.append(doc)
+            added += 1
+        return added
+
     if verbose:
         print(f"\n[Agentic-RAG] === 迭代检索开始（最多 {max_iterations} 轮）===")
         print(f"[Agentic-RAG] 初始查询: {query[:80]}")
@@ -2214,19 +2287,7 @@ def _self_rag_query_impl(
                 print(f"[Agentic-RAG] 第 {iteration} 轮检索失败: {e}")
             new_docs = []
 
-        added = 0
-        for doc in new_docs:
-            node = doc.node if hasattr(doc, "node") else doc
-            doc_id = (
-                getattr(node, "node_id", None)
-                or getattr(node, "id_", None)
-                or str(id(node))
-            )
-            if doc_id in seen_ids:
-                continue
-            seen_ids.add(doc_id)
-            all_docs.append(doc)
-            added += 1
+        added = add_documents(new_docs)
 
         # ---- 2) 充分性判断与下一步动作 ----
         plan = _agentic_plan(query, all_docs, llm, used_queries) if all_docs else {
@@ -2259,22 +2320,44 @@ def _self_rag_query_impl(
         if verbose:
             print(f"[Agentic-RAG] 补充查询: {current_query[:80]}")
 
-    # ---- 3) 生成最终答案 ----
-    final_result = generate_answer_with_citation(query, all_docs, llm)
+    def generate_and_evaluate():
+        result = generate_answer_with_citation(query, all_docs, llm)
+        evaluation = self_rag_evaluate(query, result["answer"], result["evidence_bundle"].nodes, llm)
+        score = float(evaluation.get("overall", 0) or 0)
+        history.append({
+            "iteration": len(history) + 1,
+            "phase": "evaluate",
+            "evaluation": evaluation,
+        })
+        return result, evaluation, score
 
-    # ---- 4) 自评估（保留评分能力）----
-    eval_result = self_rag_evaluate(
-        query,
-        final_result["answer"],
-        final_result["evidence_bundle"].nodes,
-        llm,
-    )
-    final_score = float(eval_result.get("overall", 0) or 0)
-    history.append({
-        "iteration": len(history) + 1,
-        "phase": "evaluate",
-        "evaluation": eval_result,
-    })
+    final_result, eval_result, final_score = generate_and_evaluate()
+    while final_score < float(threshold) and len(used_queries) < max_iterations:
+        next_query = self_rag_generate_followup_query(query, final_result["answer"], eval_result, llm).strip()
+        if not next_query or next_query in used_queries:
+            break
+        used_queries.append(next_query)
+        if verbose:
+            print(f"[Agentic-RAG] 自评分不足，补充查询: {next_query[:80]}")
+        try:
+            new_docs = retriever.retrieve(next_query)
+        except Exception as e:
+            if verbose:
+                print(f"[Agentic-RAG] 阈值补充检索失败: {e}")
+            new_docs = []
+        added = add_documents(new_docs)
+        history.append({
+            "iteration": len(used_queries),
+            "phase": "threshold_retrieval",
+            "query_used": next_query,
+            "docs_retrieved": len(new_docs),
+            "docs_added": added,
+            "docs_total": len(all_docs),
+            "reason": str(eval_result.get("reason", ""))[:200],
+        })
+        if not added:
+            break
+        final_result, eval_result, final_score = generate_and_evaluate()
 
     if verbose:
         print(f"[Agentic-RAG] 最终自评分: {final_score}/5 (阈值 {threshold})")
@@ -2284,6 +2367,7 @@ def _self_rag_query_impl(
         "mode": "iterative",
         "iterations": len(used_queries),
         "final_score": final_score,
+        "threshold": float(threshold),
         "history": history,
         "queries_used": used_queries,
         "evaluation": eval_result,
@@ -2786,11 +2870,10 @@ class ColBERTReranker:
             model_info(self.model_name)
         except (HfHubHTTPError, RepositoryNotFoundError) as e:
             error_msg = f"模型 '{self.model_name}' 不存在或无法访问。\n"
-            error_msg += "\n推荐的 ColBERT/Reranker 模型：\n"
-            error_msg += "  - BAAI/bge-reranker-v2-m3 (推荐，中文效果好)\n"
-            error_msg += "  - BAAI/bge-reranker-base\n"
-            error_msg += "  - BAAI/bge-reranker-large\n"
-            error_msg += "\n请设置环境变量: export COLBERT_MODEL=BAAI/bge-reranker-v2-m3"
+            error_msg += "\n推荐的 ColBERT 模型：\n"
+            error_msg += "  - jinaai/jina-colbert-v2\n"
+            error_msg += "  - colbert-ir/colbertv2.0\n"
+            error_msg += "\n普通 cross-encoder 请改用 RERANK_BACKEND=api 或 hf"
             raise ValueError(error_msg) from e
         
         try:
@@ -2806,20 +2889,17 @@ class ColBERTReranker:
             print(f"[ColBERT] 模型加载完成，device={self._device}")
         except Exception as e:
             error_msg = f"加载模型 '{self.model_name}' 失败: {e}\n"
-            error_msg += "请确认模型名称正确，或尝试使用: BAAI/bge-reranker-v2-m3"
+            error_msg += "请确认 ColBERT 模型名称和权重兼容性；普通 cross-encoder 请改用 RERANK_BACKEND=api 或 hf"
             raise RuntimeError(error_msg) from e
 
-    def _encode(self, texts: list[str]) -> "torch.Tensor":
-        """编码文本为 token-level embeddings。
-
-        Returns:
-            Tensor of shape [batch, seq_len, hidden_dim]
-        """
+    def _encode(self, texts: list[str]) -> tuple["torch.Tensor", "torch.Tensor"]:
+        """编码文本为 token-level embeddings，并返回对应 attention mask。"""
         import torch
 
         self._lazy_init()
 
         all_embeddings = []
+        all_masks = []
         for i in range(0, len(texts), self.batch_size):
             batch_texts = texts[i:i + self.batch_size]
             inputs = self._tokenizer(
@@ -2829,47 +2909,45 @@ class ColBERTReranker:
                 max_length=self.max_length,
                 return_tensors="pt",
             )
+            attention_mask = inputs["attention_mask"]
             inputs = {k: v.to(self._device) for k, v in inputs.items()}
 
             with torch.no_grad():
                 outputs = self._model(**inputs)
-                # 使用 last_hidden_state 作为 token embeddings
-                # shape: [batch, seq_len, hidden_dim]
                 token_embeddings = outputs.last_hidden_state
-                # L2 归一化，便于计算余弦相似度
-                token_embeddings = torch.nn.functional.normalize(
-                    token_embeddings, p=2, dim=-1
-                )
+                token_embeddings = torch.nn.functional.normalize(token_embeddings, p=2, dim=-1)
                 all_embeddings.append(token_embeddings.cpu())
+                all_masks.append(attention_mask.cpu())
 
-        return torch.cat(all_embeddings, dim=0)
+        return torch.cat(all_embeddings, dim=0), torch.cat(all_masks, dim=0)
 
     def _maxsim_score(
-        self, query_emb: "torch.Tensor", doc_emb: "torch.Tensor"
+        self,
+        query_emb: "torch.Tensor",
+        doc_emb: "torch.Tensor",
+        query_mask: Optional["torch.Tensor"] = None,
+        doc_mask: Optional["torch.Tensor"] = None,
     ) -> float:
-        """计算 ColBERT MaxSim 得分。
-
-        MaxSim 算法：
-        - 对于每个 query token，找到与所有 doc tokens 的最大相似度
-        - 将所有 query tokens 的最大相似度求和
-
-        Args:
-            query_emb: [query_len, hidden_dim]
-            doc_emb: [doc_len, hidden_dim]
-
-        Returns:
-            MaxSim 得分
-        """
+        """计算排除 padding 后的 ColBERT MaxSim 得分。"""
         import torch
 
-        # 计算相似度矩阵: [query_len, doc_len]
+        if query_mask is not None and not query_mask.bool().any():
+            return 0.0
+        if doc_mask is not None and not doc_mask.bool().any():
+            return 0.0
+
         sim_matrix = torch.mm(query_emb, doc_emb.T)
+        if doc_mask is not None:
+            sim_matrix = sim_matrix.masked_fill(
+                ~doc_mask.bool().unsqueeze(0), torch.finfo(sim_matrix.dtype).min
+            )
+        if query_mask is not None:
+            sim_matrix = sim_matrix[query_mask.bool()]
+        if not sim_matrix.numel():
+            return 0.0
 
-        # 对每个 query token 取最大相似度，然后求和
         max_sim_per_query = sim_matrix.max(dim=1).values
-        score = max_sim_per_query.sum().item()
-
-        return score
+        return max_sim_per_query.sum().item()
 
     def rerank(
         self,
@@ -2900,15 +2978,18 @@ class ColBERTReranker:
             else:
                 doc_texts.append(str(content))
 
-        # 编码 query 和 documents
-        query_emb = self._encode([query])[0]  # [query_len, hidden_dim]
-        doc_embs = self._encode(doc_texts)  # [num_docs, seq_len, hidden_dim]
+        query_embeddings, query_mask = self._encode([query])
+        query_emb = query_embeddings[0]
+        doc_embs, doc_masks = self._encode(doc_texts)
 
-        # 计算每个文档的 MaxSim 得分
         results = []
         for i, (doc_id, content) in enumerate(candidates):
-            doc_emb = doc_embs[i]  # [seq_len, hidden_dim]
-            score = self._maxsim_score(query_emb, doc_emb)
+            score = self._maxsim_score(
+                query_emb,
+                doc_embs[i],
+                query_mask=query_mask[0],
+                doc_mask=doc_masks[i],
+            )
             results.append((doc_id, content, score))
 
         # 按得分降序排列
@@ -2940,6 +3021,8 @@ class MultiPathRetriever:
         rerank_candidates: int = MULTIPATH_RERANK_CANDIDATES,
         rrf_k: int = MULTIPATH_RRF_K,
         enable_colbert: bool = COLBERT_RERANK_ENABLED,
+        dense_weight: float = 1.0,
+        sparse_weight: float = 1.0,
     ):
         self.dense_retriever = dense_retriever
         self.sparse_retriever = sparse_retriever
@@ -2948,6 +3031,9 @@ class MultiPathRetriever:
         self.sparse_top_k = sparse_top_k
         self.rerank_candidates = rerank_candidates
         self.rrf_k = rrf_k
+        self.dense_weight = float(dense_weight)
+        self.sparse_weight = float(sparse_weight)
+        self.last_score_kind = "rrf"
         self.enable_colbert = enable_colbert and colbert_reranker is not None
 
     def _rrf_fuse(
@@ -2957,7 +3043,7 @@ class MultiPathRetriever:
     ) -> list[tuple[str, NodeWithScore, float]]:
         """Reciprocal Rank Fusion 融合多路召回结果。
 
-        RRF 公式：score(d) = Σ 1 / (k + rank(d))
+        RRF 公式：score(d) = Σ weight / (k + rank(d))
         其中 k 是平滑参数（默认 60），rank 是文档在各路召回中的排名。
 
         Args:
@@ -2974,14 +3060,14 @@ class MultiPathRetriever:
         # Dense 结果
         for rank, node in enumerate(dense_results):
             node_id = node.node.id_ or str(rank)
-            scores[node_id] = scores.get(node_id, 0) + 1.0 / (k + rank + 1)
+            scores[node_id] = scores.get(node_id, 0) + self.dense_weight / (k + rank + 1)
             if node_id not in node_map:
                 node_map[node_id] = node
 
         # Sparse 结果
         for rank, node in enumerate(sparse_results):
             node_id = node.node.id_ or f"sparse_{rank}"
-            scores[node_id] = scores.get(node_id, 0) + 1.0 / (k + rank + 1)
+            scores[node_id] = scores.get(node_id, 0) + self.sparse_weight / (k + rank + 1)
             if node_id not in node_map:
                 node_map[node_id] = node
 
@@ -2996,77 +3082,61 @@ class MultiPathRetriever:
         query: str,
         top_k: int = 10,
         expand_queries: Optional[list[str]] = None,
+        sparse_expand_queries: Optional[list[str]] = None,
     ) -> list[NodeWithScore]:
         """执行多路召回 + 融合 + 重排。
 
         Args:
             query: 原始查询
             top_k: 最终返回的文档数
-            expand_queries: 扩展查询列表（可选，用于增加召回多样性）
+            expand_queries: Dense 扩展查询列表
+            sparse_expand_queries: Sparse 扩展查询列表；缺省时与 Dense 相同
 
         Returns:
             排序后的 NodeWithScore 列表
         """
-        queries = expand_queries if expand_queries else [query]
+        dense_queries = expand_queries if expand_queries else [query]
+        sparse_queries = sparse_expand_queries if sparse_expand_queries is not None else dense_queries
+        dense_runs: list[list[NodeWithScore]] = []
+        sparse_runs: list[list[NodeWithScore]] = []
 
-        # 1. 多路召回
-        all_dense: list[NodeWithScore] = []
-        all_sparse: list[NodeWithScore] = []
-
-        for q in queries:
-            # Dense 检索
+        for value in dense_queries:
             try:
-                dense_results = self.dense_retriever._retrieve(QueryBundle(query_str=q))
-                all_dense.extend(dense_results[:self.dense_top_k])
+                dense_results = self.dense_retriever._retrieve(QueryBundle(query_str=value))
+                dense_runs.append(dense_results[: self.dense_top_k])
             except Exception as e:
                 print(f"[MultiPath] Dense 检索失败: {e}")
 
-            # Sparse 检索
-            if self.sparse_retriever is not None:
+        if self.sparse_retriever is not None:
+            for value in sparse_queries:
                 try:
-                    sparse_results = self.sparse_retriever._retrieve(QueryBundle(query_str=q))
-                    all_sparse.extend(sparse_results[:self.sparse_top_k])
+                    sparse_results = self.sparse_retriever._retrieve(QueryBundle(query_str=value))
+                    sparse_runs.append(sparse_results[: self.sparse_top_k])
                 except Exception as e:
                     print(f"[MultiPath] Sparse 检索失败: {e}")
 
-        # 去重（按 node_id）
-        seen_dense: set[str] = set()
-        unique_dense: list[NodeWithScore] = []
-        for node in all_dense:
-            nid = node.node.id_ or ""
-            if nid and nid not in seen_dense:
-                seen_dense.add(nid)
-                unique_dense.append(node)
+        unique_dense = fusion.merge_scored_runs(dense_runs)
+        # BM25 原始分跨查询不可比（长查询分更高），按名次合并
+        unique_sparse = fusion.rrf_merge_runs(sparse_runs, rrf_k=self.rrf_k)
 
-        seen_sparse: set[str] = set()
-        unique_sparse: list[NodeWithScore] = []
-        for node in all_sparse:
-            nid = node.node.id_ or ""
-            if nid and nid not in seen_sparse:
-                seen_sparse.add(nid)
-                unique_sparse.append(node)
-
-        # 2. RRF 融合
         if unique_sparse:
+            self.last_score_kind = "rrf"
             fused = self._rrf_fuse(unique_dense, unique_sparse)
         else:
-            # 没有 sparse 结果时，仅使用 dense
+            self.last_score_kind = "vector"
             fused = [(n.node.id_ or str(i), n, n.score or 0.0) for i, n in enumerate(unique_dense)]
 
-        # 3. ColBERT 细粒度重排
-        candidates = fused[:self.rerank_candidates]
+        candidates = fused[: self.rerank_candidates]
 
         if self.enable_colbert and self.colbert_reranker is not None and candidates:
             print(f"[MultiPath] ColBERT 重排 {len(candidates)} 个候选...")
             try:
-                # 准备 rerank 输入
                 rerank_input = [
                     (nid, node.node.get_content(metadata_mode=MetadataMode.EMBED))
                     for nid, node, _ in candidates
                 ]
                 reranked = self.colbert_reranker.rerank(query, rerank_input)
 
-                # 构建最终结果
                 nid_to_node = {nid: node for nid, node, _ in candidates}
                 results: list[NodeWithScore] = []
                 for nid, _, score in reranked[:top_k]:
@@ -3074,11 +3144,11 @@ class MultiPathRetriever:
                         node = nid_to_node[nid]
                         node.score = score
                         results.append(node)
+                self.last_score_kind = "rerank"
                 return results
             except Exception as e:
                 print(f"[MultiPath] ColBERT 重排失败: {e}, 回退到 RRF 结果")
 
-        # 不使用 ColBERT 时，直接返回 RRF 融合结果
         results: list[NodeWithScore] = []
         for nid, node, score in candidates[:top_k]:
             node.score = score
@@ -3185,6 +3255,9 @@ def _try_build_colbert_reranker() -> Optional[ColBERTReranker]:
     """
     if not COLBERT_RERANK_ENABLED:
         return None
+    from pcb_rag.api_clients import assert_api_only
+
+    assert_api_only()
 
     # 验证模型名称格式
     model_name = COLBERT_MODEL.strip()
@@ -3478,23 +3551,39 @@ def _tokenize(text: str) -> list[str]:
     if not text:
         return []
 
+    text = text.translate(str.maketrans({"μ": "u", "µ": "u"}))
     use_jieba = _init_jieba()
 
     tokens: list[str] = []
-    raw_tokens: list[str] = []  # 保存原始 token 用于生成 n-gram
+    raw_tokens: list[str] = []  # 保存原始 token
+    en_bigrams: list[str] = []
+    # 英文 bigram 只拼真正相邻的两个词：中间隔着中文或标点就断开。
+    # 早先先筛出全部英文再两两拼接，「IPC-6012 规定焊盘 annular ring」会造出 ipc-6012_annular。
+    # 英文停用词视为透明（"via in pad" 仍产出 via_pad），与旧行为一致。
+    prev_en: Optional[str] = None
+    prev_end = 0
 
-    for part in re.findall(r"[A-Za-z0-9_+\-./]+|[\u4e00-\u9fff]+", text):
+    for match in re.finditer(r"[A-Za-z0-9_+\-./]+|[\u4e00-\u9fff]+", text):
+        part = match.group(0)
+        gap = text[prev_end : match.start()]
+        prev_end = match.end()
         if not part:
             continue
         if re.fullmatch(r"[A-Za-z0-9_+\-./]+", part):
+            if gap.strip():
+                prev_en = None
             lower = part.lower()
             # 过滤停用词（但保留专业术语）
             if lower in _STOPWORDS and lower not in _PCB_TERMS:
                 continue
             tokens.append(lower)
             raw_tokens.append(lower)
+            if prev_en is not None:
+                en_bigrams.append(f"{prev_en}_{lower}")
+            prev_en = lower
             continue
 
+        prev_en = None
         # CJK 文本处理
         part = part.strip()
         if not part:
@@ -3553,19 +3642,19 @@ def _tokenize(text: str) -> list[str]:
             tokens.extend([c for c in part if c not in _STOPWORDS])
 
     # 添加英文 bigram（提升短语匹配，如 "annular ring"）
-    en_tokens = [t for t in raw_tokens if re.fullmatch(r"[a-z0-9_+\-./]+", t)]
-    if len(en_tokens) >= 2:
-        for i in range(len(en_tokens) - 1):
-            bigram = f"{en_tokens[i]}_{en_tokens[i+1]}"
-            tokens.append(bigram)
+    tokens.extend(en_bigrams)
 
     return tokens
 
 
 
 
-def _extract_query_filters(user_query: str) -> tuple[str, Optional[MetadataFilters]]:
+def _extract_query_filters(
+    user_query: str, *, include_acl: bool = True
+) -> tuple[str, Optional[MetadataFilters]]:
     """从用户输入里提取过滤条件，并返回 (clean_query, filters)。
+
+    ``include_acl=False`` 用于调用方单独跟踪业务过滤与权限过滤。
 
     支持：
     - key=value / key:value（vendor/eda/layers/oz/source_type/effective_date）
@@ -3632,8 +3721,7 @@ def _extract_query_filters(user_query: str) -> tuple[str, Optional[MetadataFilte
             pass
 
     if not extracted:
-        # 没有业务过滤条件时，仍然要带上权限条件（否则跨租户数据会进入召回）
-        return user_query, build_acl_filters(current_principal())
+        return user_query, build_acl_filters(current_principal()) if include_acl else None
 
     filters: list[MetadataFilter] = []
     for k, v in extracted.items():
@@ -3651,7 +3739,8 @@ def _extract_query_filters(user_query: str) -> tuple[str, Optional[MetadataFilte
     )
     clean = re.sub(r"\s+", " ", clean).strip()
     base_filters = MetadataFilters(filters=filters, condition=FilterCondition.AND)
-    # 权限条件与业务过滤以 AND 合并：在召回阶段就把无权访问的文档挡掉
+    if not include_acl:
+        return clean or user_query, base_filters
     return clean or user_query, merge_filters(base_filters, build_acl_filters(current_principal()))
 
 
@@ -3686,6 +3775,8 @@ class _Bm25Index:
     #  新文档即使包含该词也进不了候选集（与 BM25 不重载叠加，问题被进一步放大）。
     #  DF > 80% 的词已在 score() 里被过滤，这里默认不截断。
     max_postings: int = 0
+    #: 语料至少这么多篇时才启用 DF > 80% 过滤（小语料下 IDF 已足够压低共有词）
+    df_filter_min_docs: int = 10
 
     def candidates(self, query_tokens: list[str], max_postings: Optional[int] = None) -> set:
         """返回可能命中的候选文档下标（基于倒排索引）。
@@ -3735,8 +3826,9 @@ class _Bm25Index:
 
             n_qi = self.df.get(term, 0)
 
-            # 过滤过于常见的词（可能是停用词漏网之鱼）
-            if n_qi > df_threshold:
+            # 过滤过于常见的词（可能是停用词漏网之鱼）。
+            # 语料太小时不过滤：2~4 篇文档里，几乎所有共有词的 DF 都超过 80%
+            if N >= self.df_filter_min_docs and n_qi > df_threshold:
                 continue
 
             # 改进的 IDF：使用 log((N+1)/(n+0.5)) 确保非负
@@ -3761,6 +3853,9 @@ class _Bm25Index:
             score += term_score * min(qtf, 3)
 
         return score
+
+
+_WARNED_FILTER_OPERATORS: set = set()
 
 
 class LocalBM25Retriever(BaseRetriever):
@@ -3814,9 +3909,30 @@ class LocalBM25Retriever(BaseRetriever):
             if isinstance(val, list):
                 return tgt in val
             return False
+        if op in {FilterOperator.TEXT_MATCH, FilterOperator.TEXT_MATCH_INSENSITIVE}:
+            if not isinstance(val, str) or not isinstance(tgt, str):
+                return False
+            pattern = tgt + "%"
+            regex = "".join(
+                ".*" if character == "%" else "." if character == "_" else re.escape(character)
+                for character in pattern
+            )
+            flags = re.IGNORECASE if op == FilterOperator.TEXT_MATCH_INSENSITIVE else 0
+            return re.fullmatch(regex, val, flags=flags) is not None
+        if op == getattr(FilterOperator, "ANY", None):
+            values = val if isinstance(val, (list, tuple, set)) else [val]
+            return any(item in values for item in (tgt or []))
+        if op == getattr(FilterOperator, "ALL", None):
+            values = val if isinstance(val, (list, tuple, set)) else [val]
+            return all(item in values for item in (tgt or []))
+        if op == getattr(FilterOperator, "IS_EMPTY", None):
+            return val is None or val == "" or val == [] or val == {}
 
-        # 未实现的操作符：默认放行（避免误杀）
-        return True
+        # 未实现的操作符：拒绝。放行会让新加的过滤（包括权限过滤）在词法路静默失效
+        if op not in _WARNED_FILTER_OPERATORS:
+            _WARNED_FILTER_OPERATORS.add(op)
+            print(f"[BM25] 不支持的过滤操作符 {op!r}，命中该条件的文档一律不返回")
+        return False
 
     def _match_filters(self, metadata: dict, filters: MetadataFilters) -> bool:
         parts: list[bool] = []
@@ -3917,6 +4033,52 @@ def _truncate_utf8_text(text: str, max_bytes: int) -> str:
     return b[:max_bytes].decode("utf-8", errors="ignore")
 
 
+def _lexical_schema_path(cache_path: Path) -> Path:
+    # 旁路文件而不是首行标记：eval / scripts 里有多处按「每行一条记录」直接读这份 JSONL
+    return cache_path.with_name(cache_path.name + ".schema.json")
+
+
+def _lexical_schema_payload() -> dict[str, Any]:
+    return {"schema": LEXICAL_CACHE_SCHEMA, "required_keys": list(LEXICAL_REQUIRED_KEYS)}
+
+
+def _lexical_cache_schema_ok(cache_path: Path) -> bool:
+    """缓存是否按当前字段清单导出（ACL 字段名可配置，改名后也要重建）。"""
+    try:
+        payload = json.loads(_lexical_schema_path(cache_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return payload == _lexical_schema_payload()
+
+
+def _write_lexical_schema(cache_path: Path) -> None:
+    try:
+        _lexical_schema_path(cache_path).write_text(
+            json.dumps(_lexical_schema_payload(), ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"[BM25] 写词法缓存格式文件失败: {exc}")
+
+
+def _read_lexical_cache(cache_path: Path) -> list[TextNode]:
+    docs: list[TextNode] = []
+    try:
+        with cache_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                text = obj.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                text = _truncate_utf8_text(text, LEXICAL_MAX_BYTES)
+                docs.append(TextNode(text=text, id_=obj.get("id") or None, metadata=obj.get("metadata") or {}))
+    except Exception:
+        return []
+    return docs
+
+
 def _load_or_build_bm25(vector_store: MilvusVectorStore) -> Optional[_Bm25Index]:
     if not LEXICAL_ENABLED:
         return None
@@ -3940,23 +4102,18 @@ def _load_or_build_bm25(vector_store: MilvusVectorStore) -> Optional[_Bm25Index]
         except OSError:
             cache_usable = False
 
+    if cache_usable and not _lexical_cache_schema_ok(cache_path):
+        if ACL_ENABLED:
+            # 旧缓存没有权限字段，开着 ACL 继续用就会越权，必须重建
+            print(f"[BM25] 词法缓存缺少权限/版本字段（旧格式），ACL 已开启，将重建: {cache_path}")
+            cache_usable = False
+        else:
+            # 不开 ACL 时不强制重建，避免冻结的实验语料被改写；TTL 到期后自然换成新格式
+            print(f"[BM25] 词法缓存为旧格式（缺少权限/版本字段），将在 TTL 到期后重建: {cache_path}")
+
     docs: list[TextNode] = []
     if cache_usable:
-        try:
-            with cache_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    obj = json.loads(line)
-                    text = obj.get("text")
-                    if not isinstance(text, str) or not text.strip():
-                        continue
-                    text = _truncate_utf8_text(text, LEXICAL_MAX_BYTES)
-                    node = TextNode(text=text, id_=obj.get("id") or None, metadata=obj.get("metadata") or {})
-                    docs.append(node)
-        except Exception:
-            docs = []
+        docs = _read_lexical_cache(cache_path)
 
     # 如果没有缓存，则从 Milvus 导出一次并落盘缓存
     if not docs:
@@ -3970,7 +4127,7 @@ def _load_or_build_bm25(vector_store: MilvusVectorStore) -> Optional[_Bm25Index]
                     text = _truncate_utf8_text(text, LEXICAL_MAX_BYTES)
 
                     md: dict[str, Any] = {}
-                    for k in LEXICAL_METADATA_KEYS:
+                    for k in (*LEXICAL_METADATA_KEYS, *LEXICAL_REQUIRED_KEYS):
                         if k in row and row.get(k) is not None:
                             md[k] = row.get(k)
                     rec = {
@@ -3981,6 +4138,7 @@ def _load_or_build_bm25(vector_store: MilvusVectorStore) -> Optional[_Bm25Index]
                     }
                     out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             tmp_path.replace(cache_path)
+            _write_lexical_schema(cache_path)
         except Exception:
             try:
                 if tmp_path.exists():
@@ -3989,22 +4147,14 @@ def _load_or_build_bm25(vector_store: MilvusVectorStore) -> Optional[_Bm25Index]
                 pass
 
         # 重新读一次缓存
-        try:
-            with cache_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    obj = json.loads(line)
-                    text = obj.get("text")
-                    if not isinstance(text, str) or not text.strip():
-                        continue
-                    text = _truncate_utf8_text(text, LEXICAL_MAX_BYTES)
-                    node = TextNode(text=text, id_=obj.get("id") or None, metadata=obj.get("metadata") or {})
-                    docs.append(node)
-        except Exception:
-            docs = []
+        docs = _read_lexical_cache(cache_path)
+        if docs and ACL_ENABLED and not _lexical_cache_schema_ok(cache_path):
+            # 重建失败、手里只剩旧格式缓存：宁可关掉词法路，也不能越权
+            print(f"[BM25] 词法缓存重建失败且旧缓存缺少权限字段，ACL 已开启，本次关闭词法路: {cache_path}")
+            return None
 
+    # 父块只用于上下文扩展，不参与 BM25 统计（与 retrieval.build_lexical 一致）
+    docs = [node for node in docs if (node.metadata or {}).get("node_level") != "parent"]
     if not docs:
         return None
 

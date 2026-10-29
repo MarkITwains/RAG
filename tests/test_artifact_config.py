@@ -91,3 +91,16 @@ def test_graph_model_backend_and_local_model_change_graph_fingerprint():
     changed = pipeline_fingerprints({"LLM_BACKEND": "local", "OLLAMA_LLM_MODEL": "new"})
 
     assert base["graph"] != changed["graph"]
+
+
+def test_artifact_config_is_stable_across_calls():
+    from pcb_rag import ingest
+
+    first = ingest.artifact_config()
+    second = ingest.artifact_config()
+
+    implementation = first["GRAPH_IMPLEMENTATION"]
+    assert isinstance(implementation, str) and len(implementation) == 64
+    int(implementation, 16)
+    assert implementation == second["GRAPH_IMPLEMENTATION"]
+    assert pipeline_fingerprints(first) == pipeline_fingerprints(second)

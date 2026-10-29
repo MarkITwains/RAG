@@ -12,3 +12,8 @@ services:
     ports: !override
       - "127.0.0.1:19530:19530"
       - "127.0.0.1:9091:9091"
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"

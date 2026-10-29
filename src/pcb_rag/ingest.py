@@ -3613,7 +3613,7 @@ def artifact_config(overrides=None):
     config["LEXICAL_IMPLEMENTATION"] = hashlib.sha256(Path(__file__).with_name("query.py").read_bytes()).hexdigest()
     config["GRAPH_IMPLEMENTATION"] = hashlib.sha256(
         Path(__file__).with_name("graph_rag.py").read_bytes() + Path(__file__).with_name("graph_semantic.py").read_bytes()
-    )
+    ).hexdigest()
     return config
 
 
@@ -3621,7 +3621,7 @@ def main():
     from pcb_rag.ingestion import run_ingestion
     from pcb_rag.revisions import RevisionStore, pipeline_fingerprints, state_path
     from pcb_rag.graph_semantic import build_graph_vectors
-    from pcb_rag.api_clients import get_embedding_profile
+    from pcb_rag.api_clients import assert_api_only, get_embedding_profile
     from pcb_rag.embedding_contract import ensure_ingest_embedding_profile
 
     documents = _load_ingest_documents()
@@ -3634,6 +3634,7 @@ def main():
         print(json.dumps({"collection": COLLECTION, "documents": len(current), "parse_fragments": len(selected),
                           "removed_or_changed": len(stale), "pipeline": fingerprints}, ensure_ascii=False, indent=2))
         return
+    assert_api_only()
     Settings.llm = build_llm()
     Settings.embed_model = build_embed_model()
     dimension = get_embedding_dim(Settings.embed_model)

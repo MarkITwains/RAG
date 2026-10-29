@@ -2027,6 +2027,19 @@ def main() -> int:
     ap.add_argument("--self-rag-verbose", action="store_true", help="Show Self-RAG iteration logs in evaluation")
     args = ap.parse_args()
 
+    from pcb_rag.api_clients import api_only_enabled, assert_api_only
+
+    assert_api_only()
+    if api_only_enabled() and "colbert" in args.mode:
+        print("[ERROR] AI_API_ONLY=1 禁止本地 ColBERT 评测", file=sys.stderr)
+        return 2
+    if api_only_enabled() and args.soft_match == "llm" and (
+        args.soft_llm_backend == "ollama"
+        or (args.soft_llm_backend == "auto" and "11434" in args.soft_llm_base_url)
+    ):
+        print("[ERROR] AI_API_ONLY=1 要求软匹配 judge 使用 API", file=sys.stderr)
+        return 2
+
     ds_path = Path(args.dataset)
     if not ds_path.exists():
         print(f"[ERROR] dataset not found: {ds_path}", file=sys.stderr)

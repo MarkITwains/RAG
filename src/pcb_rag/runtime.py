@@ -115,6 +115,8 @@ def await_work(future, control: RequestControl | None = None, *, timeout: float 
             if local_deadline is not None:
                 left = min(left, local_deadline - time.monotonic())
                 if left <= 0:
+                    if future.done():
+                        return future.result()
                     raise DeadlineExceeded("stage deadline exceeded")
             try:
                 return future.result(timeout=min(0.1, left))

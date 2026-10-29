@@ -41,6 +41,136 @@ def node_id_key(item: Any) -> str:
     return str(id(item))
 
 
+def merge_scored_runs(
+    runs: Sequence[Sequence[Any]],
+    top_n: Optional[int] = None,
+) -> List[Any]:
+    """Merge same-route query runs by node id, keeping each node's best score."""
+    best: Dict[str, Tuple[float, Any]] = {}
+    for nodes in runs:
+        for item in nodes:
+            key = node_id_key(item)
+            score = float(getattr(item, "score", 0.0) or 0.0)
+            previous = best.get(key)
+            if previous is None or score > previous[0]:
+                best[key] = (score, item)
+    ordered = sorted(best.values(), key=lambda pair: -pair[0])
+    if top_n is not None:
+        ordered = ordered[: max(0, int(top_n))]
+    return [item for _score, item in ordered]
+
+
+def rrf_merge_runs(
+    runs: Sequence[Sequence[Any]],
+    top_n: Optional[int] = None,
+    rrf_k: int = DEFAULT_RRF_K,
+) -> List[Any]:
+    """按名次合并同一路的多个查询结果（分数跨查询不可比时用）。
+
+    BM25 分是查询词逐项相加的，查询越长分越高：Query2Doc / 多查询扩展出来的
+    长查询，原始分天然压过原问题的精确命中，``merge_scored_runs`` 取最高分就会
+    让长查询霸榜。这里只看每条在各查询里的名次：``Σ 1/(rrf_k + rank)``，
+    并把融合分写回 ``item.score``。同分时保留首次出现的顺序（原问题在前）。
+
+    只有一个查询时退回 ``merge_scored_runs``，保留原生分数。
+    """
+    if len(runs) <= 1:
+        return merge_scored_runs(runs, top_n=top_n)
+    scores: Dict[str, float] = {}
+    items: Dict[str, Any] = {}
+    for nodes in runs:
+        seen: set = set()
+        rank = 0
+        for item in nodes:
+            key = node_id_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            rank += 1
+            items.setdefault(key, item)
+            scores[key] = scores.get(key, 0.0) + 1.0 / float(rrf_k + rank)
+    ordered = sorted(scores, key=lambda key: -scores[key])
+    if top_n is not None:
+        ordered = ordered[: max(0, int(top_n))]
+    out: List[Any] = []
+    for key in ordered:
+        item = items[key]
+        try:
+            item.score = float(scores[key])
+        except Exception:
+            pass
+        out.append(item)
+    return out
+
+
+#: 位置式 FUSION_QUOTAS（如 ``3,2,1``）按这个顺序对应路名，沿用原注释的约定：
+#: 主检索为 向量 / HyDE / BM25（之后是 Step-back），两个值时是两路模式 向量 / BM25。
+POSITIONAL_QUOTA_ROUTES: Tuple[str, ...] = ("vector", "hyde", "bm25", "stepback")
+
+
+def parse_route_quotas(raw: Any) -> Dict[str, int]:
+    """把 FUSION_QUOTAS 解析成 ``{路名: 保底条数}``。
+
+    - 推荐写法 ``vector=3,bm25=2,graph=1``：按路名绑定，某一路为空或失败、
+      后面的路往前挪时，配额也不会落到别的路上。
+    - 兼容旧的位置式 ``3,2,1``：按 :data:`POSITIONAL_QUOTA_ROUTES` 转成路名。
+    - 空项会被跳过（``3,2,`` 合法）。写错时打印警告并返回空 dict（退回均分配额），
+      不让一个配置笔误把服务拖到起不来。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    items = [part.strip() for part in text.split(",") if part.strip()]
+    try:
+        if all("=" in part for part in items):
+            quotas: Dict[str, int] = {}
+            for part in items:
+                name, value = (piece.strip() for piece in part.split("=", 1))
+                if not name:
+                    raise ValueError(f"empty route name in {part!r}")
+                quotas[name.lower()] = max(0, int(value))
+            return quotas
+        if any("=" in part for part in items):
+            raise ValueError("mixes named and positional entries")
+        values = [max(0, int(part)) for part in items]
+    except ValueError as exc:
+        print(f"[Fusion] FUSION_QUOTAS={text!r} 无法解析（{exc}），改用均分配额")
+        return {}
+    if len(values) == 2:
+        names: Tuple[str, ...] = ("vector", "bm25")
+    elif len(values) <= len(POSITIONAL_QUOTA_ROUTES):
+        names = POSITIONAL_QUOTA_ROUTES[: len(values)]
+    else:
+        print(f"[Fusion] FUSION_QUOTAS={text!r} 位置式最多 {len(POSITIONAL_QUOTA_ROUTES)} 个值，改用均分配额")
+        return {}
+    return dict(zip(names, values))
+
+
+def normalize_route_quotas(quotas: Any) -> Dict[str, int]:
+    """接受 dict、``((路名, 条数), ...)``、位置式整数序列或原始字符串。"""
+    if not quotas:
+        return {}
+    if isinstance(quotas, str):
+        return parse_route_quotas(quotas)
+    if isinstance(quotas, dict):
+        return {str(name).lower(): max(0, int(value)) for name, value in quotas.items()}
+    entries = list(quotas)
+    if all(isinstance(entry, (tuple, list)) and len(entry) == 2 for entry in entries):
+        return {str(name).lower(): max(0, int(value)) for name, value in entries}
+    return parse_route_quotas(",".join(str(entry) for entry in entries))
+
+
+def quotas_for_routes(
+    route_names: Sequence[str],
+    quotas: Dict[str, int],
+    default: int,
+) -> Optional[List[int]]:
+    """按路名取每路配额；没配置的路用 ``default``。没有任何配置时返回 None。"""
+    if not quotas:
+        return None
+    return [quotas.get(str(name).split(":")[0].lower(), max(0, int(default))) for name in route_names]
+
+
 def weighted_rrf_fuse(
     routes: Sequence[Tuple[Sequence[Any], float]],
     top_n: int,
