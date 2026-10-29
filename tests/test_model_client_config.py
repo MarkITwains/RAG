@@ -30,6 +30,47 @@ def test_explicit_temperature_overrides_environment(monkeypatch, backend):
     assert actual == 0.0
 
 
+def test_build_llm_supports_independent_api_credentials(monkeypatch):
+    monkeypatch.setattr(api_clients, "LLM_BASE_URL", "https://answer.invalid/v1")
+    monkeypatch.setattr(api_clients, "LLM_MODEL", "answer-model")
+
+    llm = api_clients.build_llm(
+        model="judge-model",
+        backend="api",
+        api_base="https://judge.invalid/v1/",
+        api_key="judge-test-key",
+    )
+
+    assert llm.api_base == "https://judge.invalid/v1"
+    assert llm.api_key == "judge-test-key"
+    assert llm.model == "judge-model"
+
+
+def test_api_only_rejects_local_model_factory(monkeypatch):
+    monkeypatch.setenv("AI_API_ONLY", "1")
+
+    with pytest.raises(RuntimeError, match="AI_API_ONLY"):
+        api_clients.build_llm(backend="local")
+    with pytest.raises(RuntimeError, match="AI_API_ONLY"):
+        api_clients.build_embed_model(backend="local")
+
+
+def test_api_only_rejects_local_rerank_colbert_and_judge(monkeypatch):
+    monkeypatch.setenv("AI_API_ONLY", "1")
+    monkeypatch.setenv("RERANK_BACKEND", "api")
+    monkeypatch.setattr(api_clients, "LLM_BACKEND", "api")
+    monkeypatch.setattr(api_clients, "EMBED_BACKEND", "api")
+
+    monkeypatch.setenv("COLBERT_RERANK_ENABLED", "1")
+    with pytest.raises(RuntimeError, match="COLBERT"):
+        api_clients.assert_api_only()
+
+    monkeypatch.setenv("COLBERT_RERANK_ENABLED", "0")
+    monkeypatch.setenv("JUDGE_BACKEND", "local")
+    with pytest.raises(RuntimeError, match="JUDGE_BACKEND"):
+        api_clients.assert_api_only(judge=True)
+
+
 def test_local_embedding_uses_ollama_timeout(monkeypatch):
     monkeypatch.setattr(api_clients, "OLLAMA_TIMEOUT", 17.0)
 

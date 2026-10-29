@@ -20,23 +20,32 @@ table{border-collapse:collapse;width:100%;text-align:left}th,td{border-bottom:1p
 <button id="previous" disabled>上一页</button><button id="next" disabled>下一页</button></section>
 <section><h2>图谱证据定位</h2><label for="entity">实体名称</label><input id="entity" placeholder="如：镀金层厚度"><button id="graph">查看来源</button><pre id="graphResult"></pre></section>
 <script>
-let offset=0;const $=id=>document.getElementById(id);
+let offset=0,total=0,refreshId=0;const $=id=>document.getElementById(id);
 async function request(path,method='GET'){
  const response=await fetch(path,{method,headers:{Authorization:'Bearer '+$('token').value.trim()}});
  const data=await response.json();if(!response.ok)throw Error(data.detail||('请求失败 '+response.status));return data;
 }
 async function refresh(){
+ const id=++refreshId,requestedOffset=offset;
  $('notice').textContent='正在读取…';
- try{const [state,list]=await Promise.all([request('/api/admin/status'),request('/api/admin/documents?offset='+offset+'&limit=50')]);
+ try{const [state,list]=await Promise.all([request('/api/admin/status'),request('/api/admin/documents?offset='+requestedOffset+'&limit=50')]);
+ if(id!==refreshId)return;
+ total=list.total;
  $('overview').textContent='当前集合：'+(state.collection||'旧版集合')+'\n已发布版本：'+state.revision+'\n文档数：'+state.documents+'\n待完成版本：'+(state.pending_revision||'无')+'\n后台任务：'+state.job.status;
  $('stages').textContent=JSON.stringify({storage_revisions:state.storage_revisions,stages:state.stages},null,2);
  $('retry').disabled=!state.retry_available||state.job.status==='running';$('docs').replaceChildren();
  for(const doc of list.documents){const row=document.createElement('tr');for(const value of [doc.source_path,doc.status,doc.revision||'待发布',JSON.stringify(doc.stages)]){const cell=document.createElement('td');cell.textContent=value;row.append(cell)}$('docs').append(row)}
- $('count').textContent='共 '+list.total+' 份，当前显示 '+list.documents.length+' 份';$('previous').disabled=offset===0;$('next').disabled=offset+50>=list.total;$('notice').textContent='状态已更新。';
- }catch(error){$('notice').textContent=error.message}
+ $('count').textContent='共 '+total+' 份，当前显示 '+list.documents.length+' 份';$('previous').disabled=requestedOffset===0;$('next').disabled=requestedOffset+50>=total;$('notice').textContent='状态已更新。';
+ }catch(error){if(id===refreshId)$('notice').textContent=error.message}
 }
-$('refresh').onclick=()=>refresh();$('previous').onclick=()=>{offset=Math.max(0,offset-50);refresh()};$('next').onclick=()=>{offset+=50;refresh()};
-$('retry').onclick=async()=>{try{$('retry').disabled=true;await request('/api/admin/retry','POST');await refresh()}catch(error){$('notice').textContent=error.message}};
+$('refresh').onclick=()=>refresh();
+$('previous').onclick=()=>{if(offset===0)return;offset=Math.max(0,offset-50);refresh()};
+$('next').onclick=()=>{if(offset+50>=total)return;offset+=50;refresh()};
+$('retry').onclick=async()=>{
+ $('retry').disabled=true;
+ try{await request('/api/admin/retry','POST')}catch(error){$('notice').textContent=error.message;$('retry').disabled=false;return}
+ await refresh();
+};
 $('graph').onclick=async()=>{try{$('graphResult').textContent=JSON.stringify(await request('/api/graph/neighbors?entity='+encodeURIComponent($('entity').value)),null,2)}catch(error){$('notice').textContent=error.message}};
 </script>
 </html>

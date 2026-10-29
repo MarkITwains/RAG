@@ -48,3 +48,48 @@ def test_plain_fusion_uses_supported_retriever(monkeypatch):
 
     assert isinstance(retriever, recall._RRFRetriever)
     assert retriever._rrf_k == 73
+
+
+def test_generation_eval_uses_independent_api_judge(monkeypatch, tmp_path):
+    import json
+    from eval import evaluate
+
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text(json.dumps({"question": "question", "ground_truth": "answer"}) + "\n", encoding="utf-8")
+    captured = {}
+
+    class Engine:
+        llm = SimpleNamespace(model="answer-model")
+
+        def __init__(self, **kwargs):
+            pass
+
+        def retrieve(self, query):
+            return []
+
+        def configuration(self):
+            return {}
+
+    def build_judge(model, **kwargs):
+        captured.update(model=model, **kwargs)
+        return SimpleNamespace(model="judge-model")
+
+    monkeypatch.setattr(evaluate, "EvalEngine", Engine)
+    monkeypatch.setattr(evaluate, "build_llm", build_judge)
+    monkeypatch.setattr(
+        evaluate,
+        "evaluate_case",
+        lambda **kwargs: {"context_precision": 1.0, "context_recall": 1.0, "judge_failed": []},
+    )
+    monkeypatch.setenv("JUDGE_BASE_URL", "https://judge.invalid/v1")
+    monkeypatch.setenv("JUDGE_API_KEY", "judge-test-key")
+    monkeypatch.setenv("JUDGE_MODEL", "judge-model")
+
+    evaluate.run(dataset, tmp_path / "report.json", 0, 5, 200, True, True, [])
+
+    assert captured == {
+        "model": "judge-model",
+        "backend": "api",
+        "api_base": "https://judge.invalid/v1",
+        "api_key": "judge-test-key",
+    }

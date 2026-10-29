@@ -268,11 +268,24 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
 .sheet .row{display:flex;gap:8px;margin-top:14px}
 .sheet .row button{flex:1}
 .sheet .note{font-size:11.5px;color:var(--text-3);margin:10px 0 0;line-height:1.6}
+#btnSources,.panel-close{display:none}
+.panel-backdrop{display:none}
 
 /* ---------- 窄屏 ---------- */
 @media (max-width:900px){
   .layout{grid-template-columns:1fr}
-  .panel{display:none}
+  #btnSources{display:inline-block}
+  .panel{
+    display:flex;position:fixed;top:56px;right:0;bottom:0;z-index:70;
+    width:min(372px,100vw);visibility:hidden;transform:translateX(100%);
+    box-shadow:-8px 0 24px rgba(0,0,0,.08);
+  }
+  .panel.mobile-open{visibility:visible;transform:translateX(0)}
+  .panel-close{display:inline-block;padding:2px 6px}
+  .panel-backdrop.show{
+    display:block;position:fixed;inset:56px 0 0;z-index:60;
+    background:rgba(0,0,0,.18);
+  }
   .thread-inner{padding:28px 20px 48px}
   .composer-inner{padding:12px 16px 0}
   .composer-meta{padding:8px 16px 12px;gap:12px}
@@ -301,36 +314,39 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
   <div class="topbar-right">
     <div class="status" id="status"><span class="dot"></span><span class="label">检查中</span></div>
     <button class="ghost" id="btnSettings">设置</button>
+    <button class="ghost" id="btnSources" disabled>证据</button>
     <button class="ghost" id="btnNew">新对话</button>
   </div>
 </header>
 
-<div class="sheet" id="sheet">
+<form class="sheet" id="sheet">
   <h3>接口凭据</h3>
   <p class="desc">服务端以 Bearer Token 鉴权，填一次即存于本机浏览器。</p>
   <label for="tokenInput">API Token</label>
   <input id="tokenInput" type="password" placeholder="DIFY_API_TOKEN" autocomplete="off">
   <div class="row">
-    <button class="ghost" id="btnClearToken">清除</button>
-    <button class="primary" id="btnSaveToken">保存</button>
+    <button class="ghost" id="btnClearToken" type="button">清除</button>
+    <button class="primary" id="btnSaveToken" type="submit">保存</button>
   </div>
   <p class="note">若服务端未启用鉴权，留空即可。</p>
-</div>
+</form>
 
 <main class="layout">
   <section class="thread" id="thread">
     <div class="thread-inner" id="threadInner"></div>
   </section>
-  <aside class="panel">
+  <aside class="panel" id="panel">
     <div class="panel-head">
       <h2>证据来源</h2>
       <span class="count" id="srcCount">0</span>
+      <button class="ghost panel-close" id="btnCloseSources" type="button">关闭</button>
     </div>
     <div class="panel-body" id="panelBody">
       <p class="panel-empty">提问后，这里会列出模型实际依据的原文片段、所属章节与检索得分。点击答案里的角标可定位到对应条目。</p>
     </div>
   </aside>
 </main>
+<div class="panel-backdrop" id="panelBackdrop"></div>
 
 <footer class="composer">
   <div class="composer-inner">
@@ -361,8 +377,11 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
   var el = {
     thread: document.getElementById("thread"),
     inner: document.getElementById("threadInner"),
+    panel: document.getElementById("panel"),
     panelBody: document.getElementById("panelBody"),
+    panelBackdrop: document.getElementById("panelBackdrop"),
     srcCount: document.getElementById("srcCount"),
+    btnSources: document.getElementById("btnSources"),
     input: document.getElementById("input"),
     send: document.getElementById("send"),
     status: document.getElementById("status"),
@@ -512,6 +531,7 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
   function renderSources(list){
     state.sources = list || [];
     el.srcCount.textContent = String(state.sources.length);
+    el.btnSources.disabled = !state.sources.length;
 
     if (!state.sources.length) {
       el.panelBody.innerHTML =
@@ -541,6 +561,17 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
         "</div>" +
       "</div>";
     }).join("");
+  }
+
+  function openSources(){
+    if (window.innerWidth > 900 || !state.sources.length) return;
+    el.panel.classList.add("mobile-open");
+    el.panelBackdrop.classList.add("show");
+  }
+
+  function closeSources(){
+    el.panel.classList.remove("mobile-open");
+    el.panelBackdrop.classList.remove("show");
   }
 
   function focusSource(idx){
@@ -581,8 +612,10 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
     if (state.turns.length === 0) el.inner.innerHTML = "";
 
     var turn = addTurn(q);
-    state.turns.push({ q: q, a: "" });
+    var turnState = { q: q, a: "", sources: [], root: turn.root };
+    state.turns.push(turnState);
     scrollToBottom(true);
+    closeSources();
     renderSources([]);
 
     var controller = new AbortController();
@@ -646,7 +679,8 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
               line.textContent = "检索改写：" + msg.data.rewritten_query;
               rw.querySelector("div").appendChild(line);
             }
-            renderSources(msg.data.citations || []);
+            turnState.sources = msg.data.citations || [];
+            renderSources(turnState.sources);
           } else if (msg.event === "token") {
             if (firstToken) {
               firstToken = false;
@@ -673,34 +707,40 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
 
       state.history.push({ role: "user", content: q });
       state.history.push({ role: "assistant", content: turn.answer });
-      state.turns[state.turns.length - 1].a = turn.answer;
+      turnState.a = turn.answer;
       scrollToBottom(false);
 
     } catch (err) {
       var message = err && err.message ? err.message : String(err);
       var hint = "";
+      var aborted = err && err.name === "AbortError";
       if (message === "AUTH") {
         hint = "服务端启用了鉴权。点右上角「设置」填入 API Token 后重试。";
         message = "鉴权失败（401）";
         openSheet();
-      } else if (err && err.name === "AbortError") {
+      } else if (aborted) {
         message = "已取消";
       }
       turn.body.innerHTML =
         '<div class="err-box">' + esc(message) +
         (hint ? '<div class="hint">' + esc(hint) + "</div>" : "") +
         "</div>";
+      if (!aborted && turn.root.isConnected && !el.input.value) {
+        el.input.value = q;
+        el.input.dispatchEvent(new Event("input"));
+      }
     } finally {
       state.busy = false;
       state.ctrl = null;
       el.send.disabled = false;
       el.send.textContent = "提问";
-      el.input.focus();
+      if (!el.sheet.classList.contains("open")) el.input.focus();
     }
   }
 
   /* ---------- 交互 ---------- */
   function openSheet(){
+    closeSources();
     el.tokenInput.value = state.token;
     el.sheet.classList.add("open");
     el.tokenInput.focus();
@@ -735,10 +775,15 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
     }
     var cite = e.target.closest(".cite");
     if (cite) {
+      var root = cite.closest(".turn");
+      var selected = state.turns.find(function(item){ return item.root === root; });
+      if (!selected) return;
       Array.prototype.forEach.call(el.inner.querySelectorAll(".cite.active"), function(n){
         n.classList.remove("active");
       });
       cite.classList.add("active");
+      renderSources(selected.sources);
+      openSources();
       focusSource(cite.getAttribute("data-idx"));
     }
   });
@@ -749,11 +794,16 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
     card.classList.toggle("open");
   });
 
+  el.btnSources.addEventListener("click", openSources);
+  document.getElementById("btnCloseSources").addEventListener("click", closeSources);
+  el.panelBackdrop.addEventListener("click", closeSources);
+
   document.getElementById("btnNew").addEventListener("click", function(){
     if (state.ctrl) state.ctrl.abort();
     state.history = [];
     state.turns = [];
     el.inner.innerHTML = "";
+    closeSources();
     renderEmpty();
     renderSources([]);
     el.input.focus();
@@ -764,7 +814,15 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
     if (el.sheet.classList.contains("open")) closeSheet(); else openSheet();
   });
 
-  document.getElementById("btnSaveToken").addEventListener("click", function(){
+  el.tokenInput.addEventListener("keydown", function(e){
+    if (e.key === "Enter" && !e.isComposing) {
+      e.preventDefault();
+      el.sheet.requestSubmit();
+    }
+  });
+
+  el.sheet.addEventListener("submit", function(e){
+    e.preventDefault();
     state.token = el.tokenInput.value.trim();
     if (state.token) localStorage.setItem(TOKEN_KEY, state.token);
     else localStorage.removeItem(TOKEN_KEY);
@@ -787,7 +845,10 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
   });
 
   document.addEventListener("keydown", function(e){
-    if (e.key === "Escape") closeSheet();
+    if (e.key === "Escape") {
+      closeSheet();
+      closeSources();
+    }
   });
 
   // 窄屏下长 placeholder 会换行并被 min-height 裁掉，按宽度切换文案
@@ -796,7 +857,10 @@ button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:6px;trans
       ? "询问 PCB 规范或工艺参数…"
       : "询问 PCB 设计规范、工艺参数或 EDA 工具操作…";
   }
-  window.addEventListener("resize", syncPlaceholder);
+  window.addEventListener("resize", function(){
+    syncPlaceholder();
+    if (window.innerWidth > 900) closeSources();
+  });
   syncPlaceholder();
 
   /* ---------- 启动 ---------- */

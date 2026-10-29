@@ -223,6 +223,48 @@ class TestBuildAclFilters:
     def test_returns_none_for_missing_principal(self, acl_on):
         assert build_acl_filters(None) is None
 
+    def test_non_strict_legacy_mode_preserves_recall_with_postfilter(self, acl_on, monkeypatch):
+        monkeypatch.delenv("ACL_STRICT_LEGACY", raising=False)
+        assert build_acl_filters(Principal(tenant_id="acme")) is None
+
+    def test_strict_mode_includes_owner_and_group_grants(self, acl_on, monkeypatch):
+        monkeypatch.setenv("ACL_STRICT_LEGACY", "1")
+        filters = build_acl_filters(Principal(user_id="u1", tenant_id="acme", groups=frozenset({"qa"})))
+        clauses = {item.key: item for item in filters.filters}
+        assert clauses[security.ACL_OWNER_FIELD].value == "u1"
+        assert "%|qa|%" in {item.value for item in filters.filters if item.key == security.ACL_GROUPS_FIELD}
+
+    def test_strict_pushdown_preserves_owner_and_group_results(self, acl_on, monkeypatch):
+        pytest.importorskip("llama_index.core")
+        from llama_index.core.schema import TextNode
+        from pcb_rag.query import LocalBM25Retriever
+        from pcb_rag.retrieval import build_lexical
+
+        monkeypatch.setenv("ACL_STRICT_LEGACY", "1")
+        principal = Principal(user_id="u1", tenant_id="acme", groups=frozenset({"qa"}))
+        docs = [
+            TextNode(
+                id_="owner",
+                text="owneronly",
+                metadata={"tenant_id": "other", "visibility": "private", "owner_id": "u1"},
+            ),
+            TextNode(
+                id_="group",
+                text="groupshared",
+                metadata={"tenant_id": "other", "visibility": "private", "acl_groups": "|pcb|qa|"},
+            ),
+            TextNode(id_="denied", text="deniedonly", metadata={"tenant_id": "other", "visibility": "private"}),
+        ]
+        retriever = LocalBM25Retriever(build_lexical(docs), filters=build_acl_filters(principal))
+        assert [item.node.id_ for item in retriever.retrieve("owneronly")] == ["owner"]
+        assert [item.node.id_ for item in retriever.retrieve("groupshared")] == ["group"]
+        assert retriever.retrieve("deniedonly") == []
+
+    def test_unsafe_group_pattern_falls_back_to_postfilter(self, acl_on, monkeypatch):
+        monkeypatch.setenv("ACL_STRICT_LEGACY", "1")
+        principal = Principal(tenant_id="acme", groups=frozenset({"qa_%"}))
+        assert build_acl_filters(principal) is None
+
 
 class TestDescribeAcl:
     def test_reports_configuration(self):
@@ -297,7 +339,8 @@ class TestMergeFilters:
         assert security.merge_filters(biz, None) is biz
         assert security.merge_filters(None, biz) is biz
 
-    def test_or_group_is_kept_as_nested_subtree(self, acl_on, li):
+    def test_or_group_is_kept_as_nested_subtree(self, acl_on, li, monkeypatch):
+        monkeypatch.setenv("ACL_STRICT_LEGACY", "1")
         biz = self._biz(li)
         acl = security.build_acl_filters(Principal(tenant_id="acme"))
         assert acl is not None and acl.condition == li.FilterCondition.OR
@@ -305,26 +348,30 @@ class TestMergeFilters:
         merged = security.merge_filters(biz, acl)
         assert isinstance(merged, li.MetadataFilters)
         assert merged.condition == li.FilterCondition.AND
-        # 顶层应是 [vendor==JLC, (tenant==acme OR visibility==public)]，共 2 个操作数
         assert len(merged.filters) == 2
         nested = [f for f in merged.filters if isinstance(f, li.MetadataFilters)]
         assert len(nested) == 1
         assert nested[0].condition == li.FilterCondition.OR
-        assert {f.key for f in nested[0].filters} == {
+        assert {f.key for f in nested[0].filters} >= {
             security.ACL_TENANT_FIELD,
             security.ACL_VISIBILITY_FIELD,
+            security.ACL_OWNER_FIELD,
+            security.ACL_GROUPS_FIELD,
         }
 
-    def test_milvus_expression_keeps_or_semantics(self, acl_on, li):
+    def test_milvus_expression_keeps_or_semantics(self, acl_on, li, monkeypatch):
         """真实编译成 Milvus 表达式：私有文档（tenant 命中但非 public）必须能通过。"""
         pytest.importorskip("llama_index.vector_stores.milvus")
         from llama_index.vector_stores.milvus.utils import parse_standard_filters
 
+        monkeypatch.setenv("ACL_STRICT_LEGACY", "1")
         merged = security.merge_filters(self._biz(li), security.build_acl_filters(Principal(tenant_id="acme")))
         _, expr = parse_standard_filters(merged)
         # 摊平的错误形态是 "vendor == 'JLC' and tenant_id == 'acme' and visibility == 'public'"
         assert " or " in expr
         assert expr.count(" and ") == 1
+        assert security.ACL_OWNER_FIELD in expr
+        assert security.ACL_GROUPS_FIELD in expr
 
     def test_and_groups_are_flattened(self, li):
         a = self._biz(li)

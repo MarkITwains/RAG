@@ -128,12 +128,16 @@ def run(
     print(f"[Eval] 共 {len(rows)} 条样本，top_k={top_k}, recall_k={recall_k}, "
           f"rerank={'on' if use_rerank else 'off'}, mode={'retrieval' if retrieval_only else 'full'}")
 
+    from pcb_rag.api_clients import assert_api_only
+
+    assert_api_only(judge=True)
     engine = EvalEngine(recall_k=recall_k, top_k=top_k, use_rerank=use_rerank)
-    # 异源 judge：通过 JUDGE_MODEL / JUDGE_BACKEND 注入与答题模型不同的判卷模型
-    # （如 JUDGE_MODEL=glm-5-3-260814 JUDGE_BACKEND=api）。留空则与答题同模型（不推荐）。
+    # 默认使用 API judge；可用 JUDGE_* 指定与答题模型不同的独立模型服务。
     judge = build_llm(
         os.getenv("JUDGE_MODEL") or None,
-        backend=os.getenv("JUDGE_BACKEND") or None,
+        backend=os.getenv("JUDGE_BACKEND") or "api",
+        api_base=os.getenv("JUDGE_BASE_URL") or None,
+        api_key=os.getenv("JUDGE_API_KEY") or None,
     )
     judge_model = getattr(judge, "model", "unknown")
     print(f"[Eval] Judge: {judge_model}"

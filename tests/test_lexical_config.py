@@ -41,3 +41,20 @@ def test_legacy_cache_builder_honors_bm25_env(tmp_path, monkeypatch):
 
     assert index.k1 == pytest.approx(2.4)
     assert index.b == pytest.approx(0.35)
+
+
+def test_single_document_bm25_returns_exact_match():
+    index = build_lexical([TextNode(id_="only", text="铜厚 35 μm")])
+
+    result = query.LocalBM25Retriever(index).retrieve("铜厚")
+
+    assert [item.node.id_ for item in result] == ["only"]
+
+
+@pytest.mark.parametrize("micro", ["μ", "µ"])
+def test_micro_sign_is_not_conflated_with_meter(micro):
+    tokenized = query._tokenize(f"35 {micro}m")
+
+    assert "um" in tokenized
+    assert "m" not in tokenized
+    assert tokenized != query._tokenize("35 m")

@@ -16,7 +16,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from pcb_rag.context_budget import dedupe_by_key
-from pcb_rag.fusion import quota_rrf_fuse, weighted_rrf_fuse
+from pcb_rag.fusion import (
+    merge_scored_runs,
+    normalize_route_quotas,
+    parse_route_quotas,
+    quota_rrf_fuse,
+    quotas_for_routes,
+    rrf_merge_runs,
+    weighted_rrf_fuse,
+)
 from pcb_rag.revisions import RevisionStore, fingerprint, node_visible, state_path
 from pcb_rag.runtime import IO_EXECUTOR, DeadlineExceeded, await_work, request_scope, run_stage
 from pcb_rag.security import current_principal, filter_nodes
@@ -48,7 +56,8 @@ class PipelineConfig:
     rrf_k: int = 40
     quota_enabled: bool = True
     quota_min: int = 1
-    quotas: tuple[int, ...] = ()
+    # 按路名绑定的保底配额：((路名, 条数), ...)；也接受 dict 或旧的位置式整数
+    quotas: tuple = ()
     dense_top_k: int = 200
     sparse_top_k: int = 200
     multipath_candidates: int = 200
@@ -107,7 +116,8 @@ class PipelineConfig:
         )
         raw_quotas = str(getattr(q, "FUSION_QUOTAS_RAW", ""))
         if raw_quotas:
-            values["quotas"] = tuple(int(value) for value in raw_quotas.split(","))
+            # 容错解析：空项跳过，写错只告警并退回均分，不让 get_pipeline() 起不来
+            values["quotas"] = tuple(parse_route_quotas(raw_quotas).items())
         values.update(overrides)
         return cls(**values)
 
@@ -183,8 +193,9 @@ class RetrievalPipeline:
             if self.state.get("index") is not None:
                 return
             from pcb_rag import query as q
-            from pcb_rag.api_clients import build_llm
+            from pcb_rag.api_clients import assert_api_only, build_llm
 
+            assert_api_only()
             llm = self.state.get("llm") or build_llm()
             index = q.build_index(
                 getattr(llm, "model", "default"),
@@ -213,11 +224,15 @@ class RetrievalPipeline:
             active = self.revisions.read().get("active", {})
             revision = active.get("revision", "legacy")
             if not force and self.state.get("revision") == revision:
-                # Legacy graph-only deployments also need hot reload.
+                # Legacy graph-only deployments also need hot reload. With the
+                # graph route disabled the stamp is never stored, so comparing it
+                # would force a full refresh on every request.
+                if active or not self.config.graph_enabled:
+                    return
                 from pcb_rag.graph_rag import GRAPH_PATH
 
                 stamp = Path(GRAPH_PATH).stat().st_mtime_ns if Path(GRAPH_PATH).exists() else None
-                if active or stamp == self.state.get("graph_stamp"):
+                if stamp == self.state.get("graph_stamp"):
                     return
             from pcb_rag.graph_rag import GRAPH_PATH, KnowledgeGraph
 
@@ -257,7 +272,9 @@ class RetrievalPipeline:
                     if updated["graph"]
                     else None
                 )
-            self.state.clear()
+            # ``updated`` starts as a copy of the current state, so a plain update
+            # replaces every key in one step. clear() + update() left a window in
+            # which a concurrent request saw an empty state (KeyError: 'index').
             self.state.update(updated)
 
     def _fetch(self, ids, state):
@@ -283,11 +300,16 @@ class RetrievalPipeline:
         from pcb_rag.security import build_acl_filters, merge_filters
 
         self.refresh()
-        state = dict(self.state)
+        with self._lock:
+            # Snapshot under the lock so one request never mixes artifacts from
+            # two revisions while another thread is publishing.
+            state = dict(self.state)
         control.revision = state.get("revision", "legacy")
         cfg = self.config
-        clean, filters = q._extract_query_filters(user_query)
+        clean, business_filters = q._extract_query_filters(user_query, include_acl=False)
+        filters = merge_filters(business_filters, build_acl_filters(current_principal()))
         if fallback:
+            business_filters = None
             filters = build_acl_filters(current_principal())
         # Push published revision and child constraints down to Milvus when the
         # new metadata schema exists. The in-memory check still runs before any
@@ -353,11 +375,18 @@ class RetrievalPipeline:
                 enable_colbert=False,
                 rerank_candidates=cfg.multipath_candidates,
                 rrf_k=cfg.multipath_rrf_k,
+                dense_weight=float(weights[0]),
+                sparse_weight=float(weights[1]),
             )
             submit(
                 "multipath",
                 1.0,
-                lambda: retriever.retrieve(clean, top_k=cfg.multipath_candidates, expand_queries=queries),
+                lambda: retriever.retrieve(
+                    clean,
+                    top_k=cfg.multipath_candidates,
+                    expand_queries=queries,
+                    sparse_expand_queries=lexical_queries,
+                ),
             )
         elif cfg.mode != "bm25":
             for index, value in enumerate(queries):
@@ -394,16 +423,34 @@ class RetrievalPipeline:
 
         # Enhanced routes use the explicitly injected LLM and participate before
         # reranking. Query2Doc, decomposition and Step-back retain separate flags.
+        def enhanced_nodes(retriever, expander):
+            # The pipeline already decided from cfg.hyde / cfg.query2doc /
+            # cfg.enhance_all that this route runs, so the module-level env
+            # switches must not veto it (force=True). strict=True lets LLM
+            # failures reach the route status instead of looking like a no-op.
+            enhanced = expander(clean, llm=self.llm, force=True, strict=True)
+            if not enhanced or enhanced.strip() == clean:
+                return None
+            return retriever.retrieve(enhanced)
+
         enhance = cfg.enhance_all or q._is_short_query(clean)
         if cfg.hyde and enhance:
             submit(
                 "hyde",
                 float(weights[0]) * cfg.hyde_weight,
-                lambda: vector.retrieve(q.hyde_expand_query(clean, llm=self.llm)),
+                lambda: enhanced_nodes(vector, q.hyde_expand_query),
             )
             hyde_deadline = time.monotonic() + max(0.0, float(os.getenv("HYDE_WAIT_BUDGET", "30")))
         if cfg.query2doc and enhance:
-            submit("query2doc", float(weights[0]), lambda: vector.retrieve(q.query2doc_expand(clean, llm=self.llm)))
+            if lexical is not None and cfg.lexical_enabled and cfg.mode != "vector":
+                submit(
+                    "query2doc",
+                    float(weights[1]),
+                    lambda: enhanced_nodes(lexical, q.query2doc_expand),
+                )
+            else:
+                control.routes["query2doc"] = "unavailable"
+                control.degraded.append("query2doc_lexical_unavailable")
         if understanding.get("need_step_back"):
             submit(
                 "stepback",
@@ -423,35 +470,73 @@ class RetrievalPipeline:
                         continue
                 else:
                     nodes = await_work(future, control)
+                if nodes is None and name in {"hyde", "query2doc"}:
+                    control.routes[name] = "skipped_noop"
+                    control.degraded.append(name + "_noop")
+                    continue
                 nodes = self._allowed(copy.deepcopy(nodes), state)
                 nodes = dedupe_by_key(nodes, _key)
-                group_name = name.split(":")[0]
-                group = groups.setdefault(group_name, {"nodes": [], "weight": weight})
-                group["nodes"].extend(nodes)
+                group_name = "bm25" if name == "query2doc" else name.split(":")[0]
+                group = groups.setdefault(group_name, {"runs": [], "weight": weight})
+                group["runs"].append(nodes)
                 control.routes[name] = "ok" if nodes else "empty"
             except DeadlineExceeded:
                 for _, _, pending, _ in jobs:
                     pending.cancel()
                 raise
             except Exception as error:
+                from pcb_rag.usage import UsageBudgetExceeded
+
+                if isinstance(error, UsageBudgetExceeded):
+                    # Same contract as rerank: an exhausted budget stops the
+                    # request instead of being recorded as one failed route.
+                    for _, _, pending, _ in jobs:
+                        pending.cancel()
+                    raise
                 control.routes[name] = "failed:" + type(error).__name__
                 control.degraded.append(name + "_failed:" + type(error).__name__)
             finally:
                 control.timings[name] = (time.monotonic() - started) * 1000
-        routes = [
-            (dedupe_by_key(group["nodes"], _key)[: cfg.recall_k * 2], group["weight"]) for group in groups.values()
-        ]
-        if len(routes) == 1:
+        # Raw BM25 scores grow with query length, so runs from different
+        # queries (multi-expand, decomposition, Query2Doc) are merged by rank.
+        # Graph evidence already carries rank-fused scores.
+        rank_scored = {"graph"}
+        ranked_groups = []
+        for name, group in groups.items():
+            if name == "bm25" and len(group["runs"]) > 1:
+                merged = rrf_merge_runs(group["runs"], top_n=cfg.recall_k * 2, rrf_k=cfg.rrf_k)
+                rank_scored.add(name)
+            else:
+                merged = merge_scored_runs(group["runs"], top_n=cfg.recall_k * 2)
+            ranked_groups.append((name, merged, group["weight"]))
+        ranked_groups = [group for group in ranked_groups if group[1]]
+        routes = [(nodes, weight) for _name, nodes, weight in ranked_groups]
+        if not routes:
+            candidates = []
+            score_kind = "native"
+        elif len(routes) == 1:
             candidates = routes[0][0][: cfg.recall_k]
-            score_kind = "vector" if "vector" in groups else "rrf"
+            group_name = ranked_groups[0][0]
+            if group_name == "multipath":
+                score_kind = getattr(retriever, "last_score_kind", "rrf")
+            else:
+                score_kind = "rrf" if group_name in rank_scored else "native"
         else:
             fuse = quota_rrf_fuse if cfg.quota_enabled else weighted_rrf_fuse
             options = {"min_per_route": cfg.quota_min} if cfg.quota_enabled else {}
-            if cfg.quota_enabled and len(cfg.quotas) == len(routes):
-                options["quotas"] = cfg.quotas
+            if cfg.quota_enabled:
+                # Bind quotas by route name: empty or failed routes are dropped
+                # above, so positions shift between requests.
+                quotas = quotas_for_routes(
+                    [name for name, _nodes, _weight in ranked_groups],
+                    normalize_route_quotas(cfg.quotas),
+                    cfg.quota_min,
+                )
+                if quotas is not None:
+                    options["quotas"] = quotas
             candidates = fuse(routes, cfg.recall_k, rrf_k=cfg.rrf_k, **options)
             score_kind = "rrf"
-        if not candidates and filters and not fallback:
+        if not candidates and business_filters and not fallback:
             control.degraded.append("business_filter_relaxed")
             return self._retrieve(user_query, top_k, score_threshold, control, fallback=True)
         rerank = state.get("rerank") if cfg.rerank_enabled else None
@@ -516,9 +601,11 @@ class RetrievalPipeline:
             except Exception as error:
                 control.degraded.append("context_expansion_failed:" + type(error).__name__)
         if cfg.compression:
-            from pcb_rag.compression import compress_pipeline
+            from pcb_rag import compression
 
-            selected = compress_pipeline(copy.deepcopy(selected), clean)
+            if compression.COMPRESSION_MODE in {"llm", "hybrid"} and self.llm is None:
+                control.degraded.append("compression_llm_unavailable")
+            selected = compression.compress_pipeline(copy.deepcopy(selected), clean, llm=self.llm)
         selected = self._allowed(selected, state, parents=True)
         control.remaining()
         return PipelineRun(

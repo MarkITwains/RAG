@@ -293,9 +293,14 @@ def llm_compress_text(text: str, query: str, llm: Any, *, max_chars: int = COMPR
         f"原文：\n{text}"
     )
 
+    from pcb_rag.runtime import DeadlineExceeded
+    from pcb_rag.usage import UsageBudgetExceeded, model_complete
+
     try:
-        response = llm.complete(prompt)
+        response = model_complete(llm, prompt)
         compressed = str(getattr(response, "text", response)).strip()
+    except (DeadlineExceeded, UsageBudgetExceeded):
+        raise
     except Exception:
         return compress_text_extractive(text, query, max_chars=max_chars)
 

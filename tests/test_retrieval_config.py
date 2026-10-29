@@ -194,7 +194,7 @@ def test_hyde_wait_budget_skips_only_slow_hyde_route(offline_pipeline, monkeypat
     fixture = offline_pipeline
     started, release = threading.Event(), threading.Event()
 
-    def slow_hyde(text, llm=None):
+    def slow_hyde(text, llm=None, **_):
         started.set()
         release.wait(1)
         return text
@@ -220,11 +220,52 @@ def test_hyde_wait_budget_keeps_fast_hyde_route(offline_pipeline, monkeypatch):
     fixture = offline_pipeline
     fixture.pipeline.config = replace(fixture.pipeline.config, hyde=True)
     monkeypatch.setenv("HYDE_WAIT_BUDGET", "30")
-    monkeypatch.setattr(query, "hyde_expand_query", lambda text, llm=None: text)
+    monkeypatch.setattr(query, "hyde_expand_query", lambda text, llm=None, **_: text + "\n关键事实：测试")
 
     result = fixture.pipeline.retrieve("铜厚")
 
     assert result.routes["hyde"] == "ok"
+    assert "hyde_wait_timeout" not in result.degraded
+
+
+def test_hyde_noop_does_not_duplicate_original_vector_route(offline_pipeline, monkeypatch):
+    from dataclasses import replace
+    from pcb_rag import query
+
+    fixture = offline_pipeline
+    fixture.pipeline.config = replace(fixture.pipeline.config, hyde=True)
+    monkeypatch.setattr(query, "hyde_expand_query", lambda text, llm=None, **_: text)
+
+    result = fixture.pipeline.retrieve("铜厚")
+
+    assert fixture.index.calls == ["铜厚"]
+    assert result.routes["hyde"] == "skipped_noop"
+    assert "hyde_noop" in result.degraded
+
+
+def test_hyde_wait_budget_accepts_route_completed_before_earlier_job(offline_pipeline, monkeypatch):
+    import time
+    from dataclasses import replace
+    from pcb_rag import query
+
+    fixture = offline_pipeline
+
+    def rows(text):
+        if text == "铜厚":
+            time.sleep(0.05)
+            return []
+        return [fixture.score(fixture.docs[1])]
+
+    fixture.index.rows = rows
+    fixture.pipeline.config = replace(fixture.pipeline.config, hyde=True)
+    monkeypatch.setenv("HYDE_WAIT_BUDGET", "0.01")
+    monkeypatch.setattr(query, "hyde_expand_query", lambda text, llm=None, **_: text + "\nHYPOTHETICAL")
+
+    result = fixture.pipeline.retrieve("铜厚")
+
+    assert fixture.index.calls == ["铜厚", "铜厚\nHYPOTHETICAL"]
+    assert result.routes["hyde"] == "ok"
+    assert [item.node.id_ for item in result.nodes] == ["real"]
     assert "hyde_wait_timeout" not in result.degraded
 
 
@@ -239,7 +280,7 @@ def test_hyde_wait_budget_does_not_mask_request_deadline(offline_pipeline, monke
     fixture.pipeline.config = replace(fixture.pipeline.config, hyde=True, timeout=0.01)
     monkeypatch.setenv("HYDE_WAIT_BUDGET", "30")
 
-    def slow_hyde(text, llm=None):
+    def slow_hyde(text, llm=None, **_):
         release.wait(1)
         return text
 
@@ -249,3 +290,161 @@ def test_hyde_wait_budget_does_not_mask_request_deadline(offline_pipeline, monke
             fixture.pipeline.retrieve("铜厚")
     finally:
         release.set()
+
+
+def test_multi_query_merges_runs_by_best_score(offline_pipeline, monkeypatch):
+    from dataclasses import replace
+    from pcb_rag import query
+
+    fixture = offline_pipeline
+    fixture.pipeline.config = replace(fixture.pipeline.config, multi_expand=True)
+    monkeypatch.setattr(query, "_build_multi_expand_queries", lambda text, num_queries=3, llm=None: [text, "变体"])
+    fixture.index.rows = lambda text: [fixture.score(fixture.node(text), 0.99 if text == "变体" else 0.1)]
+
+    result = fixture.pipeline.retrieve("原始", top_k=2)
+
+    assert [item.node.id_ for item in result.nodes] == ["变体", "原始"]
+
+
+def test_query2doc_is_a_lexical_expansion(offline_pipeline, monkeypatch):
+    from dataclasses import replace
+    from pcb_rag import query
+
+    fixture = offline_pipeline
+    lexical = type("Lexical", (), {"calls": []})()
+    lexical.retrieve = lambda text: lexical.calls.append(text) or []
+    fixture.pipeline.state["bm25_index"] = object()
+    fixture.pipeline.config = replace(fixture.pipeline.config, lexical_enabled=True, query2doc=True, enhance_all=True)
+    monkeypatch.setattr(query, "LocalBM25Retriever", lambda *args, **kwargs: lexical)
+    monkeypatch.setattr(query, "query2doc_expand", lambda text, llm=None, **_: "Q2D " + text)
+
+    fixture.pipeline.retrieve("铜厚")
+
+    assert "Q2D 铜厚" in lexical.calls
+    assert all(not text.startswith("Q2D") for text in fixture.index.calls)
+
+
+def test_multipath_receives_distinct_queries_and_route_weights(offline_pipeline, monkeypatch):
+    from dataclasses import replace
+    from pcb_rag import query
+
+    fixture = offline_pipeline
+    captured = {}
+
+    class MultiPath:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def retrieve(self, query, top_k, expand_queries, sparse_expand_queries):
+            captured["dense_queries"] = expand_queries
+            captured["sparse_queries"] = sparse_expand_queries
+            return []
+
+    fixture.pipeline.state["bm25_index"] = object()
+    fixture.pipeline.config = replace(
+        fixture.pipeline.config, multipath=True, lexical_enabled=True, routing=True, mode="production"
+    )
+    monkeypatch.setattr(query, "MultiPathRetriever", MultiPath)
+    monkeypatch.setattr(query, "_expand_query", lambda text: text + " SYNONYM")
+    monkeypatch.setattr(
+        query,
+        "understand_query",
+        lambda *args, **kwargs: {
+            "vector_weight": 0.2,
+            "bm25_weight": 0.8,
+            "num_queries": 3,
+            "need_decompose": False,
+            "need_step_back": False,
+        },
+    )
+
+    fixture.pipeline.retrieve("铜厚")
+
+    assert captured["dense_queries"] == ["铜厚"]
+    assert captured["sparse_queries"] == ["铜厚 SYNONYM"]
+    assert captured["dense_weight"] == 0.2
+    assert captured["sparse_weight"] == 0.8
+
+
+def test_multipath_dense_only_applies_native_score_threshold(offline_pipeline, monkeypatch):
+    from dataclasses import replace
+    from llama_index.core.schema import NodeWithScore
+
+    fixture = offline_pipeline
+
+    class Dense:
+        def _retrieve(self, bundle):
+            return [NodeWithScore(node=fixture.docs[1], score=0.5)]
+
+    fixture.index.as_retriever = lambda **kwargs: Dense()
+    fixture.pipeline.state["bm25_index"] = fixture.build_lexical([])
+    fixture.pipeline.config = replace(fixture.pipeline.config, multipath=True, lexical_enabled=True)
+
+    result = fixture.pipeline.retrieve("语义查询", score_threshold=0.8)
+
+    assert result.nodes == []
+    assert "score_threshold_ignored_for_rrf" not in result.degraded
+
+
+def test_acl_only_empty_result_does_not_relax_business_filters(offline_pipeline, monkeypatch):
+    from pcb_rag import security
+
+    fixture = offline_pipeline
+    fixture.index.rows = []
+    monkeypatch.setattr(security, "ACL_ENABLED", True)
+    monkeypatch.setenv("ACL_STRICT_LEGACY", "1")
+
+    result = fixture.pipeline.retrieve("无匹配")
+
+    assert fixture.index.calls == ["无匹配"]
+    assert "business_filter_relaxed" not in result.degraded
+
+
+def test_empty_business_filter_result_is_relaxed_once(offline_pipeline):
+    fixture = offline_pipeline
+    fixture.index.rows = lambda text: [] if len(fixture.index.calls) == 1 else [fixture.score(fixture.docs[1])]
+
+    result = fixture.pipeline.retrieve("vendor=missing 铜厚")
+
+    assert fixture.index.calls == ["铜厚", "铜厚"]
+    assert "business_filter_relaxed" in result.degraded
+    assert [item.node.id_ for item in result.nodes] == ["real"]
+
+
+def test_pipeline_llm_compression_uses_pipeline_llm(offline_pipeline, monkeypatch):
+    from dataclasses import replace
+    from pcb_rag import compression
+
+    fixture = offline_pipeline
+    fixture.pipeline.config = replace(fixture.pipeline.config, compression=True)
+    monkeypatch.setattr(compression, "COMPRESSION_ENABLED", True)
+    monkeypatch.setattr(compression, "COMPRESSION_MODE", "llm")
+
+    fixture.pipeline.retrieve("铜厚")
+
+    assert len(fixture.llm._prompts) == 2
+    assert all("资料压缩助手" in prompt for prompt in fixture.llm._prompts)
+
+
+@pytest.mark.local_model
+def test_colbert_maxsim_excludes_padding():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from pcb_rag.query import ColBERTReranker
+
+    scorer = SimpleNamespace()
+    query_embedding = torch.tensor([[1.0, 0.0]])
+    document_embedding = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+    query_mask = torch.tensor([1])
+    document_mask = torch.tensor([1, 0])
+
+    assert ColBERTReranker._maxsim_score(scorer, query_embedding, document_embedding) == 1.0
+    assert (
+        ColBERTReranker._maxsim_score(
+            scorer, query_embedding, document_embedding, query_mask=query_mask, doc_mask=document_mask
+        )
+        == 0.0
+    )
+    assert (
+        ColBERTReranker._maxsim_score(scorer, query_embedding, document_embedding, doc_mask=torch.tensor([0, 0])) == 0.0
+    )

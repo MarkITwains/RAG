@@ -186,3 +186,34 @@ class TestNodeLevelCompression:
         summary = compression.summarize_compression(nodes)
         assert summary["nodes"] == 1
         assert summary["ratio"] <= 1.0
+
+    def test_llm_mode_uses_metered_model_call(self, monkeypatch):
+        import pcb_rag.compression as compression
+
+        monkeypatch.setattr(compression, "COMPRESSION_ENABLED", True)
+        monkeypatch.setattr(compression, "COMPRESSION_MODE", "llm")
+        llm = SimpleNamespace(calls=[], model="stub")
+        llm.complete = lambda prompt, **kwargs: llm.calls.append(prompt) or SimpleNamespace(text="压缩后的事实。")
+        nodes = [_node("铜厚应不小于 35 μm。" * 20, "a")]
+
+        result = compression.compress_nodes(nodes, "铜厚", llm=llm)
+
+        assert len(llm.calls) == 1
+        assert result[0].text == "压缩后的事实。"
+
+    def test_llm_mode_propagates_usage_budget(self, monkeypatch):
+        import pcb_rag.compression as compression
+        from pcb_rag.runtime import request_scope
+        from pcb_rag.usage import UsageBudgetExceeded
+        import pytest
+
+        monkeypatch.setattr(compression, "COMPRESSION_ENABLED", True)
+        monkeypatch.setattr(compression, "COMPRESSION_MODE", "llm")
+        monkeypatch.setenv("RAG_MAX_MODEL_CALLS", "1")
+        llm = SimpleNamespace(calls=[], model="stub")
+        llm.complete = lambda prompt, **kwargs: llm.calls.append(prompt) or SimpleNamespace(text="压缩后的事实。")
+        nodes = [_node("第一段铜厚要求。" * 20, "a"), _node("第二段铜厚要求。" * 20, "b")]
+
+        with request_scope(1), pytest.raises(UsageBudgetExceeded):
+            compression.compress_nodes(nodes, "铜厚", llm=llm)
+        assert len(llm.calls) == 1

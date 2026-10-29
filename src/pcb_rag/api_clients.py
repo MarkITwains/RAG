@@ -143,6 +143,27 @@ def _should_send_dimensions(model_name: str) -> bool:
     return model_name.lower().startswith("text-embedding-3")
 
 
+def api_only_enabled() -> bool:
+    return os.getenv("AI_API_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def assert_api_only(*, judge: bool = False) -> None:
+    if not api_only_enabled():
+        return
+    backends = {"LLM_BACKEND": LLM_BACKEND, "EMBED_BACKEND": EMBED_BACKEND}
+    rerank_enabled = os.getenv("RERANK_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+    rerank_backend = os.getenv("RERANK_BACKEND", "qwen3reranker").strip().lower()
+    if rerank_enabled and rerank_backend not in {"api", "none", "off", "disabled"}:
+        backends["RERANK_BACKEND"] = rerank_backend
+    if os.getenv("COLBERT_RERANK_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        backends["COLBERT_RERANK_ENABLED"] = "local"
+    if judge:
+        backends["JUDGE_BACKEND"] = os.getenv("JUDGE_BACKEND", "api").strip().lower()
+    invalid = [f"{name}={value}" for name, value in backends.items() if value != "api"]
+    if invalid:
+        raise RuntimeError("AI_API_ONLY=1 要求所有 AI 调用使用 API: " + ", ".join(invalid))
+
+
 # ---------------------------------------------------------------------------
 # 2. LLM 工厂
 # ---------------------------------------------------------------------------
@@ -152,16 +173,22 @@ def build_llm(
     backend: Optional[str] = None,
     request_timeout: Optional[float] = None,
     temperature: Optional[float] = None,
+    api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Any:
     """构建 LLM 实例（``local`` = Ollama，``api`` = OpenAI 兼容）。"""
 
     backend = (backend or LLM_BACKEND).strip().lower()
     temp = LLM_TEMPERATURE if temperature is None else float(temperature)
+    if api_only_enabled() and backend != "api":
+        raise RuntimeError("AI_API_ONLY=1 禁止 LLM 使用本地后端")
 
     if backend == "api":
         from llama_index.llms.openai_like import OpenAILike
 
-        if not LLM_BASE_URL:
+        base_url = (api_base or LLM_BASE_URL).strip().rstrip("/")
+        credential = LLM_API_KEY if api_key is None else api_key.strip()
+        if not base_url:
             raise RuntimeError(
                 "LLM_BACKEND=api 需要配置 LLM_BASE_URL（OpenAI 兼容的 /v1 地址）"
             )
@@ -171,8 +198,8 @@ def build_llm(
 
         return OpenAILike(
             model=model_name,
-            api_base=LLM_BASE_URL,
-            api_key=LLM_API_KEY or _PLACEHOLDER_KEY,
+            api_base=base_url,
+            api_key=credential or _PLACEHOLDER_KEY,
             is_chat_model=True,
             is_function_calling_model=False,
             context_window=LLM_CONTEXT_WINDOW,
@@ -209,6 +236,8 @@ def build_embed_model(model: Optional[str] = None, *, backend: Optional[str] = N
     """构建 Embedding 实例（``local`` = Ollama，``api`` = OpenAI 兼容）。"""
 
     backend = (backend or EMBED_BACKEND).strip().lower()
+    if api_only_enabled() and backend != "api":
+        raise RuntimeError("AI_API_ONLY=1 禁止 Embedding 使用本地后端")
 
     if backend == "api":
         from llama_index.embeddings.openai import OpenAIEmbedding
