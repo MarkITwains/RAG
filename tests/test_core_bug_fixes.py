@@ -205,7 +205,9 @@ def test_legacy_hyde_still_falls_back_on_plain_errors_but_not_on_budget(monkeypa
     monkeypatch.setattr(query, "model_complete", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("x")))
     assert query.hyde_expand_query("铜厚", llm=object()) == "铜厚"
 
-    monkeypatch.setattr(query, "model_complete", lambda *args, **kwargs: (_ for _ in ()).throw(UsageBudgetExceeded("b")))
+    monkeypatch.setattr(
+        query, "model_complete", lambda *args, **kwargs: (_ for _ in ()).throw(UsageBudgetExceeded("b"))
+    )
     with pytest.raises(UsageBudgetExceeded):
         query.hyde_expand_query("铜厚", llm=object())
 
@@ -310,9 +312,7 @@ def test_pipeline_quotas_follow_route_names(offline_pipeline, monkeypatch):
             return [NodeWithScore(node=fixture.docs[1], score=1.0)]
 
     fixture.pipeline.state["bm25_index"] = object()
-    fixture.pipeline.config = replace(
-        fixture.pipeline.config, lexical_enabled=True, quotas=(("bm25", 5),), quota_min=1
-    )
+    fixture.pipeline.config = replace(fixture.pipeline.config, lexical_enabled=True, quotas=(("bm25", 5),), quota_min=1)
     monkeypatch.setattr(query, "LocalBM25Retriever", lambda *args, **kwargs: Lexical())
     monkeypatch.setattr(retrieval, "quota_rrf_fuse", fake_fuse)
 
